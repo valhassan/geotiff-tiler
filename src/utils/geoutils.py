@@ -9,7 +9,6 @@ from rasterio.shutil import copy as riocopy
 from rasterio import MemoryFile
 from rasterio.windows import from_bounds
 from typing import List, Sequence, Optional, Union
-from osgeo import gdal, ogr, osr
 
 def stack_bands(srcs: List, band: int = 1):
     """
@@ -347,6 +346,8 @@ def rasterize_vector(
         out_shape=out_shape,
         transform=transform,
         fill=0,
+        all_touched=True,
+        merge_alg=rasterio.enums.MergeAlg.replace,
         dtype=dtype,
     )
     meta = image.meta.copy()
@@ -369,11 +370,3 @@ def rasterize_vector(
             with memfile.open(**meta) as dst:
                 dst.write(label_raster, 1)
             return memfile.open()
-
-
-
-
-
-
-    
-   
