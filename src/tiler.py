@@ -122,6 +122,19 @@ class Tiler:
         
         return image_patches, label_patches
     
+    def _build_output_folder(self, image_name: str, id: int):
+        """Builds the output path for the tiles"""
+        image_folder = f"{image_name}_{id}"
+        output_folder = Path(self.output_dir) / image_folder
+        if not output_folder.exists():
+            output_folder.mkdir(parents=True, exist_ok=True)
+        return output_folder
+    
+    def _build_patch_path(self, output_folder: Path, 
+                          image_name: str, x: int, y: int):
+        """Builds the output path for the tiles"""
+        patch_name = f"{image_name}_{x}_{y}.tif"
+        return output_folder / patch_name
     
     def create_tiles(self):
         """Creates tiles from input pairs"""
@@ -129,6 +142,8 @@ class Tiler:
         for input_pair in self.input_pairs:
             
             image_path, label_path = input_pair
+            image_name = Path(image_path).stem
+            output_folder = self._build_output_folder(image_name, id)
             
             try:
                 image = load_image(image_path)
@@ -172,13 +187,12 @@ class Tiler:
             if intersection is None:
                 logger.info("Skipping pair: No intersection between image and label")
                 continue
-            clipped_image, clipped_label = clip_to_intersection(image, label, intersection)
+            image, label = clip_to_intersection(image, label, intersection)
             
-            if isinstance(clipped_label, gpd.GeoDataFrame):                    
-                label = self._prepare_vector_labels(clipped_label, clipped_image)
-                    
-                
-            # Continue with tiling...
+            if isinstance(label, gpd.GeoDataFrame):                    
+                label = self._prepare_vector_labels(label, image)
+            
+            image_patches, label_patches = self.tiling(image, label)
     
 
 
@@ -196,9 +210,7 @@ if __name__ == '__main__':
                   label_threshold=0.5, 
                   single_class_mode=False, 
                   multiclass_mode={'class1': True, 'class2': False}, 
-                  output_dir='/home/valhassa/Projects/geotiff-tiler/data/output',
-                  write_label_raster=True,
-                  label_raster_path='final_label.tif')
+                  output_dir='/home/valhassa/Projects/geotiff-tiler/data/output')
     
     tiler.create_tiles()
     
