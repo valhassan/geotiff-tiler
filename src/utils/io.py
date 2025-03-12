@@ -47,13 +47,17 @@ def load_mask(mask_path: str, skip_layer: str | None = "extent"):
             return rasterio.open(mask_path)
         elif label_type == 'vector':
             layers = fiona.listlayers(mask_path)
+            extent_layer = next((layer for layer in layers if "extent" in layer.lower()), None)
             main_layer = next(
-                (layer for layer in layers if skip_layer not in layer.lower()),
-                None
-            )
+                (layer for layer in layers if skip_layer not in layer.lower()), None)
             if main_layer is None:
                 raise ValueError(f"No suitable layer found in {mask_path}")
-            return gpd.read_file(mask_path, layer=main_layer)
+            result = gpd.read_file(mask_path, layer=main_layer)
+            if extent_layer:
+                extent_gdf = gpd.read_file(mask_path, layer=extent_layer)
+                if not extent_gdf.empty:
+                    result.attrs['extent_geometry'] = extent_gdf.geometry.iloc[0]
+            return result
     else:
         raise FileNotFoundError(f"File not found: {mask_path}")
 
