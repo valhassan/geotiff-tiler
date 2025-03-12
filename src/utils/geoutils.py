@@ -1,5 +1,6 @@
 import rasterio
 import rasterio.features
+import rasterio.mask
 import xml.etree.ElementTree as ET
 import geopandas as gpd
 import numpy as np
@@ -8,7 +9,7 @@ from pathlib import Path
 from rasterio.shutil import copy as riocopy
 from rasterio import MemoryFile
 from rasterio.windows import from_bounds
-from typing import List, Sequence, Optional, Union
+from typing import List, Sequence, Optional, Union, Tuple
 
 def stack_bands(srcs: List, band: int = 1):
     """
@@ -68,6 +69,70 @@ def select_bands(src: str, band_indices: Optional[Sequence]):
 
     return ET.tostring(vrt_dataset).decode('UTF-8')
 
+def ensure_crs_match(image: rasterio.DatasetReader,
+                     label: Union[rasterio.DatasetReader, gpd.GeoDataFrame],
+                     ) -> Tuple[rasterio.DatasetReader, Union[rasterio.DatasetReader, gpd.GeoDataFrame], bool]:
+    """
+    Ensure the CRS between image and label match by converting label to match the image.
+    
+    Args:
+        image: Opened rasterio dataset
+        label: Either a rasterio dataset or GeoDataFrame
+    Returns:
+        Tuple of (aligned_image, aligned_label, was_converted)
+    """
+    # Check if CRS already match
+    if image.crs == label.crs:
+        return image, label, False
+    
+    # Convert based on data types
+    was_converted = True
+    
+    if isinstance(label, gpd.GeoDataFrame):
+        # For vector labels, conversion is straightforward
+        label = label.to_crs(image.crs)
+    
+    elif isinstance(label, rasterio.DatasetReader):
+        # Both are rasters, convert label to match image
+        # Important: Using a MemoryFile object that persists beyond this function
+        memfile = rasterio.MemoryFile()
+        
+        # Calculate transform to match the image's pixel grid
+        dst_transform, dst_width, dst_height = rasterio.warp.calculate_default_transform(
+            label.crs, image.crs, label.width, label.height, *label.bounds
+        )
+        
+        dst_kwargs = label.meta.copy()
+        dst_kwargs.update({
+            'crs': image.crs,
+            'transform': dst_transform,
+            'width': dst_width,
+            'height': dst_height,
+            'driver': 'GTiff'  # Ensure driver is set
+        })
+        
+        dst = memfile.open(**dst_kwargs)
+        
+        # Reproject using nearest neighbor for categorical data
+        for i in range(1, label.count + 1):
+            rasterio.warp.reproject(
+                source=rasterio.band(label, i),
+                destination=rasterio.band(dst, i),
+                src_transform=label.transform,
+                src_crs=label.crs,
+                dst_transform=dst_transform,
+                dst_crs=image.crs,
+                resampling=rasterio.warp.Resampling.nearest  # Correct for categorical data
+            )
+        
+        # Close the original label dataset if it's not needed
+        label.close()  # Uncomment if you want to close the original
+        
+        # Use the reprojected dataset (don't close memfile or dst)
+        dst.close()  # Close the destination to flush data
+        label = memfile.open()  # Reopen from memfile
+    
+    return image, label, was_converted
 
 
 def create_nodata_mask(
@@ -175,66 +240,64 @@ def get_intersection(image: rasterio.DatasetReader, label: Union[rasterio.Datase
     # Get label bounds based on type
     if isinstance(label, rasterio.DatasetReader):
         label_bounds = box(*label.bounds)
-        label_crs = label.crs
     elif isinstance(label, gpd.GeoDataFrame):
-        label_bounds = box(*label.total_bounds)
-        label_crs = label.crs
+        if hasattr(label, 'attrs') and 'extent_geometry' in label.attrs:
+            label_bounds = label.attrs['extent_geometry']
+        else:
+            label_bounds = box(*label.total_bounds)
     else:
         raise ValueError("Label must be either a rasterio.DatasetReader or GeoDataFrame")
-    
-    # Check CRS match
-    if image.crs != label_crs:
-        raise ValueError(f"CRS mismatch: Image CRS: {image.crs}, Label CRS: {label_crs}")
-    
     # Find intersection
-    intersection = image_bounds.intersection(label_bounds)
+    intersection = label_bounds.intersection(image_bounds)
     
     if intersection.is_empty:
         return None
     
     return intersection
 
-def clip_raster_to_extent(raster: rasterio.DatasetReader, 
-                         common_extent: box,
-                         write_raster: bool = False,
-                         output_path: str = None):
+def clip_raster_to_extent(raster: rasterio.DatasetReader,
+                          geometry,
+                          write_raster: bool = False,
+                          output_path: str = None,
+                          ):
     """
-    Clip a raster to the given extent.
+    Clip a raster to the given geometry.
+    
+    Args:
+        raster: Input rasterio dataset
+        geometry: Shapely geometry or list of geometries to clip by
+        write_raster: Whether to write the result to disk
+        output_path: Path to save the clipped raster (if write_raster is True)
+    Returns:
+        Clipped rasterio dataset or path to the saved file
     """
-    # Get the window coordinates in pixel space
-    window = from_bounds(
-        *common_extent.bounds,  # minx, miny, maxx, maxy
-        transform=raster.transform
-    )
+    # Handle single geometry vs list of geometries
+    shapes = [geometry] if hasattr(geometry, 'geom_type') else geometry
+    nodata_value = raster.nodata
     
-    # Round window to whole pixels
-    window = window.round_lengths()
-    
-    # Read the data within the window
-    clipped_data = raster.read(window=window)
-    
-    # Get the transform for the clipped raster
-    transform = rasterio.windows.transform(window, raster.transform)
-    
+    # Perform the clipping
+    out_image, out_transform = rasterio.mask.mask(raster,
+                                                  shapes,
+                                                  crop=True,
+                                                  all_touched=True,
+                                                  nodata=nodata_value
+                                                  )
     # Update metadata
     out_meta = raster.meta.copy()
-    out_meta.update({
-        'height': clipped_data.shape[1],
-        'width': clipped_data.shape[2],
-        'transform': transform,
-        'driver': 'GTiff'
-    })
-    print(f"Clipped dimensions: {clipped_data.shape}")
+    out_meta.update({"height": out_image.shape[1],
+                     "width": out_image.shape[2],
+                     "transform": out_transform,
+                     "nodata": nodata_value})
     
     if write_raster:
         with rasterio.open(output_path, "w", **out_meta) as dest:
-            dest.write(clipped_data)
-            return output_path
+            dest.write(out_image)
+        return output_path
     else:
         with MemoryFile() as memfile:
             with memfile.open(**out_meta) as dest:
-                dest.write(clipped_data)
-                return memfile.open()
+                dest.write(out_image)
+            return memfile.open()
 
 def clip_vector_to_extent(gdf: gpd.GeoDataFrame, extent: box) -> gpd.GeoDataFrame:
     """
@@ -271,7 +334,6 @@ def clip_to_intersection(image: rasterio.DatasetReader,
         Tuple of clipped image and label
     """
     image_clipped = clip_raster_to_extent(image, intersection)
-    
     if isinstance(label, rasterio.DatasetReader):
         label_clipped = clip_raster_to_extent(label, intersection)
     elif isinstance(label, gpd.GeoDataFrame):
