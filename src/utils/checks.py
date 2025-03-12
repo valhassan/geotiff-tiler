@@ -131,24 +131,13 @@ def calculate_overlap(
     try:
         # Get image bounds as a box
         image_bounds = box(*image.bounds)
-        print(f"image_bounds: {image_bounds}")
-        print(f"image.crs: {image.crs}")
-        # print(f"image.transform: {image.transform}")
-        # Get label bounds
         if isinstance(label, rasterio.DatasetReader):
-            # label_bounds = box(*label.bounds)
-            # print(f"label_bounds: {label_bounds}")
-            print(f"label.crs: {label.crs}")
-            # print(f"transform: {label.transform}")
+            label_bounds = box(*label.bounds)
         else:
-            # For GeoDataFrame, ensure CRS matches
-            # label_gdf = label.to_crs(image.crs)
-            print(f"label.crs: {label.crs}")
-            label_bounds = label.total_bounds
-            label_bounds = box(*label_bounds)
-            print(f"label_bounds: {label_bounds}")
-            print(f"label.crs: {label.crs}")
-            # print(f"transform: {label.transform}")
+            if hasattr(label, 'attrs') and 'extent_geometry' in label.attrs:
+                label_bounds = label.attrs['extent_geometry']
+            else:
+                label_bounds = box(*label.total_bounds)
         
         # Calculate intersection and union areas
         intersection_area = image_bounds.intersection(label_bounds).area
