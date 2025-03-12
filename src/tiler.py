@@ -10,7 +10,7 @@ from pathlib import Path
 
 from utils.io import load_image, load_mask
 from utils.geoutils import create_nodata_mask, apply_nodata_mask, rasterize_vector, get_intersection
-from utils.geoutils import clip_to_intersection
+from utils.geoutils import ensure_crs_match, clip_to_intersection
 from utils.checks import check_image_validity, check_label_validity, calculate_overlap
 from utils.checks import is_image_georeferenced, is_label_georeferenced, check_alignment
 from config.logging_config import logger
@@ -177,6 +177,10 @@ class Tiler:
                 logger.info(f"Skipping pair due to invalid label: {label_msg}")
                 continue
             
+            image, label, was_converted = ensure_crs_match(image, label)
+            if was_converted:
+                logger.info("CRS mismatch between image and label, reprojecting label to match image")
+            
             overlap_pct, overlap_msg = calculate_overlap(image, label)
             if overlap_pct == 0:
                 logger.info(f"Skipping pair due to no overlap: {overlap_msg}")
@@ -191,8 +195,36 @@ class Tiler:
             
             if isinstance(label, gpd.GeoDataFrame):                    
                 label = self._prepare_vector_labels(label, image)
+                
+            # print(f"Clipped image shape: {image.shape}")
+            # print(f"Clipped image bands: {image.count}")
+            # print(f"Clipped label shape: {label.shape}")
+            # print(f"Clipped label bands: {label.count}")
             
-            image_patches, label_patches = self.tiling(image, label)
+            # meta = image.meta
+            # # print("meta: ", meta)
+            # meta.update(driver='GTiff')
+            # meta.update(dtype=image.dtypes[0])
+            # meta.update(count=1)
+            # meta.update(nodata=0)
+            # meta.update(compress='lzw')
+            # meta.update(blockxsize=256)
+            # meta.update(blockysize=256)
+            # meta.update(tiled=True)
+            # meta.update(BIGTIFF='YES')
+            # # print(f"label_meta: {label.meta}")
+            
+            
+            # image_path = "AB26_image_clipped.tif"
+            # label_path = "AB26_label_clipped.tif"
+            
+            # with rasterio.open(image_path, 'w', **image.meta) as dst:
+            #     dst.write(image.read())
+            # with rasterio.open(label_path, 'w', **meta) as dst:
+            #     dst.write(label.read())
+            
+            
+            # image_patches, label_patches = self.tiling(image, label)
     
 
 
@@ -202,14 +234,16 @@ if __name__ == '__main__':
             ("/home/valhassa/Projects/geotiff-tiler/data/GF2_PMS1__L1A0000564539-MSS1.tif", "/home/valhassa/Projects/geotiff-tiler/data/GF2_PMS1__L1A0000564539-MSS1_24label.tif")]
     
     tiler = Tiler(input_pairs=[data[1]], 
-                  tile_size=(1024, 1024),
+                  patch_size=(1024, 1024),
                   attr_field=["class", "Quatreclasses"],
                   attr_values=[1, 2, 3, 4],
                   stride=(512, 512), 
                   discard_empty=True, 
                   label_threshold=0.5, 
                   single_class_mode=False, 
-                  multiclass_mode={'class1': True, 'class2': False}, 
+                  multiclass_mode={'class1': True, 'class2': False},
+                  write_label_raster=False,
+                  label_raster_path='/home/valhassa/Projects/geotiff-tiler/data/AB26_label.tif',
                   output_dir='/home/valhassa/Projects/geotiff-tiler/data/output')
     
     tiler.create_tiles()
