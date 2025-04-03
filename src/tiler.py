@@ -1,18 +1,24 @@
 import logging
 import rasterio
+import zarr
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 
+from rasterio.windows import Window
 from shapely.geometry import box
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Any
 from pathlib import Path
 
-from utils.io import load_image, load_mask
+import zarr.codecs
+import zarr.storage
+
+from utils.io import load_image, load_mask, read_patches_from_zarr, save_patches_to_zarr
 from utils.geoutils import create_nodata_mask, apply_nodata_mask, rasterize_vector, get_intersection
 from utils.geoutils import ensure_crs_match, clip_to_intersection
 from utils.checks import check_image_validity, check_label_validity, calculate_overlap
 from utils.checks import is_image_georeferenced, is_label_georeferenced, check_alignment
+from utils.visualization import visualize_zarr_patches
 from config.logging_config import logger
 
 logger = logging.getLogger(__name__)
@@ -21,7 +27,7 @@ logger = logging.getLogger(__name__)
 class Tiler:
     
     def __init__(self, 
-                 input_pairs: List[Tuple[str, str]], 
+                 input_dict: List[Dict[str, Any]], 
                  patch_size: Tuple[int, int], # (height, width)
                  attr_field: str,
                  attr_values: List[str],
@@ -34,7 +40,7 @@ class Tiler:
                  label_raster_path: str = None,
                  output_dir: str = None):
         
-        self.input_pairs = input_pairs
+        self.input_dict = input_dict
         self.patch_size = patch_size
         self.stride = stride if stride is not None else patch_size
         self.discard_empty = discard_empty
@@ -63,17 +69,38 @@ class Tiler:
             raise ValueError(f"Invalid patch shape: {patch.shape}")
     
     
-    def _filter_patches(self, image: np.ndarray, label: np.ndarray):
-        """Filters patches based on the discard_empty flag and label_threshold"""
-        if self.discard_empty and np.all(label) == 0:
+    def _filter_patches(self, label: np.ndarray) -> bool:
+        """
+        Filters patches based on the discard_empty flag and label_threshold.
+
+        Args:
+            label (np.ndarray): The corresponding label patch.
+
+        Returns:
+            bool: True if the patch passes the filters, False otherwise.
+        """
+        # Ensure label is not empty to avoid issues
+        if label.size == 0:
+            logger.debug("Patch discarded: invalid shape or empty")
+            return False
+        nonzero_count = np.count_nonzero(label)
+        
+        # Discard patches where all label values are 0
+        if self.discard_empty and nonzero_count == 0:
+            print(f"Patch discarded: all label values are 0")
+            logger.debug("Patch discarded: all label values are 0")
             return False
         
-        if self.label_threshold:
-            label_percentage = np.sum(label > 0) / label.size
-            if label_percentage < self.label_threshold:
+        # Apply label coverage threshold
+        if self.label_threshold is not None:
+            label_coverage = nonzero_count / label.size
+            if label_coverage < self.label_threshold:
+                print(f"Patch discarded: label coverage {label_coverage:.2f} < {self.label_threshold}")
+                logger.debug(f"Patch discarded: label coverage {label_coverage:.2f} < {self.label_threshold}")
                 return False
+
         return True
-    
+
     
     def _prepare_vector_labels(self, label: gpd.GeoDataFrame, image: rasterio.DatasetReader):
         """Prepares vector labels for tiling"""
@@ -102,25 +129,37 @@ class Tiler:
         
         image_patches = []
         label_patches = []
+        positions = []
         
-        for y in range(0, image_height, self.stride):
-            for x in range(0, image_width, self.stride):
-                window_width = min(self.patch_size[1], image_width - x)
-                window_height = min(self.patch_size[0], image_height - y)
-                
-                window = rasterio.windows.Window(col_off=x, row_off=y, width=window_width, height=window_height)
-                image_patch = image.read(window=window, boundless=False)
-                label_patch = label.read(window=window, boundless=False)
-                
-                if window_width < self.patch_size[1] or window_height < self.patch_size[0]:
-                    image_patch = self.pad_patch(image_patch, self.patch_size)
-                    label_patch = self.pad_patch(label_patch, self.patch_size)
-                
-                if self._filter_patches(image_patch, label_patch):
+        try:
+            logger.info(f"Tiling {image_height}x{image_width} "
+                        f"image with patch size {self.patch_size} and stride {self.stride}")
+            
+            for y in range(0, image_height, self.stride):
+                for x in range(0, image_width, self.stride):
+                    window_width = min(self.patch_size[1], image_width - x)
+                    window_height = min(self.patch_size[0], image_height - y)
+                    
+                    window = Window(col_off=x, row_off=y, width=window_width, height=window_height)
+                    
+                    label_patch = label.read(window=window, boundless=False)
+                    if not self._filter_patches(label_patch):
+                        continue
+                    image_patch = image.read(window=window, boundless=False)
+                    
+                    if image_patch.shape[1:] != self.patch_size or label_patch.shape[1:] != self.patch_size:
+                        image_patch = self.pad_patch(image_patch, self.patch_size)
+                        label_patch = self.pad_patch(label_patch, self.patch_size)
+                    print(f"image_patch shape: {image_patch.shape}")
+                    print(f"label_patch shape: {label_patch.shape}")
                     image_patches.append(image_patch)
                     label_patches.append(label_patch)
-        
-        return image_patches, label_patches
+                    positions.append((x, y))
+            logger.info(f"Extracted {len(image_patches)} patches")
+            return image_patches, label_patches, positions
+        except Exception as e:
+            logger.error(f"Tiling failed: {e}")
+            raise
     
     def _build_output_folder(self, image_name: str, id: int):
         """Builds the output path for the tiles"""
@@ -139,11 +178,16 @@ class Tiler:
     def create_tiles(self):
         """Creates tiles from input pairs"""
         
-        for input_pair in self.input_pairs:
-            
-            image_path, label_path = input_pair
+        for input_dict in self.input_dict:
+            image_path = input_dict["image"]
+            label_path = input_dict["label"]
+            metadata = input_dict["metadata"]
             image_name = Path(image_path).stem
             output_folder = self._build_output_folder(image_name, id)
+            
+            metadata["image_name"] = image_name
+            metadata["patch_size"] = self.patch_size
+            metadata["stride"] = self.stride
             
             try:
                 image = load_image(image_path)
@@ -195,58 +239,68 @@ class Tiler:
             
             if isinstance(label, gpd.GeoDataFrame):                    
                 label = self._prepare_vector_labels(label, image)
-                
-            # print(f"Clipped image shape: {image.shape}")
-            # print(f"Clipped image bands: {image.count}")
-            # print(f"Clipped label shape: {label.shape}")
-            # print(f"Clipped label bands: {label.count}")
             
-            # meta = image.meta
-            # # print("meta: ", meta)
-            # meta.update(driver='GTiff')
-            # meta.update(dtype=image.dtypes[0])
-            # meta.update(count=1)
-            # meta.update(nodata=0)
-            # meta.update(compress='lzw')
-            # meta.update(blockxsize=256)
-            # meta.update(blockysize=256)
-            # meta.update(tiled=True)
-            # meta.update(BIGTIFF='YES')
-            # # print(f"label_meta: {label.meta}")
-            
-            
-            # image_path = "AB26_image_clipped.tif"
-            # label_path = "AB26_label_clipped.tif"
-            
-            # with rasterio.open(image_path, 'w', **image.meta) as dst:
-            #     dst.write(image.read())
-            # with rasterio.open(label_path, 'w', **meta) as dst:
-            #     dst.write(label.read())
-            
-            
-            # image_patches, label_patches = self.tiling(image, label)
-    
+            image_patches, label_patches, positions = self.tiling(image, label)
+            save_patches_to_zarr(image_patches=image_patches, label_patches=label_patches, 
+                                 patch_locations=positions, metadata=metadata, 
+                                 output_dir=output_folder, image_name=image_name)
+
+
 
 
 if __name__ == '__main__':
-    data = [("https://int.datacube.services.geo.ca/stac/api/collections/worldview-2-ortho-pansharp/items/ON_Gore-Bay_WV02_20110828", "/home/valhassa/Projects/geotiff-tiler/data/ON45.gpkg"), 
-            ("/home/valhassa/Projects/geotiff-tiler/data/AB26_NRGB_8bit_clahe25.tif", "/home/valhassa/Projects/geotiff-tiler/data/AB26.gpkg"),
-            ("/home/valhassa/Projects/geotiff-tiler/data/GF2_PMS1__L1A0000564539-MSS1.tif", "/home/valhassa/Projects/geotiff-tiler/data/GF2_PMS1__L1A0000564539-MSS1_24label.tif")]
     
-    tiler = Tiler(input_pairs=[data[1]], 
-                  patch_size=(1024, 1024),
-                  attr_field=["class", "Quatreclasses"],
-                  attr_values=[1, 2, 3, 4],
-                  stride=(512, 512), 
-                  discard_empty=True, 
-                  label_threshold=0.5, 
-                  single_class_mode=False, 
-                  multiclass_mode={'class1': True, 'class2': False},
-                  write_label_raster=False,
-                  label_raster_path='/home/valhassa/Projects/geotiff-tiler/data/AB26_label.tif',
-                  output_dir='/home/valhassa/Projects/geotiff-tiler/data/output')
+    # data = [{"image": "https://int.datacube.services.geo.ca/stac/api/collections/worldview-2-ortho-pansharp/items/ON_Gore-Bay_WV02_20110828", 
+    #          "label": "/home/valhassa/Projects/geotiff-tiler/data/ON45.gpkg",
+    #          "metadata": {"collection": "worldview-2-ortho-pansharp", "gsd": 0.46}}, 
+    #         {"image": "/home/valhassa/Projects/geotiff-tiler/data/AB26_NRGB_8bit_clahe25.tif", 
+    #          "label": "/home/valhassa/Projects/geotiff-tiler/data/AB26.gpkg",
+    #          "metadata": {"collection": "planetscope", "gsd": 0.6}}, 
+    #         {"image": "/home/valhassa/Projects/geotiff-tiler/data/GF2_PMS1__L1A0000564539-MSS1.tif", 
+    #          "label": "/home/valhassa/Projects/geotiff-tiler/data/GF2_PMS1__L1A0000564539-MSS1_24label.tif",
+    #          "metadata": {"collection": "gaofen-2-pansharp", "gsd": 0.8}}]
     
-    tiler.create_tiles()
+    # tiler = Tiler(input_pairs=[data[1]], 
+    #               patch_size=(1024, 1024),
+    #               attr_field=["class", "Quatreclasses"],
+    #               attr_values=[1, 2, 3, 4],
+    #               stride=1024, 
+    #               discard_empty=True, 
+    #               label_threshold=0.1, 
+    #               single_class_mode=False, 
+    #               multiclass_mode={'class1': True, 'class2': False},
+    #               write_label_raster=False,
+    #               label_raster_path='/home/valhassa/Projects/geotiff-tiler/data/AB26_label.tif',
+    #               output_dir='/home/valhassa/Projects/geotiff-tiler/data/output')
     
+    # tiler.create_tiles()
+    import matplotlib.pyplot as plt
+    zarr_path = "/home/valhassa/Projects/geotiff-tiler/data/output/zarr_stores/AB26_NRGB_8bit_clahe25.zarr"
+    visualize_zarr_patches(zarr_path, save_path="example_patch_2.png")
+    # image_patches, label_patches, patch_locations = read_patches_from_zarr(zarr_path)
+    # print(f"image_patches shape: {image_patches.shape}")
+    # print(f"label_patches shape: {label_patches.shape}")
+    # print(f"patch_locations shape: {patch_locations.shape}")
+    # fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+        
+    # # Display image (assuming RGB)
+    # if image_patches[0].shape[0] == 3 or image_patches[0].shape[0] == 4:
+    #     # Handle RGB or RGBA images
+    #     img_display = np.transpose(image_patches[0], (1, 2, 0))
+    #     if img_display.shape[2] == 4:  # RGBA
+    #         img_display = img_display[:, :, :3]  # Take only RGB channels
+    #     axes[0].imshow(img_display)
+    # else:
+    #     # Handle single band or multi-band images
+    #     axes[0].imshow(image_patches[0][0], cmap='gray')
     
+    # axes[0].set_title("Image Patch")
+    
+    # # Display label
+    # axes[1].imshow(label_patches[0][0], cmap='viridis')
+    # axes[1].set_title("Label Patch")
+    
+    # plt.tight_layout()
+    # plt.savefig("example_patch.png")
+    # plt.close()
     
