@@ -275,15 +275,31 @@ def clip_raster_to_extent(raster: rasterio.DatasetReader,
     shapes = [geometry] if hasattr(geometry, 'geom_type') else geometry
     nodata_value = raster.nodata
     
-    # Perform the clipping
-    out_image, out_transform = rasterio.mask.mask(raster,
-                                                  shapes,
-                                                  crop=True,
-                                                  all_touched=True,
-                                                  nodata=nodata_value
-                                                  )
-    # Update metadata
-    out_meta = raster.meta.copy()
+    is_vrt = raster.driver.upper() == 'VRT'
+    
+    if is_vrt:
+        with MemoryFile() as memfile:
+            temp_meta = raster.meta.copy()
+            temp_meta.update({"driver": "GTiff"})
+            with memfile.open(**temp_meta) as temp:
+                temp.write(raster.read())
+                out_image, out_transform = rasterio.mask.mask(temp,
+                                                              shapes,
+                                                              crop=True,
+                                                              all_touched=True,
+                                                              nodata=nodata_value)
+                out_meta = temp_meta.copy()
+    else:
+        # Perform the clipping
+        out_image, out_transform = rasterio.mask.mask(raster,
+                                                      shapes,
+                                                      crop=True,
+                                                      all_touched=True,
+                                                      nodata=nodata_value
+                                                      )
+        
+        out_meta = raster.meta.copy()
+    
     out_meta.update({"height": out_image.shape[1],
                      "width": out_image.shape[2],
                      "transform": out_transform,
