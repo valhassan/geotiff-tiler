@@ -47,7 +47,6 @@ def visualize_zarr_patches(zarr_path,
         n_samples = len(indices)
     
     if n_samples == 0:
-        print("No valid patches to visualize")
         return None
     # Create figure
     fig, axes = plt.subplots(n_samples, 2, figsize=figsize)
@@ -62,10 +61,11 @@ def visualize_zarr_patches(zarr_path,
         
         # Handle image display    
         img = np.transpose(img, (1, 2, 0))
-        if img.shape[2] > 3:
+        if img.shape[2] >= 3:
             img = img[:, :, :3]
             axes[i, 0].imshow(img)
-        elif img.shape[2] == 1 or len(img.shape) == 2:
+        elif img.shape[2] < 3:
+            img = img[:, :, :1]
             axes[i, 0].imshow(img, cmap=cmap_image)
         else:
             raise ValueError(f"Unexpected image shape: {img.shape}")
