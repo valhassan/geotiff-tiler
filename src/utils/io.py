@@ -5,7 +5,6 @@ import rasterio
 import fiona
 import numpy as np
 import geopandas as gpd
-from pprint import pprint
 from pathlib import Path
 from typing import Sequence
 from .checks import check_stac, check_label_type
@@ -126,12 +125,13 @@ def save_patches_to_zarr(image_patches: list[np.ndarray],
 
             # Use Blosc compression for efficiency
             compressor = zarr.codecs.BloscCodec(cname='lz4', clevel=5, shuffle='shuffle')
+            compressors = [compressor]
 
             # Store images with one patch per chunk
             images_array = root.create_array(name='images',
                                              shape=stacked_images.shape,
                                              chunks=(1, *image_shape),  # Each patch is a chunk
-                                             compressor=compressor,
+                                             compressors=compressors,
                                              dtype=stacked_images.dtype)
             images_array[:] = stacked_images
             
@@ -139,7 +139,7 @@ def save_patches_to_zarr(image_patches: list[np.ndarray],
             labels_array = root.create_array(name='labels',
                                              shape=stacked_labels.shape,
                                              chunks=(1, *label_shape),  # Each patch is a chunk
-                                             compressor=compressor,
+                                             compressors=compressors,
                                              dtype=stacked_labels.dtype)
             labels_array[:] = stacked_labels
 
@@ -147,7 +147,7 @@ def save_patches_to_zarr(image_patches: list[np.ndarray],
             locations_array = root.create_array(name='locations',
                                                 shape=patch_locations_array.shape,
                                                 chunks=(n_patches, 2),  # Single chunk for simplicity
-                                                compressor=compressor,
+                                                compressors=compressors,
                                                 dtype=patch_locations_array.dtype)
             locations_array[:] = patch_locations_array
             
@@ -155,7 +155,7 @@ def save_patches_to_zarr(image_patches: list[np.ndarray],
             metadata["label_channels"] = label_shape[0]
             root.attrs.update(metadata)
 
-            logger.info(f"Saved {n_patches} patches to {zarr_path} using Zarr")
+            logger.info(f"Saved {n_patches} patches to {zarr_path}")
             return zarr_path
 
         except Exception as e:
@@ -184,11 +184,6 @@ def read_patches_from_zarr(zarr_path, indices=None):
         """
         zarr_path = str(zarr_path)
         root = zarr.open(zarr_path, mode='r')
-        # print(f"{root['images'].info}")
-        print("Root Group Metadata:")
-        pprint(dict(root.attrs))
-        print("\nRoot Group Info:")
-        print(root.info)
         
         if indices is None:
             image_patches = root['images'][:]
@@ -200,13 +195,4 @@ def read_patches_from_zarr(zarr_path, indices=None):
             patch_locations = root['locations'][indices]
         
         return image_patches, label_patches, patch_locations
-
-
-if __name__ == '__main__':
-    stac_image = 'https://int.datacube.services.geo.ca/stac/api/collections/worldview-2-ortho-pansharp/items/ON_Gore-Bay_WV02_20110828'
-    image_path = 'data/worldview-2-ortho-pansharp/ON_Gore-Bay_WV02_20110828_1030010019004C00.tif'
-    bands_requested = ["red", "green", "blue"]
-    raster = load_image(stac_image, bands_requested)
-    print(raster.meta)
-    raster.close()
     
