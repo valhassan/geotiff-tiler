@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
-from utils.io import read_patches_from_zarr
+from .io import read_patches_from_zarr
 
 def visualize_zarr_patches(zarr_path, 
                            indices=None, 
