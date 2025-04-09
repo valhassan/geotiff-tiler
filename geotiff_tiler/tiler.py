@@ -7,13 +7,13 @@ from rasterio.windows import Window
 from typing import Tuple, Dict, List, Any
 from pathlib import Path
 
-from .utils.io import load_image, load_mask, save_patches_to_zarr
-from .utils.geoutils import create_nodata_mask, apply_nodata_mask, rasterize_vector, get_intersection
-from .utils.geoutils import ensure_crs_match, clip_to_intersection
-from .utils.checks import check_image_validity, check_label_validity, calculate_overlap
-from .utils.checks import is_image_georeferenced, is_label_georeferenced, check_alignment
-from .utils.visualization import visualize_zarr_patches
-from .config.logging_config import logger
+from geotiff_tiler.utils.io import load_image, load_mask, save_patches_to_zarr
+from geotiff_tiler.utils.geoutils import create_nodata_mask, apply_nodata_mask, rasterize_vector, get_intersection
+from geotiff_tiler.utils.geoutils import ensure_crs_match, clip_to_intersection
+from geotiff_tiler.utils.checks import check_image_validity, check_label_validity, calculate_overlap
+from geotiff_tiler.utils.checks import is_image_georeferenced, is_label_georeferenced, check_alignment
+from geotiff_tiler.utils.visualization import visualize_zarr_patches
+from geotiff_tiler.config.logging_config import logger
 
 logger = logging.getLogger(__name__)
 
