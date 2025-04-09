@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geotiff-tiler"
+version = "0.1.0"
+description = "Tool for creating patches from geo-referenced and non geo-referenced image and label pairs"
+readme = "README.md"
+authors = [{name = "Victor Alhassan", email = "victor.alhassan@nrcan-rncan.gc.ca"}]
+license = {file = "LICENSE"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+keywords = ["geotiff", "satellite imagery", "remote sensing", "geospatial", "image tiling", "earth observation", "data preparation"]
+dynamic = ["dependencies"]
+requires-python = ">=3.8"
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[project.optional-dependencies]
+dev = ["black", "bumpver", "isort", "pip-tools"]
+
+[project.urls]
+"Homepage" = "https://github.com/valhassan/geotiff-tiler"
+
+
+[tool.setuptools.packages.find]
+include = ["geotiff_tiler*"]
+
+[tool.setuptools.package-data]
+"geotiff_tiler.config" = ["*.yaml"]
