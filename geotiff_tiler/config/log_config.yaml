@@ -18,13 +18,13 @@ handlers:
     class: logging.StreamHandler
     formatter: colorlog
     stream: ext://sys.stdout
-  file:
-    class: logging.FileHandler
-    formatter: simple
-    # relative to the job log directory
-    filename: file.log
+loggers:
+  geotiff_tiler:
+    level: INFO
+    handlers: [console]
+    propagate: false
 root:
-  level: INFO
-  handlers: [console, file]
+  level: WARNING
+  handlers: [console]
 
 disable_existing_loggers: false
