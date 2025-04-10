@@ -1,6 +1,7 @@
 import logging
 import rasterio
 import numpy as np
+import pandas as pd
 import geopandas as gpd
 from tqdm import tqdm
 from rasterio.windows import Window
@@ -176,7 +177,7 @@ class Tiler:
         """Creates tiles from input pairs"""
         
         try:
-        
+            zarr_paths = []
             for id, input_dict in tqdm(enumerate(self.input_dict), 
                                     total=len(self.input_dict), desc="Processing input pairs"):
                 image_path = input_dict["image"]
@@ -204,7 +205,8 @@ class Tiler:
                 if isinstance(label, rasterio.DatasetReader) and (not is_image_georeferenced(image) or 
                                                                 not is_label_georeferenced(label)):
                     if check_alignment(image, label):
-                        self._process_and_save_tiles(image, label, metadata, output_folder, image_name)
+                        zarr_path = self._process_and_save_tiles(image, label, metadata, output_folder, image_name)
+                        zarr_paths.append(zarr_path)
                         continue
                     else:
                         logger.info("Skipping pair due to invalid label or image")
@@ -239,13 +241,15 @@ class Tiler:
                 if isinstance(label, gpd.GeoDataFrame):                    
                     label = self._prepare_vector_labels(label, image)
                 
-                self._process_and_save_tiles(image, label, metadata, output_folder, image_name)
+                zarr_path = self._process_and_save_tiles(image, label, metadata, output_folder, image_name)
+                zarr_paths.append(zarr_path)
                 
                 if 'image' in locals() and isinstance(image, rasterio.DatasetReader):
                     image.close()
                 if 'label' in locals() and isinstance(label, rasterio.DatasetReader):
                     label.close()
-            
+            df = pd.DataFrame(zarr_paths)
+            df.to_csv(Path(self.output_dir) / "zarr_paths.csv", index=False, header=False)
             logger.info("Tiling complete")
         except Exception as e:
             logger.error(f"Tiling process failed: {e}")
