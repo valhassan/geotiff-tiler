@@ -134,35 +134,6 @@ def ensure_crs_match(image: rasterio.DatasetReader,
     
     return image, label, was_converted
 
-def check_and_reopen_dataset(dataset: Union[str, Path, rasterio.DatasetReader], 
-                            original_path: Optional[str] = None) -> rasterio.DatasetReader:
-    """
-    Check if a rasterio.DatasetReader is closed and reopen it if needed.
-    
-    Args:
-        dataset: A rasterio.DatasetReader object, or path to a raster file
-        original_path: Optional path to reopen the dataset if it's closed
-        
-    Returns:
-        An open rasterio.DatasetReader object
-        
-    Raises:
-        ValueError: If dataset is closed and no original_path is provided
-    """
-    # If it's a path, open it
-    if isinstance(dataset, (str, Path)):
-        return rasterio.open(dataset)
-    
-    # If it's already a DatasetReader, check if it's closed
-    if isinstance(dataset, rasterio.DatasetReader):
-        if dataset.closed:
-            return rasterio.open(original_path)
-        else:
-            return dataset
-    else:
-        raise ValueError(
-            f"{dataset} is not an accepted format for rasterio (str, Path, or DatasetReader)")
-
 def create_nodata_mask(
     raster: Union[str, Path, rasterio.DatasetReader],
     nodata_value: Optional[Union[int, float]] = None
@@ -178,8 +149,7 @@ def create_nodata_mask(
         GeoDataFrame containing the nodata mask polygons, or None if no valid 
         nodata value is found
     """
-    print(f"Creating nodata mask for {raster}")
-    # raster = check_and_reopen_dataset(raster)
+    
     # Get nodata value
     if nodata_value is None:
         nodata_value = raster.nodata
