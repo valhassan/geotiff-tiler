@@ -40,8 +40,8 @@ data = [{
 tiler = Tiler(
     input_dict=data,
     patch_size=(256, 256),  # Height, Width
-    attr_field="class",     # Field in vector data to use for labels
-    attr_values=[1, 2, 3],  # Values to extract from the field
+    attr_field=["class", "category"],  # Field(s) in vector data to use for labels
+    attr_values=[1, 2, 3],  # Values to extract from the fields
     stride=128,             # Overlap between patches
     discard_empty=True,     # Skip patches with no labels
     label_threshold=0.05,   # Minimum non-zero label coverage
@@ -60,9 +60,9 @@ The library supports STAC (SpatioTemporal Asset Catalog) items, making it compat
 
 - **input_dict**: List of dictionaries with "image", "label", and "metadata" keys
 - **patch_size**: Tuple of (height, width) for the output patches
-- **attr_field**: Field name(s) in vector data to use for labeling
-- **attr_values**: Values to extract from the attribute field
-- **stride**: Spacing between patches (determines overlap)
+- **attr_field**: Field name(s) in vector data to use for labeling (list of strings)
+- **attr_values**: Values to extract from the attribute field (list of strings or numbers)
+- **stride**: Spacing between patches (determines overlap); if None, uses max(patch_size)
 - **discard_empty**: Whether to skip patches with no labels
 - **label_threshold**: Minimum fraction of non-zero pixels required in a label patch
 - **output_dir**: Directory to save the output patches
