@@ -75,6 +75,8 @@ Patches are saved in Zarr format with the following structure:
 - `positions`: Array of patch locations [N, 2]
 - `metadata`: Dictionary with additional information
 
+A csv file is created of the zarr paths.
+
 ## License
 
 MIT License
