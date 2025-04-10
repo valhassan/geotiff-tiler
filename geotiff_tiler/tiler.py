@@ -20,20 +20,53 @@ logger = logging.getLogger(__name__)
 
 
 class Tiler:
+    """A class for tiling geospatial images and their corresponding labels into patches.
+
+    This class handles the process of splitting geospatial images and their corresponding
+    labels (either raster or vector) into smaller patches for machine learning applications.
+    It supports various filtering options, handles coordinate reference system (CRS) 
+    mismatches, and ensures proper alignment between images and labels.
+
+    Attributes:
+        input_dict (List[Dict[str, Any]]): List of dictionaries with image, label, and metadata.
+        patch_size (Tuple[int, int]): Size of patches to create (height, width).
+        stride (int): Step size between patches. If None, uses max(patch_size).
+        discard_empty (bool): Whether to discard patches with no label data.
+        label_threshold (float): Minimum ratio of non-zero pixels required in a label patch.
+        output_dir (str): Directory where output patches will be saved.
+        attr_field (str or List[str]): Field(s) in vector data containing classification attributes.
+        attr_values (List[str]): Values in attr_field to use for classification.
+    """
+    
     
     def __init__(self, 
                  input_dict: List[Dict[str, Any]], 
                  patch_size: Tuple[int, int], # (height, width)
-                 attr_field: str,
-                 attr_values: List[str],
                  stride: int = None,
+                 attr_field: str = None,
+                 attr_values: List[str] = None,
                  discard_empty: bool = True,
                  label_threshold: float = 0.01, # minimum of non-zero pixels in a patch to be considered valid (0-1)
                  output_dir: str = None):
-        
+        """Initialize the Tiler with configuration parameters.
+
+        Args:
+            input_dict (List[Dict[str, Any]]): List of dictionaries containing:
+                - 'image': Path to the image file (str)
+                - 'label': Path to the label file (str)
+                - 'metadata': Dictionary with additional metadata (Dict)
+            patch_size (Tuple[int, int]): Size of patches to create as (height, width).
+            stride (int, optional): Step size between patches. If None, uses max(patch_size).
+            attr_field (str or List[str], optional): Field(s) in vector data containing classification attributes.
+            attr_values (List[str], optional): Values in attr_field to use for classification.
+            discard_empty (bool, optional): Whether to discard patches with no label data. Defaults to True.
+            label_threshold (float, optional): Minimum ratio of non-zero pixels required in a label patch (0-1). 
+                Defaults to 0.01.
+            output_dir (str, optional): Directory where output patches will be saved.
+        """
         self.input_dict = input_dict
         self.patch_size = patch_size
-        self.stride = stride if stride is not None else patch_size
+        self.stride = stride if stride is not None else max(patch_size)
         self.discard_empty = discard_empty
         self.label_threshold = label_threshold
         self.output_dir = output_dir
@@ -99,7 +132,26 @@ class Tiler:
         return label
     
     def tiling(self, image: rasterio.DatasetReader, label: rasterio.DatasetReader):
-        """Tiles the image and label"""
+        """Tile an image and its corresponding label into patches.
+
+        This method divides the input image and label into patches of the specified size using
+        the configured stride. It filters patches based on label content and pads patches
+        at the image boundaries to match the patch size.
+
+        Args:
+            image (rasterio.DatasetReader): The input image to be tiled.
+            label (rasterio.DatasetReader): The corresponding label to be tiled.
+
+        Returns:
+            Tuple[List[np.ndarray], List[np.ndarray], List[Tuple[int, int]]]: A tuple containing:
+                - image_patches: List of image patches as numpy arrays
+                - label_patches: List of label patches as numpy arrays
+                - positions: List of (x, y) coordinates for each patch in the original image
+
+        Raises:
+            AssertionError: If image and label dimensions don't match or patch size exceeds image dimensions.
+            Exception: If the tiling process fails for any reason.
+        """
         
         image_width = image.width
         image_height = image.height
@@ -174,7 +226,26 @@ class Tiler:
     
     
     def create_tiles(self):
-        """Creates tiles from input pairs"""
+        """Process all input image-label pairs and create tiles.
+
+        This method iterates through all input image-label pairs, performs validation checks,
+        handles CRS mismatches, and generates patches. The patches are saved in zarr format
+        and visualizations are created. The process includes:
+        
+        1. Loading images and labels
+        2. Validating georeference information
+        3. Checking image and label validity
+        4. Ensuring CRS match between image and label
+        5. Calculating overlap and clipping to intersection
+        6. Converting vector labels to raster if needed
+        7. Creating and saving tiles
+        
+        Returns:
+            None: Results are saved to the specified output_dir.
+            
+        Raises:
+            Exception: If the tiling process fails for any reason.
+        """
         
         try:
             zarr_paths = []
