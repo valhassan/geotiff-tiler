@@ -167,6 +167,7 @@ class Tiler:
         image_patches = []
         label_patches = []
         positions = []
+        discarded_count = 0
         
         try:
             logger.info(f"Tiling {image_height} x {image_width} "
@@ -181,6 +182,7 @@ class Tiler:
                     
                     label_patch = label.read(window=window, boundless=False)
                     if not self._filter_patches(label_patch):
+                        discarded_count += 1
                         continue
                     image_patch = image.read(window=window, boundless=False)
                     
@@ -190,7 +192,7 @@ class Tiler:
                     image_patches.append(image_patch)
                     label_patches.append(label_patch)
                     positions.append((x, y))
-            logger.info(f"Extracted {len(image_patches)} patches")
+            logger.info(f"Extracted {len(image_patches)} patches, discarded {discarded_count} patches")
             return image_patches, label_patches, positions
         except Exception as e:
             logger.error(f"Tiling failed: {e}")
