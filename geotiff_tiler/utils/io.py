@@ -1,4 +1,6 @@
+import time
 import logging
+import functools
 import zarr
 import pystac
 import rasterio
@@ -9,10 +11,12 @@ from pathlib import Path
 from typing import Sequence
 from .checks import check_stac, check_label_type
 from .stacitem import SingleBandItemEO
-from .geoutils import stack_bands, select_bands
+from .geoutils import stack_bands, select_bands, with_connection_retry
 
 logger = logging.getLogger(__name__)
 
+
+@with_connection_retry
 def load_image(image_path: str, 
                bands_requested: Sequence = ["red", "green", "blue"], 
                band_indices: Sequence | None = None):
