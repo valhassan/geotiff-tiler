@@ -257,7 +257,6 @@ class Tiler:
                 label_path = input_dict["label"]
                 metadata = input_dict["metadata"]
                 image_name = Path(image_path).stem
-                output_folder = self._build_output_folder(image_name, id)
                 
                 metadata["image_name"] = image_name
                 metadata["patch_size"] = self.patch_size
@@ -278,6 +277,7 @@ class Tiler:
                 if isinstance(label, rasterio.DatasetReader) and (not is_image_georeferenced(image) or 
                                                                 not is_label_georeferenced(label)):
                     if check_alignment(image, label):
+                        output_folder = self._build_output_folder(image_name, id)
                         zarr_path = self._process_and_save_tiles(image, label, metadata, output_folder, image_name)
                         zarr_paths.append(zarr_path)
                         continue
@@ -314,6 +314,7 @@ class Tiler:
                 if isinstance(label, gpd.GeoDataFrame):                    
                     label = self._prepare_vector_labels(label, image)
                 
+                output_folder = self._build_output_folder(image_name, id)
                 zarr_path = self._process_and_save_tiles(image, label, metadata, output_folder, image_name)
                 zarr_paths.append(zarr_path)
                 
