@@ -1,4 +1,7 @@
+import time
+import logging
 import rasterio
+import functools
 import rasterio.features
 import rasterio.mask
 import xml.etree.ElementTree as ET
@@ -9,7 +12,49 @@ from pathlib import Path
 from rasterio.shutil import copy as riocopy
 from rasterio import MemoryFile
 from rasterio.windows import from_bounds
+from requests.exceptions import ConnectionError, Timeout, RequestException
 from typing import List, Sequence, Optional, Union, Tuple
+
+logger = logging.getLogger(__name__)
+
+def with_connection_retry(func):
+    """Decorator to add connection retry capability to functions accessing remote resources."""
+    @functools.wraps(func)  # Preserves the original function's metadata
+    def wrapper(*args, **kwargs):
+        # Extract retry parameters from kwargs if provided
+        max_retries = kwargs.pop('max_retries', 3) if 'max_retries' in kwargs else 3
+        retry_delay = kwargs.pop('retry_delay', 1.0) if 'retry_delay' in kwargs else 1.0
+        timeout = kwargs.pop('timeout', 30.0) if 'timeout' in kwargs else 30.0
+        
+        retry_count = 0
+        last_error = None
+        
+        while retry_count < max_retries:
+            try:
+                return func(*args, **kwargs)
+            except (ConnectionError, Timeout, RequestException, rasterio.errors.RasterioIOError) as e:
+                # Only retry if it looks like a connection error
+                if "connection" in str(e).lower() or "timeout" in str(e).lower() or "remote" in str(e).lower():
+                    retry_count += 1
+                    last_error = e
+                    logger.warning(f"Connection error in {func.__name__}. "
+                                  f"Retry {retry_count}/{max_retries}. Error: {str(e)}")
+                    if retry_count < max_retries:
+                        time.sleep(retry_delay * retry_count)  # Exponential backoff
+                    continue
+                else:
+                    # Non-connection errors should be raised immediately
+                    logger.error(f"Error in {func.__name__}: {str(e)}")
+                    raise
+            except Exception as e:
+                logger.error(f"Unexpected error in {func.__name__}: {str(e)}")
+                raise
+                
+        if last_error and retry_count >= max_retries:
+            logger.error(f"Failed after {max_retries} retries in {func.__name__}")
+            raise ConnectionError(f"Failed connection after {max_retries} retries: {str(last_error)}")
+            
+    return wrapper
 
 def stack_bands(srcs: List, band: int = 1):
     """
@@ -251,6 +296,7 @@ def get_intersection(image: rasterio.DatasetReader, label: Union[rasterio.Datase
     
     return intersection
 
+@with_connection_retry
 def clip_raster_to_extent(raster: rasterio.DatasetReader,
                           geometry,
                           write_raster: bool = False,
