@@ -1,3 +1,5 @@
+import gc
+import tracemalloc
 import logging
 import rasterio
 import numpy as np
@@ -11,7 +13,7 @@ from pathlib import Path
 from geotiff_tiler.utils.io import load_image, load_mask, save_patches_to_zarr
 from geotiff_tiler.utils.geoutils import create_nodata_mask, apply_nodata_mask, rasterize_vector, get_intersection
 from geotiff_tiler.utils.geoutils import ensure_crs_match, clip_to_intersection
-from geotiff_tiler.utils.checks import check_image_validity, check_label_validity, calculate_overlap
+from geotiff_tiler.utils.checks import check_image_validity, check_label_validity, calculate_overlap, ResourceManager
 from geotiff_tiler.utils.checks import is_image_georeferenced, is_label_georeferenced, check_alignment
 from geotiff_tiler.utils.visualization import visualize_zarr_patches
 from geotiff_tiler.config.logging_config import logger
@@ -224,6 +226,8 @@ class Tiler:
                                          image_name=image_name)
         visualize_zarr_patches(zarr_path,
                                save_path=output_folder / f"{image_name}_patches.png")
+        del image_patches, label_patches, positions
+        gc.collect()
         return zarr_path
     
     
@@ -248,6 +252,8 @@ class Tiler:
         Raises:
             Exception: If the tiling process fails for any reason.
         """
+        tracemalloc.start()
+        resource_manager = ResourceManager()
         
         try:
             zarr_paths = []
@@ -263,10 +269,11 @@ class Tiler:
                 metadata["stride"] = self.stride
                 
                 try:
-                    image = load_image(image_path)
-                    label = load_mask(label_path)
+                    image = resource_manager.register(load_image(image_path))
+                    label = resource_manager.register(load_mask(label_path))
                 except Exception as e:
                     logger.error(f"Error loading image or label: {e}")
+                    resource_manager.close_all()
                     continue
                 
                 if isinstance(label, gpd.GeoDataFrame) and (not is_image_georeferenced(image) or 
@@ -277,12 +284,18 @@ class Tiler:
                 if isinstance(label, rasterio.DatasetReader) and (not is_image_georeferenced(image) or 
                                                                 not is_label_georeferenced(label)):
                     if check_alignment(image, label):
-                        output_folder = self._build_output_folder(image_name, id)
-                        zarr_path = self._process_and_save_tiles(image, label, metadata, output_folder, image_name)
-                        zarr_paths.append(zarr_path)
+                        try:
+                            output_folder = self._build_output_folder(image_name, id)
+                            zarr_path = self._process_and_save_tiles(image, label, metadata, output_folder, image_name)
+                            zarr_paths.append(zarr_path)
+                        except Exception as e:
+                            logger.error(f"Error processing image {image_name}: {e}")
+                        finally:
+                            resource_manager.close_all()
                         continue
                     else:
                         logger.info("Skipping pair due to invalid label or image")
+                        resource_manager.close_all()
                         continue
                 
                 image_valid, image_msg = check_image_validity(image)
@@ -298,6 +311,8 @@ class Tiler:
                 image, label, was_converted = ensure_crs_match(image, label)
                 if was_converted:
                     logger.info("CRS mismatch between image and label, reprojecting label to match image")
+                    if isinstance(label, rasterio.DatasetReader):
+                        resource_manager.register(label)
                 
                 overlap_pct, overlap_msg = calculate_overlap(image, label)
                 if overlap_pct == 0:
@@ -310,24 +325,28 @@ class Tiler:
                     logger.info("Skipping pair: No intersection between image and label")
                     continue
                 image, label = clip_to_intersection(image, label, intersection)
+                resource_manager.register(image)
+                resource_manager.register(label)
                 
                 if isinstance(label, gpd.GeoDataFrame):                    
                     label = self._prepare_vector_labels(label, image)
-                
+                    resource_manager.register(label)
                 output_folder = self._build_output_folder(image_name, id)
                 zarr_path = self._process_and_save_tiles(image, label, metadata, output_folder, image_name)
                 zarr_paths.append(zarr_path)
+                current, peak = tracemalloc.get_traced_memory()
+                logger.info(f"[Item {id}] Memory before processing: {current/1024/1024:.2f}MB, Peak: {peak/1024/1024:.2f}MB")
                 
-                if 'image' in locals() and isinstance(image, rasterio.DatasetReader):
-                    image.close()
-                if 'label' in locals() and isinstance(label, rasterio.DatasetReader):
-                    label.close()
+                
             df = pd.DataFrame(zarr_paths)
             df.to_csv(Path(self.output_dir) / "zarr_paths.csv", index=False, header=False)
             logger.info("Tiling complete")
         except Exception as e:
             logger.error(f"Tiling process failed: {e}")
             raise
+        finally:
+            resource_manager.close_all()
+            tracemalloc.stop()
 
 
 
