@@ -1,9 +1,13 @@
+import gc
+import logging
 import pystac
 import rasterio
 import geopandas as gpd
 import numpy as np
 from shapely.geometry import box
 from typing import Union, Tuple
+
+logger = logging.getLogger(__name__)
 
 def check_stac(image_path: str) -> bool:
     """Checks if an input string or object is a valid stac item"""
@@ -154,4 +158,24 @@ def calculate_overlap(
         return overlap_percentage, f"Overlap percentage: {overlap_percentage:.2f}%"
         
     except Exception as e:
-        return 0.0, f"Error calculating overlap: {str(e)}" 
+        return 0.0, f"Error calculating overlap: {str(e)}"
+
+class ResourceManager:
+    def __init__(self):
+        self.resources = []
+        
+    def register(self, resource):
+        """Register a resource to be managed and closed later"""
+        self.resources.append(resource)
+        return resource
+        
+    def close_all(self):
+        """Close all registered resources and clear the list"""
+        for resource in reversed(self.resources):
+            try:
+                if hasattr(resource, 'close') and callable(resource.close):
+                    resource.close()
+            except Exception as e:
+                logger.warning(f"Error closing resource: {e}")
+        self.resources = []
+        gc.collect()
