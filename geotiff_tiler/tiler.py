@@ -335,9 +335,8 @@ class Tiler:
                 zarr_path = self._process_and_save_tiles(image, label, metadata, output_folder, image_name)
                 zarr_paths.append(zarr_path)
                 current, peak = tracemalloc.get_traced_memory()
+                resource_manager.close_all()
                 logger.info(f"[Item {id}] Memory before processing: {current/1024/1024:.2f}MB, Peak: {peak/1024/1024:.2f}MB")
-                
-                
             df = pd.DataFrame(zarr_paths)
             df.to_csv(Path(self.output_dir) / "zarr_paths.csv", index=False, header=False)
             logger.info("Tiling complete")
