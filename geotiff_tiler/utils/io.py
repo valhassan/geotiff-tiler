@@ -160,6 +160,7 @@ def save_patches_to_zarr(image_patches: list[np.ndarray],
             root.attrs.update(metadata)
 
             logger.info(f"Saved {n_patches} patches to {zarr_path}")
+            del stacked_images, stacked_labels, patch_locations_array
             return zarr_path
 
         except Exception as e:
