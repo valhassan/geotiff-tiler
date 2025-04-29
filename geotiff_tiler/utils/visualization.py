@@ -3,6 +3,8 @@ import numpy as np
 from .io import read_patches_from_zarr
 
 def visualize_zarr_patches(zarr_path, 
+                           image_name,
+                           number_of_patches,
                            indices=None, 
                            n_samples=3, 
                            figsize=(15, 10), 
@@ -31,33 +33,36 @@ def visualize_zarr_patches(zarr_path,
         None
     """
     
-    # Read patches from zarr
-    image_patches, label_patches, patch_locations = read_patches_from_zarr(zarr_path)
-    
     # Select indices to visualize
-    total_patches = len(image_patches)
     if indices is None:
-        if n_samples >= total_patches:
-            indices = list(range(total_patches))
-            n_samples = total_patches
+        if n_samples >= number_of_patches:
+            indices = list(range(number_of_patches))
+            n_samples = number_of_patches
         else:
-            indices = np.random.choice(range(total_patches), size=n_samples, replace=False)
+            indices = np.random.choice(range(number_of_patches), size=n_samples, replace=False)
     else:
-        indices = [i for i in indices if i < total_patches]
+        indices = [i for i in indices if i < number_of_patches]
         n_samples = len(indices)
     
     if n_samples == 0:
         return None
+    
+    # Read patches from zarr
+    image_patches, label_patches, patch_locations = read_patches_from_zarr(zarr_path, 
+                                                                           image_name, 
+                                                                           indices=indices)
+    
     # Create figure
     fig, axes = plt.subplots(n_samples, 2, figsize=figsize)
     if n_samples == 1:
         axes = axes.reshape(1, 2)
     
     # Visualize each sample
-    for i, idx in enumerate(indices):
-        img = image_patches[idx]
-        lbl = label_patches[idx]
-        loc = patch_locations[idx]
+    for i in range(n_samples):
+        idx = indices[i]
+        img = image_patches[i]
+        lbl = label_patches[i]
+        loc = patch_locations[i]
         
         # Handle image display    
         img = np.transpose(img, (1, 2, 0))
