@@ -1,4 +1,7 @@
 import gc
+import time
+import math
+import zarr
 import tracemalloc
 import logging
 import rasterio
@@ -10,7 +13,7 @@ from rasterio.windows import Window
 from typing import Tuple, Dict, List, Any
 from pathlib import Path
 
-from geotiff_tiler.utils.io import load_image, load_mask, save_patches_to_zarr
+from geotiff_tiler.utils.io import load_image, load_mask
 from geotiff_tiler.utils.geoutils import create_nodata_mask, apply_nodata_mask, rasterize_vector, get_intersection
 from geotiff_tiler.utils.geoutils import ensure_crs_match, clip_to_intersection
 from geotiff_tiler.utils.checks import check_image_validity, check_label_validity, calculate_overlap, ResourceManager
@@ -49,7 +52,8 @@ class Tiler:
                  attr_values: List[str] = None,
                  discard_empty: bool = True,
                  label_threshold: float = 0.01, # minimum of non-zero pixels in a patch to be considered valid (0-1)
-                 output_dir: str = None):
+                 output_dir: str = None,
+                 zarr_filename: str = None):
         """Initialize the Tiler with configuration parameters.
 
         Args:
@@ -72,6 +76,7 @@ class Tiler:
         self.discard_empty = discard_empty
         self.label_threshold = label_threshold
         self.output_dir = output_dir
+        self.zarr_filename = zarr_filename
         self.attr_field = attr_field
         self.attr_values = attr_values
         
@@ -89,7 +94,6 @@ class Tiler:
             return padded_patch
         else:
             raise ValueError(f"Invalid patch shape: {patch.shape}")
-    
     
     def _filter_patches(self, label: np.ndarray) -> bool:
         """
@@ -121,7 +125,6 @@ class Tiler:
 
         return True
 
-    
     def _prepare_vector_labels(self, label: gpd.GeoDataFrame, image: rasterio.DatasetReader):
         """Prepares vector labels for tiling"""
         nodata_mask = create_nodata_mask(image)
@@ -133,7 +136,13 @@ class Tiler:
                                   output_path=None)
         return label
     
-    def tiling(self, image: rasterio.DatasetReader, label: rasterio.DatasetReader):
+    def tiling(self, 
+               image: rasterio.DatasetReader, 
+               label: rasterio.DatasetReader,
+               metadata: Dict[str, Any],
+               image_name: str,
+               output_dir: str,
+               zarr_filename: str):
         """Tile an image and its corresponding label into patches.
 
         This method divides the input image and label into patches of the specified size using
@@ -154,10 +163,11 @@ class Tiler:
             AssertionError: If image and label dimensions don't match or patch size exceeds image dimensions.
             Exception: If the tiling process fails for any reason.
         """
+        chunk_size = 32
+        buffer_size = chunk_size ** 2
         
         image_width = image.width
         image_height = image.height
-        
         label_width = label.width
         label_height = label.height
         
@@ -166,70 +176,116 @@ class Tiler:
         assert (self.patch_size[0] <= image_height and 
                 self.patch_size[1] <= image_width), "Patch size must be smaller than image dimensions"
         
-        image_patches = []
-        label_patches = []
-        positions = []
-        discarded_count = 0
+        logger.info(f"Tiling {image_height} x {image_width} "
+                    f"image with patch size {self.patch_size} and stride {self.stride}")
         
+        number_of_patches_x = math.ceil(image_width / self.stride)
+        number_of_patches_y = math.ceil(image_height / self.stride)
+        total_patches = number_of_patches_x * number_of_patches_y
+        
+        
+        output_dir_viz = Path(output_dir) / "viz"
+        output_dir_viz.mkdir(parents=True, exist_ok=True)
+        output_dir_parent = output_dir_viz.parent
+        
+        if zarr_filename is None:
+            zarr_filename = "zarr_file.zarr"
+        zarr_path_file = output_dir_parent / zarr_filename
+        zarr_path_with_image_name = zarr_path_file / image_name
+        
+        store = zarr.storage.LocalStore(str(zarr_path_file))
+        root = zarr.group(store=store, overwrite=False)
+        image_group = root.create_group(name=image_name, overwrite=False)
+        # n_patches_per_chunk = total_patches // max(1, total_patches // 100)
+        # print(f"n_patches_per_chunk: {n_patches_per_chunk}")
+        
+        image_patches_shape = (0, image.count, *self.patch_size)
+        label_patches_shape = (0, label.count, *self.patch_size)
+        image_patches_chunk_size = (chunk_size, image.count, *self.patch_size)
+        label_patches_chunk_size = (chunk_size, label.count, *self.patch_size)
+        compressors = [zarr.codecs.BloscCodec(cname='lz4', clevel=5, shuffle='shuffle')]
+        
+        images_array = image_group.create_array(name='images',
+                                                shape=image_patches_shape,
+                                                chunks=image_patches_chunk_size,
+                                                compressors=compressors,
+                                                dtype=image.dtypes[0])
+        labels_array = image_group.create_array(name='labels',
+                                                shape=label_patches_shape,
+                                                chunks=label_patches_chunk_size,
+                                                compressors=compressors,
+                                                dtype=label.dtypes[0])
+        locations_array = image_group.create_array(name='locations',
+                                                   shape=(0, 2),
+                                                   chunks=(total_patches, 2),
+                                                   compressors=compressors,
+                                                   dtype=np.int32)
+        
+        image_buffer = []
+        label_buffer = []
+        location_buffer = []
+        discarded_count = 0
+        patch_count = 0
+        start_time = time.time()
         try:
-            logger.info(f"Tiling {image_height} x {image_width} "
-                        f"image with patch size {self.patch_size} and stride {self.stride}")
+            with tqdm(total=total_patches, desc="Tiling patches") as pbar:
+                for y in range(0, image_height, self.stride):
+                    for x in range(0, image_width, self.stride):
+                        window_width = min(self.patch_size[1], image_width - x)
+                        window_height = min(self.patch_size[0], image_height - y)
+                        window = Window(col_off=x, row_off=y, width=window_width, height=window_height)
+                        
+                        label_patch = label.read(window=window, boundless=False)
+                        if not self._filter_patches(label_patch):
+                            discarded_count += 1
+                            continue
+                        image_patch = image.read(window=window, boundless=False)
+                        
+                        if image_patch.shape[1:] != self.patch_size or label_patch.shape[1:] != self.patch_size:
+                            image_patch = self.pad_patch(image_patch, self.patch_size)
+                            label_patch = self.pad_patch(label_patch, self.patch_size)
+                        
+                        image_buffer.append(image_patch)
+                        label_buffer.append(label_patch)
+                        location_buffer.append((x, y))
+                        
+                        if len(image_buffer) >= buffer_size:
+                            images_array.append(np.stack(image_buffer, axis=0))
+                            labels_array.append(np.stack(label_buffer, axis=0))
+                            locations_array.append(np.array(location_buffer))
+                            patch_count += len(image_buffer)
+                            image_buffer, label_buffer, location_buffer = [], [], []
+                        
+                        pbar.update(1)
+                        
+            if len(image_buffer) > 0:
+                images_array.append(np.stack(image_buffer, axis=0))
+                labels_array.append(np.stack(label_buffer, axis=0))
+                locations_array.append(np.array(location_buffer))
+                patch_count += len(image_buffer)
+                image_buffer, label_buffer, location_buffer = [], [], []
+                
+            metadata["image_channels"] = image.count
+            metadata["label_channels"] = label.count
+            image_group.attrs.update(metadata)
             
-            for y in range(0, image_height, self.stride):
-                for x in range(0, image_width, self.stride):
-                    window_width = min(self.patch_size[1], image_width - x)
-                    window_height = min(self.patch_size[0], image_height - y)
-                    
-                    window = Window(col_off=x, row_off=y, width=window_width, height=window_height)
-                    
-                    label_patch = label.read(window=window, boundless=False)
-                    if not self._filter_patches(label_patch):
-                        discarded_count += 1
-                        continue
-                    image_patch = image.read(window=window, boundless=False)
-                    
-                    if image_patch.shape[1:] != self.patch_size or label_patch.shape[1:] != self.patch_size:
-                        image_patch = self.pad_patch(image_patch, self.patch_size)
-                        label_patch = self.pad_patch(label_patch, self.patch_size)
-                    image_patches.append(image_patch)
-                    label_patches.append(label_patch)
-                    positions.append((x, y))
-            logger.info(f"Extracted {len(image_patches)} patches, discarded {discarded_count} patches")
-            return image_patches, label_patches, positions
+            # Save visualization
+            visualize_zarr_patches(zarr_path=zarr_path_file, 
+                                   image_name=image_name, 
+                                   number_of_patches=patch_count,
+                                   save_path=output_dir_viz / f"{image_name}.png")
+            
+            logger.info(f"Tiling complete:\n\
+                        Extracted {patch_count} patches,\n\
+                        Discarded {discarded_count} of {total_patches} patches\n\
+                        Saved to {zarr_path_with_image_name}")
+            return zarr_path_with_image_name
         except Exception as e:
             logger.error(f"Tiling failed: {e}")
             raise
-    
-    def _build_output_folder(self, image_name: str, id: int):
-        """Builds the output path for the tiles"""
-        id_str = str(id).zfill(3)
-        image_folder = f"{id_str}_{image_name}"
-        output_folder = Path(self.output_dir) / image_folder
-        if not output_folder.exists():
-            output_folder.mkdir(parents=True, exist_ok=True)
-        return output_folder
-    
-    def _build_patch_path(self, output_folder: Path, 
-                          image_name: str, x: int, y: int):
-        """Builds the output path for the tiles"""
-        patch_name = f"{image_name}_{x}_{y}.tif"
-        return output_folder / patch_name
-    
-    def _process_and_save_tiles(self, image, label, metadata, output_folder, image_name):
-        """Processes tiles and saves them to zarr format"""
-        image_patches, label_patches, positions = self.tiling(image, label)
-        zarr_path = save_patches_to_zarr(image_patches=image_patches,
-                                         label_patches=label_patches,
-                                         patch_locations=positions,
-                                         metadata=metadata,
-                                         output_dir=output_folder,
-                                         image_name=image_name)
-        visualize_zarr_patches(zarr_path,
-                               save_path=output_folder / f"{image_name}_patches.png")
-        del image_patches, label_patches, positions
-        gc.collect()
-        return zarr_path
-    
+        finally:
+            end_time = time.time()
+            logger.info(f"Tiling time: {end_time - start_time:.2f} seconds")
     
     def create_tiles(self):
         """Process all input image-label pairs and create tiles.
@@ -285,8 +341,8 @@ class Tiler:
                                                                 not is_label_georeferenced(label)):
                     if check_alignment(image, label):
                         try:
-                            output_folder = self._build_output_folder(image_name, id)
-                            zarr_path = self._process_and_save_tiles(image, label, metadata, output_folder, image_name)
+                            zarr_path = self.tiling(image, label, metadata, 
+                                                    image_name, self.output_dir, self.zarr_filename)
                             zarr_paths.append(zarr_path)
                         except Exception as e:
                             logger.error(f"Error processing image {image_name}: {e}")
@@ -331,8 +387,9 @@ class Tiler:
                 if isinstance(label, gpd.GeoDataFrame):                    
                     label = self._prepare_vector_labels(label, image)
                     resource_manager.register(label)
-                output_folder = self._build_output_folder(image_name, id)
-                zarr_path = self._process_and_save_tiles(image, label, metadata, output_folder, image_name)
+                
+                zarr_path = self.tiling(image, label, metadata, 
+                                        image_name, self.output_dir, self.zarr_filename)
                 zarr_paths.append(zarr_path)
                 current, peak = tracemalloc.get_traced_memory()
                 resource_manager.close_all()
