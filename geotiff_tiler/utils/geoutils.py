@@ -401,7 +401,6 @@ def clip_to_intersection(image: rasterio.DatasetReader,
     
     return image_clipped, label_clipped
 
-
 def rasterize_vector(
     vector: gpd.GeoDataFrame,
     image: rasterio.DatasetReader,
