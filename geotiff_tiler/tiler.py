@@ -195,6 +195,10 @@ class Tiler:
         
         store = zarr.storage.LocalStore(str(zarr_path_file))
         root = zarr.group(store=store, overwrite=False)
+        
+        if image_name in root:
+            logger.info(f"Image {image_name} already exists in {zarr_path_file}, skipping")
+            return None
         image_group = root.create_group(name=image_name, overwrite=False)
         # n_patches_per_chunk = total_patches // max(1, total_patches // 100)
         # print(f"n_patches_per_chunk: {n_patches_per_chunk}")
@@ -343,6 +347,8 @@ class Tiler:
                         try:
                             zarr_path = self.tiling(image, label, metadata, 
                                                     image_name, self.output_dir, self.zarr_filename)
+                            if zarr_path is None:
+                                continue
                             zarr_paths.append(zarr_path)
                         except Exception as e:
                             logger.error(f"Error processing image {image_name}: {e}")
@@ -390,12 +396,17 @@ class Tiler:
                 
                 zarr_path = self.tiling(image, label, metadata, 
                                         image_name, self.output_dir, self.zarr_filename)
+                if zarr_path is None:
+                    continue
                 zarr_paths.append(zarr_path)
                 current, peak = tracemalloc.get_traced_memory()
                 resource_manager.close_all()
                 logger.info(f"[Item {id}] Memory before processing: {current/1024/1024:.2f}MB, Peak: {peak/1024/1024:.2f}MB")
-            df = pd.DataFrame(zarr_paths)
-            df.to_csv(Path(self.output_dir) / "zarr_paths.csv", index=False, header=False)
+            if zarr_paths:
+                df = pd.DataFrame(zarr_paths)
+                csv_file_name = "zarr_paths.csv" if self.zarr_filename is None else f"{self.zarr_filename}.csv"
+                csv_path = Path(self.output_dir) / csv_file_name
+                df.to_csv(csv_path, index=False, header=False, mode='a')
             logger.info("Tiling complete")
         except Exception as e:
             logger.error(f"Tiling process failed: {e}")
