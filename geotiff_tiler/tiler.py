@@ -1,5 +1,7 @@
+import os
 import gc
 import time
+import json
 import math
 import zarr
 import tracemalloc
@@ -7,19 +9,21 @@ import logging
 import rasterio
 import numpy as np
 import pandas as pd
+import webdataset as wds
 import geopandas as gpd
 from tqdm import tqdm
 from rasterio.windows import Window
+from collections import defaultdict
 from typing import Tuple, Dict, List, Any
 from pathlib import Path
 
 from geotiff_tiler.utils.io import load_image, load_mask
 from geotiff_tiler.utils.geoutils import create_nodata_mask, apply_nodata_mask, rasterize_vector, get_intersection
 from geotiff_tiler.utils.geoutils import ensure_crs_match, clip_to_intersection
-from geotiff_tiler.utils.checks import check_image_validity, check_label_validity, calculate_overlap, ResourceManager
-from geotiff_tiler.utils.checks import is_image_georeferenced, is_label_georeferenced, check_alignment
+from geotiff_tiler.utils.checks import validate_pair, calculate_overlap, ResourceManager
 from geotiff_tiler.utils.visualization import visualize_zarr_patches
 from geotiff_tiler.config.logging_config import logger
+from geotiff_tiler.val import calculate_class_distribution, create_spatial_grid, select_validation_cells
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +52,19 @@ class Tiler:
                  input_dict: List[Dict[str, Any]], 
                  patch_size: Tuple[int, int], # (height, width)
                  stride: int = None,
+                 grid_size: int = 4,
+                 val_ratio: float = 0.2,
+                 class_balance_weight: float = 0.5,
+                 spatial_weight: float = 0.5,
                  attr_field: str = None,
                  attr_values: List[str] = None,
+                 class_ids: Dict[str, int] = None,
                  discard_empty: bool = True,
                  label_threshold: float = 0.01, # minimum of non-zero pixels in a patch to be considered valid (0-1)
+                 split: str = "trn",
+                 prefix: str = "sample",
                  output_dir: str = None,
-                 zarr_filename: str = None):
+                 ):
         """Initialize the Tiler with configuration parameters.
 
         Args:
@@ -63,11 +74,18 @@ class Tiler:
                 - 'metadata': Dictionary with additional metadata (Dict)
             patch_size (Tuple[int, int]): Size of patches to create as (height, width).
             stride (int, optional): Step size between patches. If None, uses max(patch_size).
+            grid_size (int, optional): Size of the grid to create. Defaults to 4.
+            val_ratio (float, optional): Ratio of validation cells to total cells. Defaults to 0.2.
+            class_balance_weight (float, optional): Weight for class balance. Defaults to 0.5.
+            spatial_weight (float, optional): Weight for spatial balance. Defaults to 0.5.
             attr_field (str or List[str], optional): Field(s) in vector data containing classification attributes.
             attr_values (List[str], optional): Values in attr_field to use for classification.
+            class_ids (Dict[str, int], optional): Dictionary mapping class names to class IDs.
             discard_empty (bool, optional): Whether to discard patches with no label data. Defaults to True.
             label_threshold (float, optional): Minimum ratio of non-zero pixels required in a label patch (0-1). 
                 Defaults to 0.01.
+            split (str, optional): Split to use for tiling. Defaults to "trn".
+            prefix (str, optional): Prefix for output files. Defaults to "sample".
             output_dir (str, optional): Directory where output patches will be saved.
         """
         self.input_dict = input_dict
@@ -75,10 +93,21 @@ class Tiler:
         self.stride = stride if stride is not None else max(patch_size)
         self.discard_empty = discard_empty
         self.label_threshold = label_threshold
+        self.split = split if split in ["trn", "tst"] else "trn"
         self.output_dir = output_dir
-        self.zarr_filename = zarr_filename
+        self.prefix = prefix
         self.attr_field = attr_field
         self.attr_values = attr_values
+        self.grid_size = grid_size
+        self.val_ratio = val_ratio
+        self.class_balance_weight = class_balance_weight
+        self.spatial_weight = spatial_weight
+        self.class_ids = class_ids or {'background': 0,
+                                       'fore': 1,
+                                       'hydro': 2,
+                                       'road': 3,
+                                       'building': 4
+                                       }
         
     @staticmethod
     def pad_patch(patch: np.ndarray, patch_size: Tuple[int, int], mode='edge'):
@@ -136,103 +165,76 @@ class Tiler:
                                   output_path=None)
         return label
     
-    def tiling(self, 
-               image: rasterio.DatasetReader, 
-               label: rasterio.DatasetReader,
-               metadata: Dict[str, Any],
-               image_name: str,
-               output_dir: str,
-               zarr_filename: str):
-        """Tile an image and its corresponding label into patches.
-
-        This method divides the input image and label into patches of the specified size using
-        the configured stride. It filters patches based on label content and pads patches
-        at the image boundaries to match the patch size.
-
-        Args:
-            image (rasterio.DatasetReader): The input image to be tiled.
-            label (rasterio.DatasetReader): The corresponding label to be tiled.
-
-        Returns:
-            Tuple[List[np.ndarray], List[np.ndarray], List[Tuple[int, int]]]: A tuple containing:
-                - image_patches: List of image patches as numpy arrays
-                - label_patches: List of label patches as numpy arrays
-                - positions: List of (x, y) coordinates for each patch in the original image
-
-        Raises:
-            AssertionError: If image and label dimensions don't match or patch size exceeds image dimensions.
-            Exception: If the tiling process fails for any reason.
-        """
-        chunk_size = 32
-        buffer_size = chunk_size ** 2
+    def _get_shard_path(self, base_path, prefix, split, idx):
+        return os.path.join(base_path, f"{prefix}-{split}-{idx:06d}.tar")
+    
+    def _estimate_patch_size(self, image_patch, label_patch, metadata):
+        size = image_patch.nbytes + label_patch.nbytes
+        size += len(json.dumps(metadata).encode("utf-8"))
+        return size
+    
+    def tiling(self,
+               image_analysis: Dict[str, Any],
+               validation_cells: List[str] = None,
+               create_val_set: bool = False
+               ):
+        
+        image = image_analysis['image']
+        label = image_analysis['label']
+        
+        metadata = image_analysis['metadata']
+        metadata["image_channels"] = image.count
+        metadata["label_channels"] = label.count
         
         image_width = image.width
         image_height = image.height
         label_width = label.width
         label_height = label.height
+        total_patches = image_analysis['grid']['total_patches']
+        grid_size = image_analysis['grid']['grid_size']
+        image_name = image_analysis['image_name']
         
         assert (image_width == label_width and 
                 image_height == label_height), "Image and label dimensions must match"
         assert (self.patch_size[0] <= image_height and 
                 self.patch_size[1] <= image_width), "Patch size must be smaller than image dimensions"
+        if create_val_set:
+            output_train_dir = Path(self.output_dir) / self.prefix / "trn"
+            output_val_dir = Path(self.output_dir) / self.prefix / "val"
+            output_train_dir.mkdir(parents=True, exist_ok=True)
+            output_val_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            output_tst_dir = Path(self.output_dir) / self.prefix / "tst"
+            output_tst_dir.mkdir(parents=True, exist_ok=True)
         
         logger.info(f"Tiling {image_height} x {image_width} "
                     f"image with patch size {self.patch_size} and stride {self.stride}")
         
-        number_of_patches_x = math.ceil(image_width / self.stride)
-        number_of_patches_y = math.ceil(image_height / self.stride)
-        total_patches = number_of_patches_x * number_of_patches_y
+        if not hasattr(self, 'prefix_shard_indices'):
+            self.prefix_shard_indices = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+            self.prefix_shard_sizes = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+            self.prefix_writers = {}
+            self.prefix_patch_counts = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
         
+        if self.prefix not in self.prefix_writers and create_val_set:
+            trn_shard_path = self._get_shard_path(output_train_dir, self.prefix, "trn",
+                                                  self.prefix_shard_indices[self.prefix]["trn"])
+            val_shard_path = self._get_shard_path(output_val_dir, self.prefix, "val", 
+                                                  self.prefix_shard_indices[self.prefix]["val"])
+            self.prefix_writers[self.prefix] = {"trn": wds.TarWriter(trn_shard_path),
+                                               "val": wds.TarWriter(val_shard_path)}
+        elif self.prefix not in self.prefix_writers and not create_val_set:
+            tst_shard_path = self._get_shard_path(output_tst_dir, self.prefix, "tst", 
+                                                  self.prefix_shard_indices[self.prefix]["tst"])
+            self.prefix_writers[self.prefix] = {"tst": wds.TarWriter(tst_shard_path)}
         
-        output_dir_viz = Path(output_dir) / "viz"
-        output_dir_viz.mkdir(parents=True, exist_ok=True)
-        output_dir_parent = output_dir_viz.parent
-        
-        if zarr_filename is None:
-            zarr_filename = "zarr_file.zarr"
-        zarr_path_file = output_dir_parent / zarr_filename
-        zarr_path_with_image_name = zarr_path_file / image_name
-        
-        store = zarr.storage.LocalStore(str(zarr_path_file))
-        root = zarr.group(store=store, overwrite=False)
-        
-        if image_name in root:
-            logger.info(f"Image {image_name} already exists in {zarr_path_file}, skipping")
-            return None
-        image_group = root.create_group(name=image_name, overwrite=False)
-        # n_patches_per_chunk = total_patches // max(1, total_patches // 100)
-        # print(f"n_patches_per_chunk: {n_patches_per_chunk}")
-        
-        image_patches_shape = (0, image.count, *self.patch_size)
-        label_patches_shape = (0, label.count, *self.patch_size)
-        image_patches_chunk_size = (chunk_size, image.count, *self.patch_size)
-        label_patches_chunk_size = (chunk_size, label.count, *self.patch_size)
-        compressors = [zarr.codecs.BloscCodec(cname='lz4', clevel=5, shuffle='shuffle')]
-        
-        images_array = image_group.create_array(name='images',
-                                                shape=image_patches_shape,
-                                                chunks=image_patches_chunk_size,
-                                                compressors=compressors,
-                                                dtype=image.dtypes[0])
-        labels_array = image_group.create_array(name='labels',
-                                                shape=label_patches_shape,
-                                                chunks=label_patches_chunk_size,
-                                                compressors=compressors,
-                                                dtype=label.dtypes[0])
-        locations_array = image_group.create_array(name='locations',
-                                                   shape=(0, 2),
-                                                   chunks=(total_patches, 2),
-                                                   compressors=compressors,
-                                                   dtype=np.int32)
-        
-        image_buffer = []
-        label_buffer = []
-        location_buffer = []
+        MAX_SHARD_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2GB
         discarded_count = 0
         patch_count = 0
         start_time = time.time()
         try:
             with tqdm(total=total_patches, desc="Tiling patches") as pbar:
+                
                 for y in range(0, image_height, self.stride):
                     for x in range(0, image_width, self.stride):
                         window_width = min(self.patch_size[1], image_width - x)
@@ -249,41 +251,67 @@ class Tiler:
                             image_patch = self.pad_patch(image_patch, self.patch_size)
                             label_patch = self.pad_patch(label_patch, self.patch_size)
                         
-                        image_buffer.append(image_patch)
-                        label_buffer.append(label_patch)
-                        location_buffer.append((x, y))
+                        # Determine grid cell for this patch
+                        if create_val_set:
+                            grid_x = int(x // (image.width / grid_size))
+                            grid_y = int(y // (image.height / grid_size))
+                            cell_id = f"{grid_x}_{grid_y}"
+                            if cell_id in validation_cells:
+                                split = "val"
+                            else:
+                                split = "trn"
+                        else:
+                            split = "tst"
                         
-                        if len(image_buffer) >= buffer_size:
-                            images_array.append(np.stack(image_buffer, axis=0))
-                            labels_array.append(np.stack(label_buffer, axis=0))
-                            locations_array.append(np.array(location_buffer))
-                            patch_count += len(image_buffer)
-                            image_buffer, label_buffer, location_buffer = [], [], []
+                        patch_key = f"{self.prefix}_{image_name}_{x}_{y}"
                         
+                        all_metadata = {"patch_metadata": {"patch_id": patch_key,
+                                                           "pixel_coordinates": [x, y],
+                                                           "patch_size": self.patch_size,
+                                                           "stride": self.stride,
+                                                           "split": split,
+                                                           "image_dtype": image.dtypes[0],
+                                                           "label_dtype": label.dtypes[0],
+                                                           "image_name": image_name,
+                                                           "sensor_type": metadata.get("collection", "unknown")
+                                                           },
+                                        "metadata": metadata
+                                        }
+                        
+                        patch_size_bytes = self._estimate_patch_size(image_patch, label_patch, all_metadata)
+                        current_shard_size = self.prefix_shard_sizes[self.prefix][split]
+                        if current_shard_size + patch_size_bytes > MAX_SHARD_SIZE_BYTES:
+                            self.prefix_writers[self.prefix][split].close()
+
+                            self.prefix_shard_indices[self.prefix][split] += 1
+                            if create_val_set:
+                                if split == "trn":
+                                    new_shard_path = self._get_shard_path(output_train_dir, self.prefix, "trn",
+                                                                          self.prefix_shard_indices[self.prefix]["trn"])
+                                else:
+                                    new_shard_path = self._get_shard_path(output_val_dir, self.prefix, "val",
+                                                                          self.prefix_shard_indices[self.prefix]["val"])
+                            else:
+                                new_shard_path = self._get_shard_path(output_tst_dir, self.prefix, "tst",
+                                                                      self.prefix_shard_indices[self.prefix]["tst"])
+                            self.prefix_writers[self.prefix][split] = wds.TarWriter(new_shard_path)
+                            logger.info(f"Created new {split} shard: {new_shard_path}")
+                            self.prefix_shard_sizes[self.prefix][split] = 0
+                            
+                        self.prefix_writers[self.prefix][split].write({"__key__": patch_key,
+                                                                      "image_patch.npy": image_patch,
+                                                                      "label_patch.npy": label_patch,
+                                                                      "metadata.json": all_metadata})
+                        self.prefix_shard_sizes[self.prefix][split] += patch_size_bytes
+                        self.prefix_patch_counts[self.prefix][split] += 1
+                        patch_count += 1
                         pbar.update(1)
-                        
-            if len(image_buffer) > 0:
-                images_array.append(np.stack(image_buffer, axis=0))
-                labels_array.append(np.stack(label_buffer, axis=0))
-                locations_array.append(np.array(location_buffer))
-                patch_count += len(image_buffer)
-                image_buffer, label_buffer, location_buffer = [], [], []
-                
-            metadata["image_channels"] = image.count
-            metadata["label_channels"] = label.count
-            image_group.attrs.update(metadata)
-            
-            # Save visualization
-            visualize_zarr_patches(zarr_path=zarr_path_file, 
-                                   image_name=image_name, 
-                                   number_of_patches=patch_count,
-                                   save_path=output_dir_viz / f"{image_name}.png")
-            
-            logger.info(f"Tiling complete:\n\
-                        Extracted {patch_count} patches,\n\
-                        Discarded {discarded_count} of {total_patches} patches\n\
-                        Saved to {zarr_path_with_image_name}")
-            return zarr_path_with_image_name
+            logger.info(f"""
+                        Tiling Complete for {image_name}!
+                        Extracted patches: {patch_count}
+                        Discarded patches: {discarded_count}
+                        Total patches: {total_patches}
+                        """)
         except Exception as e:
             logger.error(f"Tiling failed: {e}")
             raise
@@ -295,125 +323,186 @@ class Tiler:
         """Process all input image-label pairs and create tiles.
 
         This method iterates through all input image-label pairs, performs validation checks,
-        handles CRS mismatches, and generates patches. The patches are saved in zarr format
-        and visualizations are created. The process includes:
-        
-        1. Loading images and labels
-        2. Validating georeference information
-        3. Checking image and label validity
-        4. Ensuring CRS match between image and label
-        5. Calculating overlap and clipping to intersection
-        6. Converting vector labels to raster if needed
-        7. Creating and saving tiles
+        handles CRS mismatches, and generates patches. Results are saved to the specified output_dir.
         
         Returns:
-            None: Results are saved to the specified output_dir.
-            
-        Raises:
-            Exception: If the tiling process fails for any reason.
+            dict: Summary of processing results including successes, failures, and skips.
         """
+        image_analyses = []
+        global_class_distribution = defaultdict(list)
+        processing_summary = {"total": len(self.input_dict), "successful": 0, "skipped": 0, "failed": 0}
+        
         tracemalloc.start()
         resource_manager = ResourceManager()
         
-        try:
-            zarr_paths = []
-            for id, input_dict in tqdm(enumerate(self.input_dict), 
-                                    total=len(self.input_dict), desc="Processing input pairs"):
-                image_path = input_dict["image"]
-                label_path = input_dict["label"]
-                metadata = input_dict["metadata"]
-                image_name = Path(image_path).stem
-                
-                metadata["image_name"] = image_name
-                metadata["patch_size"] = self.patch_size
-                metadata["stride"] = self.stride
-                
-                try:
-                    image = resource_manager.register(load_image(image_path))
-                    label = resource_manager.register(load_mask(label_path))
-                except Exception as e:
-                    logger.error(f"Error loading image or label: {e}")
-                    resource_manager.close_all()
-                    continue
-                
-                if isinstance(label, gpd.GeoDataFrame) and (not is_image_georeferenced(image) or 
-                        not is_label_georeferenced(label)):
-                    logger.info("Skipping pair due to invalid label or image")
-                    continue
-                
-                if isinstance(label, rasterio.DatasetReader) and (not is_image_georeferenced(image) or 
-                                                                not is_label_georeferenced(label)):
-                    if check_alignment(image, label):
-                        try:
-                            zarr_path = self.tiling(image, label, metadata, 
-                                                    image_name, self.output_dir, self.zarr_filename)
-                            if zarr_path is None:
-                                continue
-                            zarr_paths.append(zarr_path)
-                        except Exception as e:
-                            logger.error(f"Error processing image {image_name}: {e}")
-                        finally:
-                            resource_manager.close_all()
-                        continue
-                    else:
-                        logger.info("Skipping pair due to invalid label or image")
-                        resource_manager.close_all()
-                        continue
-                
-                image_valid, image_msg = check_image_validity(image)
-                if not image_valid:
-                    logger.info(f"Skipping pair due to invalid image: {image_msg}")
-                    continue
-                
-                label_valid, label_msg = check_label_validity(label)
-                if not label_valid:
-                    logger.info(f"Skipping pair due to invalid label: {label_msg}")
-                    continue
-                
-                image, label, was_converted = ensure_crs_match(image, label)
-                if was_converted:
-                    logger.info("CRS mismatch between image and label, reprojecting label to match image")
-                    if isinstance(label, rasterio.DatasetReader):
-                        resource_manager.register(label)
-                
-                overlap_pct, overlap_msg = calculate_overlap(image, label)
-                if overlap_pct == 0:
-                    logger.info(f"Skipping pair due to no overlap: {overlap_msg}")
-                    continue
-                logger.info(f"Processing pair with {overlap_msg}")
-                
-                intersection = get_intersection(image, label)
-                if intersection is None:
-                    logger.info("Skipping pair: No intersection between image and label")
-                    continue
-                image, label = clip_to_intersection(image, label, intersection)
-                resource_manager.register(image)
-                resource_manager.register(label)
-                
-                if isinstance(label, gpd.GeoDataFrame):                    
-                    label = self._prepare_vector_labels(label, image)
-                    resource_manager.register(label)
-                
-                zarr_path = self.tiling(image, label, metadata, 
-                                        image_name, self.output_dir, self.zarr_filename)
-                if zarr_path is None:
-                    continue
-                zarr_paths.append(zarr_path)
-                current, peak = tracemalloc.get_traced_memory()
+        logger.info("Phase 1: Analyzing images")
+        for input_dict in tqdm(self.input_dict, desc="Processing input pairs"):
+            image_path = input_dict["image"]
+            label_path = input_dict["label"]
+            metadata = input_dict["metadata"]
+            image_name = Path(image_path).stem
+            
+            metadata["image_name"] = image_name
+            metadata["patch_size"] = self.patch_size
+            metadata["stride"] = self.stride
+            sensor_type = metadata.get("collection", "unknown")
+            
+            result = self._process_single_pair(image_path, label_path, resource_manager)
+            processing_summary[result["status"]] += 1
+            if result["status"] != "successful":
+                logger.info(f"Pair {input_dict['image']} - {result['reason']}")
                 resource_manager.close_all()
-                logger.info(f"[Item {id}] Memory before processing: {current/1024/1024:.2f}MB, Peak: {peak/1024/1024:.2f}MB")
-            if zarr_paths:
-                df = pd.DataFrame(zarr_paths)
-                csv_file_name = "zarr_paths.csv" if self.zarr_filename is None else f"{self.zarr_filename}.csv"
-                csv_path = Path(self.output_dir) / csv_file_name
-                df.to_csv(csv_path, index=False, header=False, mode='a')
-            logger.info("Tiling complete")
-        except Exception as e:
-            logger.error(f"Tiling process failed: {e}")
-            raise
-        finally:
+                continue
+            self._process_analysis(result["image"], result["label"], image_path, label_path, metadata,
+                                   image_name, sensor_type, image_analyses, global_class_distribution)
+            
             resource_manager.close_all()
-            tracemalloc.stop()
+            current, peak = tracemalloc.get_traced_memory()
+            logger.info(f"Current memory: {current/1024/1024:.2f}MB, Peak memory: {peak/1024/1024:.2f}MB")
+        target_distribution = {cls: np.mean(values) for cls, values in global_class_distribution.items()}
+        
+        logger.info(f"Phase 2: Creating WebDataset files with pre-determined splits")
+    
+        self.prefix_shard_indices = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+        self.prefix_shard_sizes = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+        self.prefix_patch_counts = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+        
+        self.prefix_writers = {}
+        
+        create_val_set = False
+        for analysis in tqdm(image_analyses, desc="Creating WebDataset files"):
+            if self.split == "trn":
+                validation_cells = select_validation_cells(analysis['grid'],
+                                                           target_distribution, 
+                                                           self.val_ratio,
+                                                           self.class_balance_weight,
+                                                           self.spatial_weight
+                                                           )
+                create_val_set = True
+            else:
+                validation_cells = None
+            
+            image_path = analysis['image_path']
+            label_path = analysis['label_path']
+            
+            results = self._process_single_pair(image_path, label_path, resource_manager)
+            if results['status'] != 'successful':
+                logger.info(f"Pair {image_path} - {results['reason']}")
+                resource_manager.close_all()
+                continue
+            
+            image = results['image']
+            label = results['label']
+            analysis['image'] = image
+            analysis['label'] = label
+            
+            self.tiling(analysis, validation_cells, create_val_set)
+            resource_manager.close_all()
+            
+        for prefix, writers in self.prefix_writers.items():
+            for split, writer in writers.items():
+                writer.close()
+                    
+        logger.info(f"Processing complete. Summary: {processing_summary}")
+        for prefix, counts in self.prefix_patch_counts.items():
+            logger.info(f"""
+                        Prefix: {prefix}, 
+                        Training patches: {counts['trn']}, 
+                        Validation patches: {counts['val']}, 
+                        Test patches: {counts['tst']},
+                        Total patches: {sum(counts.values())},
+                        Training size: {self.prefix_shard_sizes[prefix]['trn'] / 1024**2:.2f} MB,
+                        Validation size: {self.prefix_shard_sizes[prefix]['val'] / 1024**2:.2f} MB,
+                        Test size: {self.prefix_shard_sizes[prefix]['tst'] / 1024**2:.2f} MB,
+                        Training shards: {self.prefix_shard_indices[prefix]['trn'] + 1},
+                        Validation shards: {self.prefix_shard_indices[prefix]['val'] + 1},
+                        Test shards: {self.prefix_shard_indices[prefix]['tst'] + 1},
+                        """)
+        return processing_summary
+    
+    def _process_analysis(self, image, label, image_path, label_path, metadata, image_name, sensor_type, 
+                     image_analyses, global_class_distribution):
+        """
+        Process class distribution and spatial grid for an image-label pair and store results.
+        
+        Args:
+            image: Loaded image data
+            label: Loaded label data
+            image_path (str): Path to image file
+            label_path (str): Path to label file
+            metadata (dict): Metadata for the pair
+            image_name (str): Name of the image
+            sensor_type (str): Type of sensor
+            image_analyses (list): List to append analysis results to
+            global_class_distribution (defaultdict): Dictionary to store class distribution
+            
+        Returns:
+            None
+        """
+        class_distribution = calculate_class_distribution(label, self.class_ids)
+        grid = create_spatial_grid(image, self.stride, self.grid_size)
+        
+        image_analyses.append({
+            'image_path': image_path,
+            'label_path': label_path,
+            'metadata': metadata,
+            'image_name': image_name,
+            'sensor_type': sensor_type,
+            'class_distribution': class_distribution,
+            'grid': grid
+        })
+        print(f"class_distribution: {class_distribution}")
+        for cls, value in class_distribution.items():
+            global_class_distribution[cls].append(value)
+
+    def _process_single_pair(self, image_path, label_path, resource_manager):
+        """Process a single image-label pair and return the result status."""
+        image_name = Path(image_path).stem
+        try:
+            # Load data
+            image = resource_manager.register(load_image(image_path))
+            label = resource_manager.register(load_mask(label_path))
+            
+            # Validate pair and determine processing path
+            validation_result = validate_pair(image, label)
+            if not validation_result["valid"]:
+                return {"status": "skipped", "reason": validation_result["reason"]}
+                
+            special_case = validation_result.get("special_case", False)
+            if special_case:
+                # Special case processing (e.g., non-georeferenced but aligned)
+                return {"image": image, "label": label, "status": "successful", "reason": "Processed as special case"}
+            
+            # Standard processing: CRS, overlap, intersection
+            image, label, was_converted = ensure_crs_match(image, label)
+            if was_converted:
+                logger.info(f"CRS mismatch for {image_name}, reprojecting label")
+                if isinstance(label, rasterio.DatasetReader):
+                    resource_manager.register(label)
+            
+            overlap_pct, overlap_msg = calculate_overlap(image, label)
+            if overlap_pct == 0:
+                return {"status": "skipped", "reason": f"No overlap: {overlap_msg}"}
+            logger.info(f"Processing pair {image_name} with {overlap_msg}")
+            
+            intersection = get_intersection(image, label)
+            if intersection is None:
+                return {"status": "skipped", "reason": "No intersection between image and label"}
+            image, label = clip_to_intersection(image, label, intersection)
+            resource_manager.register(image)
+            resource_manager.register(label)
+            
+            # Convert vector labels if necessary
+            if isinstance(label, gpd.GeoDataFrame):
+                label = self._prepare_vector_labels(label, image)
+                resource_manager.register(label)
+
+            return {"image": image, "label": label, "status": "successful", "reason": "Processed successfully"}
+            
+        except Exception as e:
+            logger.error(f"Error processing image {image_name}: {e}")
+            return {"status": "failed", "reason": str(e)}
+    
 
 
 
