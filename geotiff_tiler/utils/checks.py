@@ -119,6 +119,36 @@ def check_label_validity(
     except Exception as e:
         return False, f"Error reading label: {str(e)}"
 
+def validate_pair(image, label):
+    """
+    Validate an image-label pair based on georeferencing and data integrity.
+    
+    Returns:
+        dict: Validation result with 'valid' (bool), 'reason' (str), and 'special_case' (bool)
+    """
+    # Check georeferencing for vector labels
+    if isinstance(label, gpd.GeoDataFrame):
+        if not is_image_georeferenced(image) or not is_label_georeferenced(label):
+            return {"valid": False, "reason": "Invalid georeferencing for vector label or image", "special_case": False}
+    # Check georeferencing for raster labels
+    elif isinstance(label, rasterio.DatasetReader):
+        if not is_image_georeferenced(image) or not is_label_georeferenced(label):
+            if check_alignment(image, label):
+                return {"valid": True, "reason": "Non-georeferenced but aligned raster pair", "special_case": True}
+            return {"valid": False, "reason": "Invalid georeferencing or alignment for raster label or image", "special_case": False}
+    
+    # Validate image
+    image_valid, image_msg = check_image_validity(image)
+    if not image_valid:
+        return {"valid": False, "reason": f"Invalid image: {image_msg}", "special_case": False}
+    
+    # Validate label
+    label_valid, label_msg = check_label_validity(label)
+    if not label_valid:
+        return {"valid": False, "reason": f"Invalid label: {label_msg}", "special_case": False}
+    
+    return {"valid": True, "reason": "Valid pair", "special_case": False}
+
 def calculate_overlap(
     image: rasterio.DatasetReader,
     label: Union[rasterio.DatasetReader, gpd.GeoDataFrame]) -> Tuple[float, str]:
