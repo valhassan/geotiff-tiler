@@ -55,7 +55,6 @@ def create_spatial_grid(image, stride_size, grid_size):
     
     stridex = maxx / grid_size
     stridey = maxy / grid_size
-    print(f"stride_size: {stride_size}")
     number_of_patches_x = math.ceil(maxx / stride_size)
     number_of_patches_y = math.ceil(maxy / stride_size)
     total_patches = number_of_patches_x * number_of_patches_y
