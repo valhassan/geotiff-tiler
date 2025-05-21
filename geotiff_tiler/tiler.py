@@ -24,6 +24,7 @@ from geotiff_tiler.utils.checks import validate_pair, calculate_overlap, Resourc
 from geotiff_tiler.utils.visualization import visualize_zarr_patches
 from geotiff_tiler.config.logging_config import logger
 from geotiff_tiler.val import calculate_class_distribution, create_spatial_grid, select_validation_cells
+from geotiff_tiler.tiling_checkpoint import TilingCheckpoint
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ class Tiler:
                  label_threshold: float = 0.01, # minimum of non-zero pixels in a patch to be considered valid (0-1)
                  split: str = "trn",
                  prefix: str = "sample",
-                 output_dir: str = None,
+                 output_dir: str = None
                  ):
         """Initialize the Tiler with configuration parameters.
 
@@ -108,6 +109,8 @@ class Tiler:
                                        'road': 3,
                                        'building': 4
                                        }
+        
+        self.checkpoint = TilingCheckpoint(output_dir, self.prefix)
         
     @staticmethod
     def pad_patch(patch: np.ndarray, patch_size: Tuple[int, int], mode='edge'):
@@ -237,6 +240,12 @@ class Tiler:
                 
                 for y in range(0, image_height, self.stride):
                     for x in range(0, image_width, self.stride):
+                        
+                        if self.checkpoint.is_patch_completed(image_name, x, y):
+                            patch_count += 1
+                            pbar.update(1)
+                            continue
+                        
                         window_width = min(self.patch_size[1], image_width - x)
                         window_height = min(self.patch_size[0], image_height - y)
                         window = Window(col_off=x, row_off=y, width=window_width, height=window_height)
@@ -245,6 +254,7 @@ class Tiler:
                         if not self._filter_patches(label_patch):
                             discarded_count += 1
                             continue
+                        
                         image_patch = image.read(window=window, boundless=False)
                         
                         if image_patch.shape[1:] != self.patch_size or label_patch.shape[1:] != self.patch_size:
@@ -303,6 +313,14 @@ class Tiler:
                                                                       "label_patch.npy": label_patch,
                                                                       "metadata.json": all_metadata})
                         self.prefix_shard_sizes[self.prefix][split] += patch_size_bytes
+                        self.checkpoint.mark_patch_completed(image_name, x, y)
+                        self.checkpoint.update_shard_info(self.prefix, split, 
+                                                          self.prefix_shard_indices[self.prefix][split],
+                                                          self.prefix_shard_sizes[self.prefix][split],
+                                                          self.prefix_patch_counts[self.prefix][split])
+                        if patch_count % 100 == 0:
+                            self.checkpoint.save_checkpoint()
+                        
                         self.prefix_patch_counts[self.prefix][split] += 1
                         patch_count += 1
                         pbar.update(1)
@@ -312,7 +330,9 @@ class Tiler:
                         Discarded patches: {discarded_count}
                         Total patches: {total_patches}
                         """)
+            self.checkpoint.save_checkpoint()
         except Exception as e:
+            self.checkpoint.save_checkpoint()
             logger.error(f"Tiling failed: {e}")
             raise
         finally:
@@ -342,6 +362,15 @@ class Tiler:
             metadata = input_dict["metadata"]
             image_name = Path(image_path).stem
             
+            # Skip already completed images
+            if self.checkpoint.is_image_completed(image_name):
+                logger.info(f"Skipping already completed image: {image_name} ")
+                processing_summary["skipped"] += 1
+                continue
+            
+            # Mark image as in progress
+            self.checkpoint.mark_image_in_progress(image_name)
+            
             metadata["image_name"] = image_name
             metadata["patch_size"] = self.patch_size
             metadata["stride"] = self.stride
@@ -351,6 +380,8 @@ class Tiler:
             processing_summary[result["status"]] += 1
             if result["status"] != "successful":
                 logger.info(f"Pair {input_dict['image']} - {result['reason']}")
+                self.checkpoint.mark_image_failed(image_name, result["reason"])
+                processing_summary["failed"] += 1
                 resource_manager.close_all()
                 continue
             self._process_analysis(result["image"], result["label"], image_path, label_path, metadata,
@@ -367,10 +398,23 @@ class Tiler:
         self.prefix_shard_sizes = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
         self.prefix_patch_counts = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
         
+        for split in ["trn", "val", "tst"]:
+            index, size, count = self.checkpoint.get_shard_info(self.prefix, split)
+            self.prefix_shard_indices[self.prefix][split] = index
+            self.prefix_shard_sizes[self.prefix][split] = size
+            self.prefix_patch_counts[self.prefix][split] = count
+        
         self.prefix_writers = {}
         
         create_val_set = False
         for analysis in tqdm(image_analyses, desc="Creating WebDataset files"):
+            image_name = analysis['image_name']
+            
+            if self.checkpoint.is_image_completed(image_name):
+                logger.info(f"Skipping already completed image for tiling: {image_name} ")
+                processing_summary["skipped"] += 1
+                continue
+            
             if self.split == "trn":
                 validation_cells = select_validation_cells(analysis['grid'],
                                                            target_distribution, 
@@ -382,29 +426,48 @@ class Tiler:
             else:
                 validation_cells = None
             
-            image_path = analysis['image_path']
-            label_path = analysis['label_path']
-            
-            results = self._process_single_pair(image_path, label_path, resource_manager)
-            if results['status'] != 'successful':
-                logger.info(f"Pair {image_path} - {results['reason']}")
+            self.checkpoint.mark_image_in_progress(image_name)
+            try:
+                image_path = analysis['image_path']
+                label_path = analysis['label_path']
+                
+                results = self._process_single_pair(image_path, label_path, resource_manager)
+                if results['status'] != 'successful':
+                    logger.info(f"Pair {image_path} - {results['reason']}")
+                    self.checkpoint.mark_image_failed(image_name, results['reason'])
+                    processing_summary["failed"] += 1
+                    resource_manager.close_all()
+                    continue
+                
+                image = results['image']
+                label = results['label']
+                analysis['image'] = image
+                analysis['label'] = label
+                
+                self.tiling(analysis, validation_cells, create_val_set)
+                self.checkpoint.mark_image_completed(image_name)
                 resource_manager.close_all()
-                continue
-            
-            image = results['image']
-            label = results['label']
-            analysis['image'] = image
-            analysis['label'] = label
-            
-            self.tiling(analysis, validation_cells, create_val_set)
-            resource_manager.close_all()
+            except Exception as e:
+                logger.error(f"Error tiling image {image_name}: {e}")
+                self.checkpoint.mark_image_failed(image_name, str(e))
+                processing_summary["failed"] += 1
+                resource_manager.close_all()
             
         for prefix, writers in self.prefix_writers.items():
             for split, writer in writers.items():
                 writer.close()
-                    
-        logger.info(f"Processing complete. Summary: {processing_summary}")
+        self.checkpoint.save_checkpoint()
+        logger.info(f"Final checkpoint saved. Stats: {self.checkpoint.get_stats()}")            
+        
+        logger.info(f"\nProcessing complete. Summary: {processing_summary}")
         for prefix, counts in self.prefix_patch_counts.items():
+            if self.prefix_shard_indices[prefix]['trn'] == 0:
+                self.prefix_shard_indices[prefix]['trn'] = -1
+            if self.prefix_shard_indices[prefix]['val'] == 0:
+                self.prefix_shard_indices[prefix]['val'] = -1
+            if self.prefix_shard_indices[prefix]['tst'] == 0:
+                self.prefix_shard_indices[prefix]['tst'] = -1
+                
             logger.info(f"""
                         Prefix: {prefix}, 
                         Training patches: {counts['trn']}, 
@@ -418,6 +481,7 @@ class Tiler:
                         Validation shards: {self.prefix_shard_indices[prefix]['val'] + 1},
                         Test shards: {self.prefix_shard_indices[prefix]['tst'] + 1},
                         """)
+    
         return processing_summary
     
     def _process_analysis(self, image, label, image_path, label_path, metadata, image_name, sensor_type, 
