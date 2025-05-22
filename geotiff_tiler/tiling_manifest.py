@@ -397,6 +397,16 @@ class TilingManifest:
         else:
             return min(0.3, default_ratio + 0.05)  # Increase by 5%
     
+    def get_total_sizes_by_split(self) -> Dict[str, int]:
+        """Calculate total size across all shards for each split"""
+        total_sizes = {"trn": 0, "val": 0, "tst": 0}
+        
+        for split in ["trn", "val", "tst"]:
+            for shard in self.shards.get(split, []):
+                total_sizes[split] += shard.get("size_bytes", 0)
+        
+        return total_sizes
+    
     # --- Save and Load Methods ---
     
     def save_manifest(self):
@@ -502,7 +512,7 @@ class TilingManifest:
         }
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get manifest statistics (compatible with original TilingCheckpoint)"""
+        """Get manifest statistics"""
         return {
             "completed_images": len(self.completed_images),
             "failed_images": len(self.failed_images),
