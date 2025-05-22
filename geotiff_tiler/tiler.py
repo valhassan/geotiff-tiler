@@ -471,9 +471,10 @@ class Tiler:
             for split, writer in writers.items():
                 writer.close()
         self.manifest.save_manifest()
-        logger.info(f"Final checkpoint saved. Stats: {self.manifest.get_stats()}")            
+        logger.info(f"Final checkpoint saved. Stats")            
         
         logger.info(f"\nProcessing complete. Summary: {processing_summary}")
+        total_sizes = self.manifest.get_total_sizes_by_split()
         for prefix, counts in self.prefix_patch_counts.items():
             if self.prefix_shard_indices[prefix]['trn'] == 0:
                 self.prefix_shard_indices[prefix]['trn'] = -1
@@ -488,9 +489,9 @@ class Tiler:
                         Validation patches: {counts['val']}, 
                         Test patches: {counts['tst']},
                         Total patches: {sum(counts.values())},
-                        Training size: {self.prefix_shard_sizes[prefix]['trn'] / 1024**2:.2f} MB,
-                        Validation size: {self.prefix_shard_sizes[prefix]['val'] / 1024**2:.2f} MB,
-                        Test size: {self.prefix_shard_sizes[prefix]['tst'] / 1024**2:.2f} MB,
+                        Training size: {total_sizes['trn'] / 1024**2:.2f} MB,
+                        Validation size: {total_sizes['val'] / 1024**2:.2f} MB,
+                        Test size: {total_sizes['tst'] / 1024**2:.2f} MB,
                         Training shards: {self.prefix_shard_indices[prefix]['trn'] + 1},
                         Validation shards: {self.prefix_shard_indices[prefix]['val'] + 1},
                         Test shards: {self.prefix_shard_indices[prefix]['tst'] + 1},
