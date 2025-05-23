@@ -52,6 +52,8 @@ class Tiler:
     def __init__(self, 
                  input_dict: List[Dict[str, Any]], 
                  patch_size: Tuple[int, int], # (height, width)
+                 bands_requested: List[str] = ["red", "green", "blue", "nir"],
+                 band_indices: List[int] = None,
                  stride: int = None,
                  grid_size: int = 4,
                  val_ratio: float = 0.2,
@@ -91,6 +93,8 @@ class Tiler:
         """
         self.input_dict = input_dict
         self.patch_size = patch_size
+        self.bands_requested = bands_requested
+        self.band_indices = band_indices
         self.stride = stride if stride is not None else max(patch_size)
         self.discard_empty = discard_empty
         self.label_threshold = label_threshold
@@ -185,14 +189,19 @@ class Tiler:
         image = image_analysis['image']
         label = image_analysis['label']
         
-        metadata = image_analysis['metadata']
-        metadata["image_channels"] = image.count
-        metadata["label_channels"] = label.count
+        
         
         image_width = image.width
         image_height = image.height
+        image_bands = image.count
         label_width = label.width
         label_height = label.height
+        label_bands = label.count
+        
+        metadata = image_analysis['metadata']
+        metadata["image_channels"] = image_bands
+        metadata["label_channels"] = label_bands
+        
         total_patches = image_analysis['grid']['total_patches']
         grid_size = image_analysis['grid']['grid_size']
         image_name = image_analysis['image_name']
@@ -217,7 +226,7 @@ class Tiler:
             output_tst_dir = Path(self.output_dir) / self.prefix / "tst"
             output_tst_dir.mkdir(parents=True, exist_ok=True)
         
-        logger.info(f"Tiling {image_height} x {image_width} "
+        logger.info(f"Tiling {image_height} x {image_width} x {image_bands} "
                     f"image with patch size {self.patch_size} and stride {self.stride}")
         
         if not hasattr(self, 'prefix_shard_indices'):
@@ -294,7 +303,11 @@ class Tiler:
                                                            },
                                         "metadata": metadata
                                         }
-                        
+                        if split == "trn":
+                            try:
+                                self.manifest.update_running_statistics(self.prefix, image_patch)
+                            except Exception as e:
+                                logger.error(f"Error updating running statistics: {e}")
                         patch_size_bytes = self._estimate_patch_size(image_patch, label_patch, all_metadata)
                         current_shard_size = self.prefix_shard_sizes[self.prefix][split]
                         if current_shard_size + patch_size_bytes > MAX_SHARD_SIZE_BYTES:
@@ -471,17 +484,20 @@ class Tiler:
             for split, writer in writers.items():
                 writer.close()
         self.manifest.save_manifest()
-        logger.info(f"Final checkpoint saved. Stats")            
+        logger.info(f"Final checkpoint saved")            
         
         logger.info(f"\nProcessing complete. Summary: {processing_summary}")
         total_sizes = self.manifest.get_total_sizes_by_split()
         for prefix, counts in self.prefix_patch_counts.items():
-            if self.prefix_shard_indices[prefix]['trn'] == 0:
-                self.prefix_shard_indices[prefix]['trn'] = -1
-            if self.prefix_shard_indices[prefix]['val'] == 0:
-                self.prefix_shard_indices[prefix]['val'] = -1
-            if self.prefix_shard_indices[prefix]['tst'] == 0:
-                self.prefix_shard_indices[prefix]['tst'] = -1
+            def get_shard_count(split_name):
+                if counts[split_name] > 0:
+                    return self.prefix_shard_indices[prefix][split_name] + 1
+                else:
+                    return 0
+            
+            trn_shards = get_shard_count('trn')
+            val_shards = get_shard_count('val')
+            tst_shards = get_shard_count('tst')
                 
             logger.info(f"""
                         Prefix: {prefix}, 
@@ -492,9 +508,9 @@ class Tiler:
                         Training size: {total_sizes['trn'] / 1024**2:.2f} MB,
                         Validation size: {total_sizes['val'] / 1024**2:.2f} MB,
                         Test size: {total_sizes['tst'] / 1024**2:.2f} MB,
-                        Training shards: {self.prefix_shard_indices[prefix]['trn'] + 1},
-                        Validation shards: {self.prefix_shard_indices[prefix]['val'] + 1},
-                        Test shards: {self.prefix_shard_indices[prefix]['tst'] + 1},
+                        Training shards: {trn_shards},
+                        Validation shards: {val_shards},
+                        Test shards: {tst_shards},
                         """)
     
         return processing_summary
@@ -538,7 +554,7 @@ class Tiler:
         image_name = Path(image_path).stem
         try:
             # Load data
-            image = resource_manager.register(load_image(image_path))
+            image = resource_manager.register(load_image(image_path, self.bands_requested, self.band_indices))
             label = resource_manager.register(load_mask(label_path))
             
             # Validate pair and determine processing path
