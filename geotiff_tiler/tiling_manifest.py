@@ -2,11 +2,41 @@ import os
 import json
 import logging
 import signal
+import numpy as np
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Set, Optional, List
 
 logger = logging.getLogger(__name__)
+
+
+class NumpyEncoder(json.JSONEncoder):
+    """JSON encoder that handles NumPy arrays and types."""
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return {
+                "_type": "ndarray",
+                "data": obj.tolist(),
+                "dtype": str(obj.dtype),
+                "shape": obj.shape
+            }
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
+
+def numpy_decoder(dct):
+    """JSON decoder that reconstructs NumPy arrays."""
+    if "_type" in dct and dct["_type"] == "ndarray":
+        arr = np.array(dct["data"], dtype=dct["dtype"])
+        # Reshape if needed (handles empty arrays correctly)
+        if "shape" in dct and arr.size > 0:
+            arr = arr.reshape(dct["shape"])
+        return arr
+    return dct
 
 class TilingManifest:
     """
@@ -65,6 +95,9 @@ class TilingManifest:
             "image_counts": {"total": 0, "completed": 0, "failed": 0, "in_progress": 0},
             "actual_split_ratio": {"trn": 0, "val": 0, "tst": 0}
         }
+        self.running_statistics = {} # prefix -> band statistics
+        self.stats_update_counter = 0 # Track updates for save frequency
+        self.stats_save_frequency = 100 # Save every N patches
         
         # Load manifest if resuming
         if self.manifest_path.exists():
@@ -84,6 +117,23 @@ class TilingManifest:
         
         signal.signal(signal.SIGINT, handle_interrupt)
         signal.signal(signal.SIGTERM, handle_interrupt)
+        
+    def _initialize_band_statistics(self, prefix: str, patch: np.ndarray):
+        """Initialize statistics tracking for a new prefix/sensor configuration."""
+        band_count = patch.shape[0]
+        
+        self.running_statistics[prefix] = {
+            "band_count": band_count,
+            "pixel_count": 0,
+            "band_sums": np.zeros(band_count, dtype=np.float64),
+            "band_sums_squared": np.zeros(band_count, dtype=np.float64),
+            "dtype": str(patch.dtype),
+            "first_patch_shape": patch.shape,
+            "last_updated": datetime.now().isoformat(),
+            "patch_count": 0  # Number of patches processed
+        }
+        
+        logger.info(f"Initialized statistics for prefix '{prefix}' with {band_count} bands")
     
     # --- Image and Patch Tracking Methods (from original TilingCheckpoint) ---
     
@@ -370,6 +420,107 @@ class TilingManifest:
                 
             self.dataset_statistics["class_distribution"] = new_distribution
     
+    def update_running_statistics(self, prefix: str, patch: np.ndarray):
+        """
+        Update running statistics with a new training patch.
+        
+        Args:
+            prefix (str): Dataset prefix (determines sensor type)
+            patch (np.ndarray): Image patch with shape (bands, height, width)
+        """
+        # Initialize on first patch
+        if prefix not in self.running_statistics:
+            self._initialize_band_statistics(prefix, patch)
+        
+        stats = self.running_statistics[prefix]
+        
+        # Validate band consistency
+        if patch.shape[0] != stats["band_count"]:
+            raise ValueError(
+                f"Band count mismatch for prefix '{prefix}': "
+                f"expected {stats['band_count']}, got {patch.shape[0]}"
+            )
+        
+        # Convert to float64 for precision
+        patch_float = patch.astype(np.float64)
+        
+        # Update statistics for each band
+        for band_idx in range(stats["band_count"]):
+            band_data = patch_float[band_idx].ravel()
+            stats["band_sums"][band_idx] += np.sum(band_data)
+            stats["band_sums_squared"][band_idx] += np.sum(band_data ** 2)
+        
+        # Update counts
+        pixels_per_patch = patch.shape[1] * patch.shape[2]
+        stats["pixel_count"] += pixels_per_patch
+        stats["patch_count"] += 1
+        stats["last_updated"] = datetime.now().isoformat()
+        
+        # Increment counter for save frequency
+        self.stats_update_counter += 1
+        
+        # Save periodically
+        if self.stats_update_counter >= self.stats_save_frequency:
+            self.save_manifest()
+            self.stats_update_counter = 0
+            logger.debug(f"Saved manifest after {self.stats_save_frequency} patches")
+    
+    def get_dataset_statistics(self, prefix: str) -> Dict[str, Any]:
+        """
+        Calculate and return mean and standard deviation from running statistics.
+        
+        Args:
+            prefix (str): Dataset prefix
+            
+        Returns:
+            Dictionary with 'mean' and 'std' lists for each band, plus metadata
+        """
+        if prefix not in self.running_statistics:
+            raise ValueError(f"No statistics found for prefix '{prefix}'")
+        
+        stats = self.running_statistics[prefix]
+        
+        if stats["pixel_count"] == 0:
+            raise ValueError(f"No patches processed yet for prefix '{prefix}'")
+        
+        # Calculate mean and std for each band
+        means = []
+        stds = []
+        
+        for band_idx in range(stats["band_count"]):
+            # Mean = sum / n
+            mean = stats["band_sums"][band_idx] / stats["pixel_count"]
+            
+            # Variance = E[X^2] - E[X]^2
+            mean_of_squares = stats["band_sums_squared"][band_idx] / stats["pixel_count"]
+            variance = mean_of_squares - mean ** 2
+            
+            # Handle numerical precision issues
+            variance = max(0, variance)
+            std = np.sqrt(variance)
+            
+            means.append(mean)
+            stds.append(std)
+        
+        return {
+            "mean": means,
+            "std": stds,
+            "band_count": stats["band_count"],
+            "pixel_count": stats["pixel_count"],
+            "patch_count": stats["patch_count"],
+            "dtype": stats["dtype"],
+            "last_updated": stats["last_updated"]
+        }
+    def get_all_dataset_statistics(self) -> Dict[str, Dict[str, Any]]:
+        """Get statistics for all prefixes in the dataset."""
+        all_stats = {}
+        for prefix in self.running_statistics:
+            try:
+                all_stats[prefix] = self.get_dataset_statistics(prefix)
+            except ValueError as e:
+                logger.warning(f"Could not get statistics for {prefix}: {e}")
+        return all_stats
+    
     def is_split_ratio_drifting(self, threshold=0.03):
         """Check if the split ratio is drifting from target"""
         if "actual_split_ratio" not in self.dataset_statistics:
@@ -422,6 +573,7 @@ class TilingManifest:
             "dataset_info": self.dataset_info,
             "shards": self.shards,
             "statistics": self.dataset_statistics,
+            "running_statistics": self.running_statistics,
             "processed_images": self.image_metadata,
             "progress": {
                 "completed_images": list(self.completed_images),
@@ -439,7 +591,7 @@ class TilingManifest:
         # Write to temporary file first (atomic write pattern)
         temp_path = self.manifest_path.with_suffix('.tmp')
         with open(temp_path, 'w') as f:
-            json.dump(manifest_data, f, indent=2)
+            json.dump(manifest_data, f, indent=2, cls=NumpyEncoder)
         
         # Atomic rename
         temp_path.rename(self.manifest_path)
@@ -448,7 +600,7 @@ class TilingManifest:
         """Load manifest from disk"""
         try:
             with open(self.manifest_path, 'r') as f:
-                manifest_data = json.load(f)
+                manifest_data = json.load(f, object_hook=numpy_decoder)
             
             # Load dataset info
             self.dataset_info = manifest_data.get("dataset_info", {})
@@ -458,6 +610,10 @@ class TilingManifest:
             
             # Load statistics
             self.dataset_statistics = manifest_data.get("statistics", {})
+            
+            # Load running statistics
+            self.running_statistics = manifest_data.get("running_statistics", {})
+            self.stats_update_counter = 0 # Reset counter
             
             # Load image metadata
             self.image_metadata = manifest_data.get("processed_images", {})
@@ -510,6 +666,8 @@ class TilingManifest:
             "image_counts": {"total": 0, "completed": 0, "failed": 0, "in_progress": 0},
             "actual_split_ratio": {"trn": 0, "val": 0, "tst": 0}
         }
+        self.running_statistics = {}
+        self.stats_update_counter = 0
     
     def get_stats(self) -> Dict[str, Any]:
         """Get manifest statistics"""
