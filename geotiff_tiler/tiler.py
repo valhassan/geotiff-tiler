@@ -303,6 +303,102 @@ class Tiler:
         except Exception as e:
             logger.error(f"Failed to export normalization statistics: {e}")
     
+    def retry_failed_images(self, max_retries: int = 3) -> Dict[str, Any]:
+        """Retry all failed images from the manifest.
+        
+        Args:
+            max_retries (int): Maximum number of retry attempts for each failed image.
+                            Defaults to 3.
+        
+        Returns:
+            dict: Summary of retry processing results including successes, failures, and skips.
+        """
+        # Get current failed images from manifest
+        failed_images = self.manifest.failed_images.copy()
+        
+        if not failed_images:
+            logger.info("No failed images to retry")
+            return {"total": 0, "successful": 0, "skipped": 0, "failed": 0}
+        
+        logger.info(f"Found {len(failed_images)} failed images to retry")
+        
+        # Find the failed images in the original input_dict
+        retry_dict = []
+        for input_item in self.input_dict:
+            image_name = Path(input_item["image"]).stem
+            if image_name in failed_images:
+                retry_dict.append(input_item)
+                logger.info(f"Queuing {image_name} for retry (previous failure: {failed_images[image_name]})")
+        
+        if not retry_dict:
+            logger.warning("Failed images not found in input_dict. They may have been removed.")
+            return {"total": len(failed_images), "successful": 0, "skipped": 0, "failed": len(failed_images)}
+        
+        # Store original input_dict and temporarily replace with retry list
+        original_input_dict = self.input_dict
+        self.input_dict = retry_dict
+        
+        # Track retry attempts
+        retry_summary = {"total": len(retry_dict), "successful": 0, "skipped": 0, "failed": 0}
+        
+        # Perform retries with attempt tracking
+        for attempt in range(1, max_retries + 1):
+            if not self.input_dict:  # All images processed successfully
+                break
+                
+            logger.info(f"\n=== Retry attempt {attempt}/{max_retries} ===")
+            
+            # Process the failed images
+            result = self.create_tiles()
+            
+            # Update retry summary
+            retry_summary["successful"] += result["successful"]
+            retry_summary["skipped"] += result["skipped"]
+            
+            # Check which images are still failing
+            still_failed = []
+            for input_item in self.input_dict:
+                image_name = Path(input_item["image"]).stem
+                if self.manifest.is_image_failed(image_name):
+                    still_failed.append(input_item)
+            
+            # Update input_dict with only still-failed images for next attempt
+            self.input_dict = still_failed
+            
+            if not still_failed:
+                logger.info(f"All images processed successfully after {attempt} attempt(s)")
+                break
+            
+            logger.info(f"{len(still_failed)} images still failing after attempt {attempt}")
+            
+            if attempt < max_retries:
+                # Optional: Add a small delay between retries to avoid hammering the server
+                wait_time = min(2 ** attempt, 30)  # Exponential backoff, max 30 seconds
+                logger.info(f"Waiting {wait_time} seconds before next retry...")
+                time.sleep(wait_time)
+        
+        # Final tally of failed images
+        retry_summary["failed"] = len(self.input_dict)
+        
+        # Restore original input_dict
+        self.input_dict = original_input_dict
+        
+        # Log final summary
+        logger.info(f"\n=== Retry Summary ===")
+        logger.info(f"Total images retried: {retry_summary['total']}")
+        logger.info(f"Successfully processed: {retry_summary['successful']}")
+        logger.info(f"Skipped: {retry_summary['skipped']}")
+        logger.info(f"Still failing: {retry_summary['failed']}")
+        
+        if retry_summary["failed"] > 0:
+            logger.warning("The following images are still failing after all retry attempts:")
+            for input_item in self.input_dict:
+                image_name = Path(input_item["image"]).stem
+                reason = self.manifest.failed_images.get(image_name, "Unknown reason")
+                logger.warning(f"  - {image_name}: {reason}")
+        
+        return retry_summary
+    
     def _process_single_pair(self, image_path, label_path, resource_manager):
         """Process a single image-label pair and return the result status."""
         image_name = Path(image_path).stem
@@ -658,5 +754,6 @@ if __name__ == '__main__':
                   label_threshold=0.1,
                   output_dir='/home/valhassa/Projects/geotiff-tiler/data/output')
     
-    tiler.create_tiles()
-    
+    initial_result = tiler.create_tiles()
+    if initial_result["failed"] > 0:
+        retry_result = tiler.retry_failed_images(max_retries=3)
