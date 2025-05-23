@@ -16,6 +16,7 @@ from rasterio.windows import Window
 from collections import defaultdict
 from typing import Tuple, Dict, List, Any
 from pathlib import Path
+from datetime import datetime
 
 from geotiff_tiler.utils.io import load_image, load_mask
 from geotiff_tiler.utils.geoutils import create_nodata_mask, apply_nodata_mask, rasterize_vector, get_intersection
@@ -115,72 +116,276 @@ class Tiler:
                                        }
         
         self.manifest = TilingManifest(output_dir, self.prefix)
-        
-    @staticmethod
-    def pad_patch(patch: np.ndarray, patch_size: Tuple[int, int], mode='edge'):
-        """Pads the patch to the patch size"""
-        height, width = patch.shape[-2:]
-        pad_height = patch_size[0] - height
-        pad_width = patch_size[1] - width
-        if patch.ndim == 2:
-            padded_patch = np.pad(patch, ((0, pad_height), (0, pad_width)), mode=mode)
-            return padded_patch
-        elif patch.ndim == 3:
-            padded_patch = np.pad(patch, ((0, 0), (0, pad_height), (0, pad_width)), mode=mode)
-            return padded_patch
-        else:
-            raise ValueError(f"Invalid patch shape: {patch.shape}")
     
-    def _filter_patches(self, label: np.ndarray) -> bool:
-        """
-        Filters patches based on the discard_empty flag and label_threshold.
+    def create_tiles(self):
+        """Process all input image-label pairs and create tiles.
 
-        Args:
-            label (np.ndarray): The corresponding label patch.
-
+        This method iterates through all input image-label pairs, performs validation checks,
+        handles CRS mismatches, and generates patches. Results are saved to the specified output_dir.
+        
         Returns:
-            bool: True if the patch passes the filters, False otherwise.
+            dict: Summary of processing results including successes, failures, and skips.
         """
-        # Ensure label is not empty to avoid issues
-        if label.size == 0:
-            logger.debug("Patch discarded: invalid shape or empty")
-            return False
-        nonzero_count = np.count_nonzero(label)
+        image_analyses = []
+        global_class_distribution = defaultdict(list)
+        processing_summary = {"total": len(self.input_dict), "successful": 0, "skipped": 0, "failed": 0}
         
-        # Discard patches where all label values are 0
-        if self.discard_empty and nonzero_count == 0:
-            logger.debug("Patch discarded: all label values are 0")
-            return False
+        tracemalloc.start()
+        resource_manager = ResourceManager()
         
-        # Apply label coverage threshold
-        if self.label_threshold is not None:
-            label_coverage = nonzero_count / label.size
-            if label_coverage < self.label_threshold:
-                logger.debug(f"Patch discarded: label coverage {label_coverage:.2f} < {self.label_threshold}")
-                return False
+        logger.info("Phase 1: Analyzing images")
+        for input_dict in tqdm(self.input_dict, desc="Processing input pairs"):
+            image_path = input_dict["image"]
+            label_path = input_dict["label"]
+            metadata = input_dict["metadata"]
+            image_name = Path(image_path).stem
+            
+            # Skip already completed images
+            if self.manifest.is_image_completed(image_name):
+                logger.info(f"Skipping already completed image: {image_name} ")
+                processing_summary["skipped"] += 1
+                continue
+            
+            # Mark image as in progress
+            self.manifest.mark_image_in_progress(image_name)
+            
+            metadata["image_name"] = image_name
+            metadata["patch_size"] = self.patch_size
+            metadata["stride"] = self.stride
+            sensor_type = metadata.get("collection", "unknown")
+            
+            result = self._process_single_pair(image_path, label_path, resource_manager)
+            processing_summary[result["status"]] += 1
+            if result["status"] != "successful":
+                logger.info(f"Pair {input_dict['image']} - {result['reason']}")
+                self.manifest.mark_image_failed(image_name, result["reason"])
+                processing_summary["failed"] += 1
+                resource_manager.close_all()
+                continue
+            self._process_analysis(result["image"], result["label"], image_path, label_path, metadata,
+                                   image_name, sensor_type, image_analyses, global_class_distribution)
+            self.manifest.update_class_distribution(image_analyses[-1]["class_distribution"])
+            resource_manager.close_all()
+            current, peak = tracemalloc.get_traced_memory()
+            logger.info(f"Current memory: {current/1024/1024:.2f}MB, Peak memory: {peak/1024/1024:.2f}MB")
+        target_distribution = {cls: np.mean(values) for cls, values in global_class_distribution.items()}
+        
+        logger.info(f"Phase 2: Creating WebDataset files with pre-determined splits")
+    
+        self.prefix_shard_indices = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+        self.prefix_shard_sizes = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+        self.prefix_patch_counts = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+        
+        for split in ["trn", "val", "tst"]:
+            index, size, count = self.manifest.get_shard_info(self.prefix, split)
+            self.prefix_shard_indices[self.prefix][split] = index
+            self.prefix_shard_sizes[self.prefix][split] = size
+            self.prefix_patch_counts[self.prefix][split] = count
+        
+        self.prefix_writers = {}
+        
+        create_val_set = False
+        for analysis in tqdm(image_analyses, desc="Creating WebDataset files"):
+            image_name = analysis['image_name']
+            
+            if self.manifest.is_image_completed(image_name):
+                logger.info(f"Skipping already completed image for tiling: {image_name} ")
+                processing_summary["skipped"] += 1
+                continue
+            
+            if self.split == "trn":
+                val_ratio = self.manifest.get_validation_ratio(self.val_ratio)
+                validation_cells = select_validation_cells(analysis['grid'],
+                                                           target_distribution, 
+                                                           val_ratio,
+                                                           self.class_balance_weight,
+                                                           self.spatial_weight
+                                                           )
+                create_val_set = True
+            else:
+                validation_cells = None
+            
+            self.manifest.mark_image_in_progress(image_name)
+            try:
+                image_path = analysis['image_path']
+                label_path = analysis['label_path']
+                
+                results = self._process_single_pair(image_path, label_path, resource_manager)
+                if results['status'] != 'successful':
+                    logger.info(f"Pair {image_path} - {results['reason']}")
+                    self.manifest.mark_image_failed(image_name, results['reason'])
+                    processing_summary["failed"] += 1
+                    resource_manager.close_all()
+                    continue
+                
+                image = results['image']
+                label = results['label']
+                analysis['image'] = image
+                analysis['label'] = label
+                
+                self._tiling(analysis, validation_cells, create_val_set)
+                self.manifest.mark_image_completed(image_name)
+                resource_manager.close_all()
+            except Exception as e:
+                logger.error(f"Error tiling image {image_name}: {e}")
+                self.manifest.mark_image_failed(image_name, str(e))
+                processing_summary["failed"] += 1
+                resource_manager.close_all()
+            
+        for prefix, writers in self.prefix_writers.items():
+            for split, writer in writers.items():
+                writer.close()
+        self.manifest.save_manifest()
+        logger.info(f"Final checkpoint saved")            
+        
+        logger.info(f"\nProcessing complete. Summary: {processing_summary}")
+        total_sizes = self.manifest.get_total_sizes_by_split()
+        for prefix, counts in self.prefix_patch_counts.items():
+            def get_shard_count(split_name):
+                if counts[split_name] > 0:
+                    return self.prefix_shard_indices[prefix][split_name] + 1
+                else:
+                    return 0
+            
+            trn_shards = get_shard_count('trn')
+            val_shards = get_shard_count('val')
+            tst_shards = get_shard_count('tst')
+                
+            logger.info(f"""
+                        Prefix: {prefix}, 
+                        Training patches: {counts['trn']}, 
+                        Validation patches: {counts['val']}, 
+                        Test patches: {counts['tst']},
+                        Total patches: {sum(counts.values())},
+                        Training size: {total_sizes['trn'] / 1024**2:.2f} MB,
+                        Validation size: {total_sizes['val'] / 1024**2:.2f} MB,
+                        Test size: {total_sizes['tst'] / 1024**2:.2f} MB,
+                        Training shards: {trn_shards},
+                        Validation shards: {val_shards},
+                        Test shards: {tst_shards},
+                        """)
+        self.export_normalization_stats()
+        
+        return processing_summary
+    
+    def export_normalization_stats(self, output_path: str = None):
+        """
+        Export normalization statistics to a JSON file.
+        
+        Args:
+            output_path (str, optional): Path to save statistics. 
+                                    If None, saves to output_dir/normalization_stats.json
+        """
+        if output_path is None:
+            output_path = Path(self.output_dir) / "normalization_stats.json"
+        
+        try:
+            all_stats = self.manifest.get_all_dataset_statistics()
+            
+            stats_with_metadata = {
+                "created_at": datetime.now().isoformat(),
+                "dataset_prefix": self.prefix,
+                "statistics": all_stats
+            }
+            
+            with open(output_path, 'w') as f:
+                json.dump(stats_with_metadata, f, indent=2)
+            
+            logger.info(f"Normalization statistics saved to {output_path}")
+            
+            for prefix, stats in all_stats.items():
+                logger.info(f"\nStatistics for {prefix}:")
+                logger.info(f"  Bands: {stats['band_count']}")
+                logger.info(f"  Patches processed: {stats['patch_count']}")
+                logger.info(f"  Mean: {[f'{m:.4f}' for m in stats['mean']]}")
+                logger.info(f"  Std:  {[f'{s:.4f}' for s in stats['std']]}")
+                
+        except Exception as e:
+            logger.error(f"Failed to export normalization statistics: {e}")
+    
+    def _process_single_pair(self, image_path, label_path, resource_manager):
+        """Process a single image-label pair and return the result status."""
+        image_name = Path(image_path).stem
+        try:
+            # Load data
+            image = resource_manager.register(load_image(image_path, self.bands_requested, self.band_indices))
+            label = resource_manager.register(load_mask(label_path))
+            
+            # Validate pair and determine processing path
+            validation_result = validate_pair(image, label)
+            if not validation_result["valid"]:
+                return {"status": "skipped", "reason": validation_result["reason"]}
+                
+            special_case = validation_result.get("special_case", False)
+            if special_case:
+                # Special case processing (e.g., non-georeferenced but aligned)
+                return {"image": image, "label": label, "status": "successful", "reason": "Processed as special case"}
+            
+            # Standard processing: CRS, overlap, intersection
+            image, label, was_converted = ensure_crs_match(image, label)
+            if was_converted:
+                logger.info(f"CRS mismatch for {image_name}, reprojecting label")
+                if isinstance(label, rasterio.DatasetReader):
+                    resource_manager.register(label)
+            
+            overlap_pct, overlap_msg = calculate_overlap(image, label)
+            if overlap_pct == 0:
+                return {"status": "skipped", "reason": f"No overlap: {overlap_msg}"}
+            logger.info(f"Processing pair {image_name} with {overlap_msg}")
+            
+            intersection = get_intersection(image, label)
+            if intersection is None:
+                return {"status": "skipped", "reason": "No intersection between image and label"}
+            image, label = clip_to_intersection(image, label, intersection)
+            resource_manager.register(image)
+            resource_manager.register(label)
+            
+            # Convert vector labels if necessary
+            if isinstance(label, gpd.GeoDataFrame):
+                label = self._prepare_vector_labels(label, image)
+                resource_manager.register(label)
 
-        return True
-
-    def _prepare_vector_labels(self, label: gpd.GeoDataFrame, image: rasterio.DatasetReader):
-        """Prepares vector labels for tiling"""
-        nodata_mask = create_nodata_mask(image)
-        label = apply_nodata_mask(label, nodata_mask)
-        label = rasterize_vector(label, image,
-                                  attr_field=self.attr_field,
-                                  attr_values=self.attr_values,
-                                  write_raster=False, 
-                                  output_path=None)
-        return label
+            return {"image": image, "label": label, "status": "successful", "reason": "Processed successfully"}
+            
+        except Exception as e:
+            logger.error(f"Error processing image {image_name}: {e}")
+            return {"status": "failed", "reason": str(e)}
     
-    def _get_shard_path(self, base_path, prefix, split, idx):
-        return os.path.join(base_path, f"{prefix}-{split}-{idx:06d}.tar")
+    def _process_analysis(self, image, label, image_path, label_path, metadata, image_name, sensor_type, 
+                     image_analyses, global_class_distribution):
+        """
+        Process class distribution and spatial grid for an image-label pair and store results.
+        
+        Args:
+            image: Loaded image data
+            label: Loaded label data
+            image_path (str): Path to image file
+            label_path (str): Path to label file
+            metadata (dict): Metadata for the pair
+            image_name (str): Name of the image
+            sensor_type (str): Type of sensor
+            image_analyses (list): List to append analysis results to
+            global_class_distribution (defaultdict): Dictionary to store class distribution
+            
+        Returns:
+            None
+        """
+        class_distribution = calculate_class_distribution(label, self.class_ids)
+        grid = create_spatial_grid(image, self.stride, self.grid_size)
+        
+        image_analyses.append({
+            'image_path': image_path,
+            'label_path': label_path,
+            'metadata': metadata,
+            'image_name': image_name,
+            'sensor_type': sensor_type,
+            'class_distribution': class_distribution,
+            'grid': grid
+        })
+        for cls, value in class_distribution.items():
+            global_class_distribution[cls].append(value)
     
-    def _estimate_patch_size(self, image_patch, label_patch, metadata):
-        size = image_patch.nbytes + label_patch.nbytes
-        size += len(json.dumps(metadata).encode("utf-8"))
-        return size
-    
-    def tiling(self,
+    def _tiling(self,
                image_analysis: Dict[str, Any],
                validation_cells: List[str] = None,
                create_val_set: bool = False
@@ -364,238 +569,70 @@ class Tiler:
         finally:
             end_time = time.time()
             logger.info(f"Tiling time: {end_time - start_time:.2f} seconds")
-    
-    def create_tiles(self):
-        """Process all input image-label pairs and create tiles.
+       
+    def _filter_patches(self, label: np.ndarray) -> bool:
+        """
+        Filters patches based on the discard_empty flag and label_threshold.
 
-        This method iterates through all input image-label pairs, performs validation checks,
-        handles CRS mismatches, and generates patches. Results are saved to the specified output_dir.
-        
-        Returns:
-            dict: Summary of processing results including successes, failures, and skips.
-        """
-        image_analyses = []
-        global_class_distribution = defaultdict(list)
-        processing_summary = {"total": len(self.input_dict), "successful": 0, "skipped": 0, "failed": 0}
-        
-        tracemalloc.start()
-        resource_manager = ResourceManager()
-        
-        logger.info("Phase 1: Analyzing images")
-        for input_dict in tqdm(self.input_dict, desc="Processing input pairs"):
-            image_path = input_dict["image"]
-            label_path = input_dict["label"]
-            metadata = input_dict["metadata"]
-            image_name = Path(image_path).stem
-            
-            # Skip already completed images
-            if self.manifest.is_image_completed(image_name):
-                logger.info(f"Skipping already completed image: {image_name} ")
-                processing_summary["skipped"] += 1
-                continue
-            
-            # Mark image as in progress
-            self.manifest.mark_image_in_progress(image_name)
-            
-            metadata["image_name"] = image_name
-            metadata["patch_size"] = self.patch_size
-            metadata["stride"] = self.stride
-            sensor_type = metadata.get("collection", "unknown")
-            
-            result = self._process_single_pair(image_path, label_path, resource_manager)
-            processing_summary[result["status"]] += 1
-            if result["status"] != "successful":
-                logger.info(f"Pair {input_dict['image']} - {result['reason']}")
-                self.manifest.mark_image_failed(image_name, result["reason"])
-                processing_summary["failed"] += 1
-                resource_manager.close_all()
-                continue
-            self._process_analysis(result["image"], result["label"], image_path, label_path, metadata,
-                                   image_name, sensor_type, image_analyses, global_class_distribution)
-            self.manifest.update_class_distribution(image_analyses[-1]["class_distribution"])
-            resource_manager.close_all()
-            current, peak = tracemalloc.get_traced_memory()
-            logger.info(f"Current memory: {current/1024/1024:.2f}MB, Peak memory: {peak/1024/1024:.2f}MB")
-        target_distribution = {cls: np.mean(values) for cls, values in global_class_distribution.items()}
-        
-        logger.info(f"Phase 2: Creating WebDataset files with pre-determined splits")
-    
-        self.prefix_shard_indices = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
-        self.prefix_shard_sizes = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
-        self.prefix_patch_counts = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
-        
-        for split in ["trn", "val", "tst"]:
-            index, size, count = self.manifest.get_shard_info(self.prefix, split)
-            self.prefix_shard_indices[self.prefix][split] = index
-            self.prefix_shard_sizes[self.prefix][split] = size
-            self.prefix_patch_counts[self.prefix][split] = count
-        
-        self.prefix_writers = {}
-        
-        create_val_set = False
-        for analysis in tqdm(image_analyses, desc="Creating WebDataset files"):
-            image_name = analysis['image_name']
-            
-            if self.manifest.is_image_completed(image_name):
-                logger.info(f"Skipping already completed image for tiling: {image_name} ")
-                processing_summary["skipped"] += 1
-                continue
-            
-            if self.split == "trn":
-                val_ratio = self.manifest.get_validation_ratio(self.val_ratio)
-                validation_cells = select_validation_cells(analysis['grid'],
-                                                           target_distribution, 
-                                                           val_ratio,
-                                                           self.class_balance_weight,
-                                                           self.spatial_weight
-                                                           )
-                create_val_set = True
-            else:
-                validation_cells = None
-            
-            self.manifest.mark_image_in_progress(image_name)
-            try:
-                image_path = analysis['image_path']
-                label_path = analysis['label_path']
-                
-                results = self._process_single_pair(image_path, label_path, resource_manager)
-                if results['status'] != 'successful':
-                    logger.info(f"Pair {image_path} - {results['reason']}")
-                    self.manifest.mark_image_failed(image_name, results['reason'])
-                    processing_summary["failed"] += 1
-                    resource_manager.close_all()
-                    continue
-                
-                image = results['image']
-                label = results['label']
-                analysis['image'] = image
-                analysis['label'] = label
-                
-                self.tiling(analysis, validation_cells, create_val_set)
-                self.manifest.mark_image_completed(image_name)
-                resource_manager.close_all()
-            except Exception as e:
-                logger.error(f"Error tiling image {image_name}: {e}")
-                self.manifest.mark_image_failed(image_name, str(e))
-                processing_summary["failed"] += 1
-                resource_manager.close_all()
-            
-        for prefix, writers in self.prefix_writers.items():
-            for split, writer in writers.items():
-                writer.close()
-        self.manifest.save_manifest()
-        logger.info(f"Final checkpoint saved")            
-        
-        logger.info(f"\nProcessing complete. Summary: {processing_summary}")
-        total_sizes = self.manifest.get_total_sizes_by_split()
-        for prefix, counts in self.prefix_patch_counts.items():
-            def get_shard_count(split_name):
-                if counts[split_name] > 0:
-                    return self.prefix_shard_indices[prefix][split_name] + 1
-                else:
-                    return 0
-            
-            trn_shards = get_shard_count('trn')
-            val_shards = get_shard_count('val')
-            tst_shards = get_shard_count('tst')
-                
-            logger.info(f"""
-                        Prefix: {prefix}, 
-                        Training patches: {counts['trn']}, 
-                        Validation patches: {counts['val']}, 
-                        Test patches: {counts['tst']},
-                        Total patches: {sum(counts.values())},
-                        Training size: {total_sizes['trn'] / 1024**2:.2f} MB,
-                        Validation size: {total_sizes['val'] / 1024**2:.2f} MB,
-                        Test size: {total_sizes['tst'] / 1024**2:.2f} MB,
-                        Training shards: {trn_shards},
-                        Validation shards: {val_shards},
-                        Test shards: {tst_shards},
-                        """)
-    
-        return processing_summary
-    
-    def _process_analysis(self, image, label, image_path, label_path, metadata, image_name, sensor_type, 
-                     image_analyses, global_class_distribution):
-        """
-        Process class distribution and spatial grid for an image-label pair and store results.
-        
         Args:
-            image: Loaded image data
-            label: Loaded label data
-            image_path (str): Path to image file
-            label_path (str): Path to label file
-            metadata (dict): Metadata for the pair
-            image_name (str): Name of the image
-            sensor_type (str): Type of sensor
-            image_analyses (list): List to append analysis results to
-            global_class_distribution (defaultdict): Dictionary to store class distribution
-            
+            label (np.ndarray): The corresponding label patch.
+
         Returns:
-            None
+            bool: True if the patch passes the filters, False otherwise.
         """
-        class_distribution = calculate_class_distribution(label, self.class_ids)
-        grid = create_spatial_grid(image, self.stride, self.grid_size)
+        # Ensure label is not empty to avoid issues
+        if label.size == 0:
+            logger.debug("Patch discarded: invalid shape or empty")
+            return False
+        nonzero_count = np.count_nonzero(label)
         
-        image_analyses.append({
-            'image_path': image_path,
-            'label_path': label_path,
-            'metadata': metadata,
-            'image_name': image_name,
-            'sensor_type': sensor_type,
-            'class_distribution': class_distribution,
-            'grid': grid
-        })
-        for cls, value in class_distribution.items():
-            global_class_distribution[cls].append(value)
+        # Discard patches where all label values are 0
+        if self.discard_empty and nonzero_count == 0:
+            logger.debug("Patch discarded: all label values are 0")
+            return False
+        
+        # Apply label coverage threshold
+        if self.label_threshold is not None:
+            label_coverage = nonzero_count / label.size
+            if label_coverage < self.label_threshold:
+                logger.debug(f"Patch discarded: label coverage {label_coverage:.2f} < {self.label_threshold}")
+                return False
 
-    def _process_single_pair(self, image_path, label_path, resource_manager):
-        """Process a single image-label pair and return the result status."""
-        image_name = Path(image_path).stem
-        try:
-            # Load data
-            image = resource_manager.register(load_image(image_path, self.bands_requested, self.band_indices))
-            label = resource_manager.register(load_mask(label_path))
-            
-            # Validate pair and determine processing path
-            validation_result = validate_pair(image, label)
-            if not validation_result["valid"]:
-                return {"status": "skipped", "reason": validation_result["reason"]}
-                
-            special_case = validation_result.get("special_case", False)
-            if special_case:
-                # Special case processing (e.g., non-georeferenced but aligned)
-                return {"image": image, "label": label, "status": "successful", "reason": "Processed as special case"}
-            
-            # Standard processing: CRS, overlap, intersection
-            image, label, was_converted = ensure_crs_match(image, label)
-            if was_converted:
-                logger.info(f"CRS mismatch for {image_name}, reprojecting label")
-                if isinstance(label, rasterio.DatasetReader):
-                    resource_manager.register(label)
-            
-            overlap_pct, overlap_msg = calculate_overlap(image, label)
-            if overlap_pct == 0:
-                return {"status": "skipped", "reason": f"No overlap: {overlap_msg}"}
-            logger.info(f"Processing pair {image_name} with {overlap_msg}")
-            
-            intersection = get_intersection(image, label)
-            if intersection is None:
-                return {"status": "skipped", "reason": "No intersection between image and label"}
-            image, label = clip_to_intersection(image, label, intersection)
-            resource_manager.register(image)
-            resource_manager.register(label)
-            
-            # Convert vector labels if necessary
-            if isinstance(label, gpd.GeoDataFrame):
-                label = self._prepare_vector_labels(label, image)
-                resource_manager.register(label)
+        return True
 
-            return {"image": image, "label": label, "status": "successful", "reason": "Processed successfully"}
-            
-        except Exception as e:
-            logger.error(f"Error processing image {image_name}: {e}")
-            return {"status": "failed", "reason": str(e)}
+    def _prepare_vector_labels(self, label: gpd.GeoDataFrame, image: rasterio.DatasetReader):
+        """Prepares vector labels for tiling"""
+        nodata_mask = create_nodata_mask(image)
+        label = apply_nodata_mask(label, nodata_mask)
+        label = rasterize_vector(label, image,
+                                  attr_field=self.attr_field,
+                                  attr_values=self.attr_values,
+                                  write_raster=False, 
+                                  output_path=None)
+        return label
+    
+    def _get_shard_path(self, base_path, prefix, split, idx):
+        return os.path.join(base_path, f"{prefix}-{split}-{idx:06d}.tar")
+    
+    def _estimate_patch_size(self, image_patch, label_patch, metadata):
+        size = image_patch.nbytes + label_patch.nbytes
+        size += len(json.dumps(metadata).encode("utf-8"))
+        return size
+
+    @staticmethod
+    def pad_patch(patch: np.ndarray, patch_size: Tuple[int, int], mode='edge'):
+        """Pads the patch to the patch size"""
+        height, width = patch.shape[-2:]
+        pad_height = patch_size[0] - height
+        pad_width = patch_size[1] - width
+        if patch.ndim == 2:
+            padded_patch = np.pad(patch, ((0, pad_height), (0, pad_width)), mode=mode)
+            return padded_patch
+        elif patch.ndim == 3:
+            padded_patch = np.pad(patch, ((0, 0), (0, pad_height), (0, pad_width)), mode=mode)
+            return padded_patch
+        else:
+            raise ValueError(f"Invalid patch shape: {patch.shape}")
     
 
 
