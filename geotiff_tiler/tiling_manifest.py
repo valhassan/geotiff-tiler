@@ -57,7 +57,7 @@ class TilingManifest:
         """
         self.output_dir = Path(output_dir)
         self.prefix = prefix
-        self.manifest_path = self.output_dir / f"{self.prefix}_manifest.json"
+        self.manifest_path = self.output_dir / prefix / f"{self.prefix}_manifest.json"
         
         # Track completed images and patches (from original TilingCheckpoint)
         self.completed_images: Set[str] = set()
