@@ -17,14 +17,17 @@ from typing import List, Sequence, Optional, Union, Tuple
 
 logger = logging.getLogger(__name__)
 
+
 def with_connection_retry(func):
-    """Decorator to add connection retry capability to functions accessing remote resources."""
-    @functools.wraps(func)  # Preserves the original function's metadata
+    """
+    Decorator to add connection retry capability to functions accessing remote resources.
+    """
+    @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        # Extract retry parameters from kwargs if provided
+        # Extract retry parameters from kwargs if provided, with enhanced defaults for STAC
         max_retries = kwargs.pop('max_retries', 3) if 'max_retries' in kwargs else 3
-        retry_delay = kwargs.pop('retry_delay', 1.0) if 'retry_delay' in kwargs else 1.0
-        timeout = kwargs.pop('timeout', 30.0) if 'timeout' in kwargs else 30.0
+        retry_delay = kwargs.pop('retry_delay', 2.0) if 'retry_delay' in kwargs else 2.0  # Increased from 1.0
+        timeout = kwargs.pop('timeout', 45.0) if 'timeout' in kwargs else 45.0  # Increased from 30.0
         
         retry_count = 0
         last_error = None
@@ -32,30 +35,62 @@ def with_connection_retry(func):
         while retry_count < max_retries:
             try:
                 return func(*args, **kwargs)
-            except (ConnectionError, Timeout, RequestException, rasterio.errors.RasterioIOError) as e:
-                # Only retry if it looks like a connection error
-                if "connection" in str(e).lower() or "timeout" in str(e).lower() or "remote" in str(e).lower():
+                
+            except (ConnectionError, Timeout, RequestException) as e:
+                # Original connection errors
+                retry_count += 1
+                last_error = e
+                error_msg = str(e).lower()
+                logger.warning(f"Network error in {func.__name__}. "
+                              f"Retry {retry_count}/{max_retries}. Error: {str(e)}")
+                
+            except rasterio.errors.RasterioIOError as e:
+                # Rasterio-specific errors (often network-related for remote files)
+                error_msg = str(e).lower()
+                if any(keyword in error_msg for keyword in [
+                    "connection", "timeout", "remote", "http", "ssl", "tls",
+                    "network", "unreachable", "refused", "reset", "broken pipe"
+                ]):
                     retry_count += 1
                     last_error = e
-                    logger.warning(f"Connection error in {func.__name__}. "
+                    logger.warning(f"Rasterio network error in {func.__name__}. "
                                   f"Retry {retry_count}/{max_retries}. Error: {str(e)}")
-                    if retry_count < max_retries:
-                        time.sleep(retry_delay * retry_count)  # Exponential backoff
-                    continue
                 else:
-                    # Non-connection errors should be raised immediately
-                    logger.error(f"Error in {func.__name__}: {str(e)}")
+                    # Non-network rasterio errors should not be retried
+                    logger.error(f"Rasterio error in {func.__name__} (not retrying): {str(e)}")
                     raise
+                    
             except Exception as e:
-                logger.error(f"Unexpected error in {func.__name__}: {str(e)}")
-                raise
-                
-        if last_error and retry_count >= max_retries:
+                # Check if it's a network-related error in disguise
+                error_msg = str(e).lower()
+                if any(keyword in error_msg for keyword in [
+                    "connection", "timeout", "network", "dns", "resolve",
+                    "unreachable", "refused", "reset", "broken pipe", "ssl", "tls"
+                ]):
+                    retry_count += 1
+                    last_error = e
+                    logger.warning(f"Network-related error in {func.__name__}. "
+                                  f"Retry {retry_count}/{max_retries}. Error: {str(e)}")
+                else:
+                    # Non-network errors should be raised immediately
+                    logger.error(f"Non-network error in {func.__name__}: {str(e)}")
+                    raise
+            
+            # If we reach here, we're retrying
+            if retry_count < max_retries:
+                # Exponential backoff with jitter
+                delay = retry_delay * (2 ** (retry_count - 1)) + (retry_count * 0.1)
+                logger.info(f"Waiting {delay:.1f} seconds before retry...")
+                time.sleep(delay)
+            
+        # All retries exhausted
+        if last_error:
             logger.error(f"Failed after {max_retries} retries in {func.__name__}")
             raise ConnectionError(f"Failed connection after {max_retries} retries: {str(last_error)}")
             
     return wrapper
 
+@with_connection_retry
 def stack_bands(srcs: List, band: int = 1):
     """
     Stacks multiple single-band rasters into a single multiband virtual raster.
