@@ -268,6 +268,6 @@ def create_dataset_summary_visualization(
         plt.tight_layout()
         
         # Save individual split visualization
-        save_path = Path(output_dir) / f"{prefix}_{split}.png"
+        save_path = Path(output_dir) / prefix / f"{prefix}_{split}.png"
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
