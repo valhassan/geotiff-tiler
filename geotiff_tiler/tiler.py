@@ -281,10 +281,10 @@ class Tiler:
         
         Args:
             output_path (str, optional): Path to save statistics. 
-                                    If None, saves to output_dir/normalization_stats.json
+                                    If None, saves to output_dir/prefix_normalization_stats.json
         """
         if output_path is None:
-            output_path = Path(self.output_dir) / "normalization_stats.json"
+            output_path = Path(self.output_dir) / f"{self.prefix}_normalization_stats.json"
         
         try:
             all_stats = self.manifest.get_all_dataset_statistics()
