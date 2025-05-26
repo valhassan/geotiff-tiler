@@ -22,7 +22,7 @@ from geotiff_tiler.utils.io import load_image, load_mask
 from geotiff_tiler.utils.geoutils import create_nodata_mask, apply_nodata_mask, rasterize_vector, get_intersection
 from geotiff_tiler.utils.geoutils import ensure_crs_match, clip_to_intersection
 from geotiff_tiler.utils.checks import validate_pair, calculate_overlap, ResourceManager
-from geotiff_tiler.utils.visualization import visualize_zarr_patches
+from geotiff_tiler.utils.visualization import visualize_webdataset_patches, create_dataset_summary_visualization
 from geotiff_tiler.config.logging_config import logger
 from geotiff_tiler.val import calculate_class_distribution, create_spatial_grid, select_validation_cells
 from geotiff_tiler.tiling_manifest import TilingManifest
@@ -66,6 +66,7 @@ class Tiler:
                  discard_empty: bool = True,
                  label_threshold: float = 0.01, # minimum of non-zero pixels in a patch to be considered valid (0-1)
                  split: str = "trn",
+                 create_viz: bool = False,
                  prefix: str = "sample",
                  output_dir: str = None
                  ):
@@ -100,6 +101,7 @@ class Tiler:
         self.discard_empty = discard_empty
         self.label_threshold = label_threshold
         self.split = split if split in ["trn", "tst"] else "trn"
+        self.create_viz = create_viz
         self.output_dir = output_dir
         self.prefix = prefix
         self.attr_field = attr_field
@@ -235,7 +237,12 @@ class Tiler:
         for prefix, writers in self.prefix_writers.items():
             for split, writer in writers.items():
                 writer.close()
+        if self.create_viz:
+            analysis_images = [analysis['image_name'] for analysis in image_analyses]
+            for image_name in analysis_images:
+                self.visualize_completed_image(image_name, n_samples=5)
         self.manifest.save_manifest()
+        create_dataset_summary_visualization(self.output_dir, self.prefix, samples_per_split=5)
         logger.info(f"Final checkpoint saved")            
         
         logger.info(f"\nProcessing complete. Summary: {processing_summary}")
@@ -398,6 +405,56 @@ class Tiler:
                 logger.warning(f"  - {image_name}: {reason}")
         
         return retry_summary
+    
+    def visualize_completed_image(self, image_name: str, n_samples: int = 5):
+        """
+        Create visualization for a completed image using manifest for efficiency.
+        """
+        # Check if image is actually completed
+        if not self.manifest.is_image_completed(image_name):
+            logger.warning(f"Image {image_name} is not marked as completed")
+            return
+        
+        # Get image metadata from manifest
+        image_meta = self.manifest.image_metadata.get(image_name, {})
+        if not image_meta:
+            logger.warning(f"No metadata found for {image_name}")
+            return
+        
+        # Determine which splits this image appears in
+        patch_distribution = image_meta.get("patches", {}).get("distribution", {})
+        splits_with_patches = [split for split, count in patch_distribution.items() if count > 0]
+        
+        if not splits_with_patches:
+            logger.warning(f"No patches found for {image_name} in any split")
+            return
+        
+        # Create visualization for each split that has patches
+        for split in splits_with_patches:
+            patch_count = patch_distribution.get(split, 0)
+            if patch_count == 0:
+                continue
+            
+            # Adjust n_samples if image has fewer patches
+            actual_samples = min(n_samples, patch_count)
+            
+            # Create visualization
+            viz_dir = Path(self.output_dir) / self.prefix / "viz" / split
+            viz_dir.mkdir(parents=True, exist_ok=True)
+            viz_path = viz_dir / f"{image_name}_{split}.png"
+            
+            logger.debug(f"Creating visualization for {image_name} in {split} split "
+                    f"({actual_samples} samples from {patch_count} patches)")
+            
+            visualize_webdataset_patches(
+                dataset_dir=self.output_dir,
+                prefix=self.prefix,
+                split=split,
+                image_name=image_name,
+                n_samples=actual_samples,
+                save_path=str(viz_path),
+                manifest=self.manifest  # Pass manifest for efficient lookup
+            )
     
     def _process_single_pair(self, image_path, label_path, resource_manager):
         """Process a single image-label pair and return the result status."""
