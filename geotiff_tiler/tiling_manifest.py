@@ -730,3 +730,68 @@ class TilingManifest:
                 "patch_counts": self.patch_counts
             }
         }
+    
+    def validate_manifest_consistency(self) -> Dict[str, Any]:
+        """Validate consistency between different tracking systems (read-only)"""
+        issues = []
+        
+        # Calculate totals from image metadata (source of truth)
+        image_totals = {"trn": 0, "val": 0, "tst": 0}
+        total_images = 0
+        
+        for image_name, image_meta in self.image_metadata.items():
+            if image_meta.get("status") == "completed":
+                total_images += 1
+                distribution = image_meta.get("patches", {}).get("distribution", {})
+                for split, count in distribution.items():
+                    if split in image_totals:
+                        image_totals[split] += count
+        
+        # Get totals from shards
+        shard_totals = {"trn": 0, "val": 0, "tst": 0}
+        for split in ["trn", "val", "tst"]:
+            for shard in self.shards.get(split, []):
+                shard_totals[split] += shard.get("patch_count", 0)
+        
+        # Get totals from statistics
+        stats_totals = self.dataset_statistics.get("patch_counts", {})
+        
+        # Get running statistics count (training only)
+        running_count = 0
+        if self.running_statistics:
+            for prefix_stats in self.running_statistics.values():
+                running_count += prefix_stats.get("patch_count", 0)
+        
+        # Compare all tracking systems
+        for split in ["trn", "val", "tst"]:
+            image_count = image_totals[split]
+            shard_count = shard_totals[split]
+            stats_count = stats_totals.get(split, 0)
+            
+            if image_count != shard_count:
+                issues.append(f"{split}: images={image_count} ≠ shards={shard_count}")
+            
+            if image_count != stats_count:
+                issues.append(f"{split}: images={image_count} ≠ statistics={stats_count}")
+        
+        # Check running statistics (should match training patches)
+        if running_count != image_totals["trn"]:
+            issues.append(f"running_stats={running_count} ≠ training_patches={image_totals['trn']}")
+        
+        # Check completed image count
+        completed_count = len(self.completed_images)
+        if completed_count != total_images:
+            issues.append(f"completed_images={completed_count} ≠ processed_images={total_images}")
+        
+        return {
+            "is_consistent": len(issues) == 0,
+            "issues": issues,
+            "counts": {
+                "from_images": image_totals,
+                "from_shards": shard_totals, 
+                "from_statistics": stats_totals,
+                "from_running_stats": running_count,
+                "completed_images": completed_count,
+                "processed_images": total_images
+            }
+        }
