@@ -702,6 +702,7 @@ class Tiler:
                                                                       "metadata.json": all_metadata})
                         self.prefix_shard_sizes[self.prefix][split] += patch_size_bytes
                         self.manifest.mark_patch_completed(image_name, x, y)
+                        self.prefix_patch_counts[self.prefix][split] += 1
                         self.manifest.update_shard_info(self.prefix, split, 
                                                           self.prefix_shard_indices[self.prefix][split],
                                                           self.prefix_shard_sizes[self.prefix][split],
