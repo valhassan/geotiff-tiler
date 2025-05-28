@@ -239,13 +239,13 @@ def select_validation_cells(grid, target_distribution, val_ratio, class_balance_
             cell_classes = {cls for cls, val in valid_cells[best_cell]['distribution'].items() if val > 0.01}
             covered_classes.update(cell_classes)
             
-            logger.info(f"Phase 1: Added {best_cell}, covered classes: {covered_classes}")
+            logger.debug(f"Phase 1: Added {best_cell}, covered classes: {covered_classes}")
         else:
-            logger.info(f"Could not find cells for missing classes: {missing_classes}")
+            logger.debug(f"Could not find cells for missing classes: {missing_classes}")
             break
     
     # Phase 2: Fill remaining slots with spatial diversity + class balance
-    logger.info("Phase 2: Optimizing spatial diversity and class balance")
+    logger.debug("Phase 2: Optimizing spatial diversity and class balance")
     
     while estimated_val_size < target_val_size and len(validation_cells) < len(valid_cells):
         best_cell = None
@@ -275,7 +275,7 @@ def select_validation_cells(grid, target_distribution, val_ratio, class_balance_
             estimated_val_size += patches_per_cell
             
             if len(validation_cells) <= 5:
-                logger.info(f"Phase 2: Selected cell {best_cell} with score {best_score:.3f}")
+                logger.debug(f"Phase 2: Selected cell {best_cell} with score {best_score:.3f}")
         else:
             break
     
@@ -287,12 +287,12 @@ def select_validation_cells(grid, target_distribution, val_ratio, class_balance_
     
     missing_classes = required_classes - final_covered_classes
     if missing_classes:
-        logger.info(f"Final validation set missing classes: {missing_classes}")
+        logger.debug(f"Final validation set missing classes: {missing_classes}")
     else:
-        logger.info("All classes represented in validation set")
+        logger.debug("All classes represented in validation set")
     
-    logger.info(f"Selected {len(validation_cells)} validation cells covering {len(final_covered_classes)} classes")
-    logger.info(f"Selected cells: {sorted(validation_cells)}")
+    logger.debug(f"Selected {len(validation_cells)} validation cells covering {len(final_covered_classes)} classes")
+    logger.debug(f"Selected cells: {sorted(validation_cells)}")
     
     return validation_cells
 
