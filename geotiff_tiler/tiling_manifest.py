@@ -405,20 +405,25 @@ class TilingManifest:
             }
     
     def update_class_distribution(self, class_distribution: Dict[str, float]):
-        """Update overall class distribution"""
-        # Simple approach: use moving average
+        """Update overall class distribution with proper weighting"""
         if not self.dataset_statistics["class_distribution"]:
             self.dataset_statistics["class_distribution"] = class_distribution
+            self._class_update_count = 1
         else:
-            # Weight old distribution by number of existing images
-            weight = len(self.completed_images) / (len(self.completed_images) + 1)
+            # Use a counter instead of completed_images length
+            if not hasattr(self, '_class_update_count'):
+                self._class_update_count = 1
+            
+            # Weight old distribution by number of updates
+            weight = self._class_update_count / (self._class_update_count + 1)
             
             new_distribution = {}
             for cls, value in class_distribution.items():
                 old_value = self.dataset_statistics["class_distribution"].get(cls, 0)
                 new_distribution[cls] = old_value * weight + value * (1 - weight)
-                
+            
             self.dataset_statistics["class_distribution"] = new_distribution
+            self._class_update_count += 1
     
     def update_running_statistics(self, prefix: str, patch: np.ndarray):
         """
