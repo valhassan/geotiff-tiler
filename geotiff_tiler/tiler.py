@@ -56,8 +56,8 @@ class Tiler:
                  bands_requested: List[str] = ["red", "green", "blue", "nir"],
                  band_indices: List[int] = None,
                  stride: int = None,
-                 grid_size: int = 4,
-                 val_ratio: float = 0.2,
+                 grid_size: int = 16,
+                 val_ratio: float = 0.1,
                  class_balance_weight: float = 0.5,
                  spatial_weight: float = 0.5,
                  attr_field: str = None,
@@ -224,7 +224,7 @@ class Tiler:
                 label = results['label']
                 analysis['image'] = image
                 analysis['label'] = label
-                
+                print(f"Tiling {image_name} with {len(validation_cells)} validation cells")
                 self._tiling(analysis, validation_cells, create_val_set)
                 self.manifest.mark_image_completed(image_name)
                 resource_manager.close_all()
@@ -524,7 +524,7 @@ class Tiler:
             None
         """
         class_distribution = calculate_class_distribution(label, self.class_ids)
-        grid = create_spatial_grid(image, self.stride, self.grid_size)
+        grid = create_spatial_grid(image, label, self.stride, self.grid_size, self.class_ids)
         
         image_analyses.append({
             'image_path': image_path,
@@ -608,6 +608,9 @@ class Tiler:
         MAX_SHARD_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2GB
         discarded_count = 0
         patch_count = 0
+        trn_patch_count = 0
+        val_patch_count = 0
+        tst_patch_count = 0
         start_time = time.time()
         try:
             with tqdm(total=total_patches, desc="Tiling patches") as pbar:
@@ -642,10 +645,13 @@ class Tiler:
                             cell_id = f"{grid_x}_{grid_y}"
                             if cell_id in validation_cells:
                                 split = "val"
+                                val_patch_count += 1
                             else:
                                 split = "trn"
+                                trn_patch_count += 1
                         else:
                             split = "tst"
+                            tst_patch_count += 1
                         
                         patch_key = f"{self.prefix}_{image_name}_{x}_{y}"
                         
@@ -710,6 +716,9 @@ class Tiler:
                         pbar.update(1)
             logger.info(f"""
                         Tiling Complete for {image_name}!
+                        TRN patches: {trn_patch_count}
+                        VAL patches: {val_patch_count}
+                        TST patches: {tst_patch_count}
                         Extracted patches: {patch_count}
                         Discarded patches: {discarded_count}
                         Total patches: {total_patches}
