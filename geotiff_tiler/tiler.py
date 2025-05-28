@@ -259,7 +259,7 @@ class Tiler:
             tst_shards = get_shard_count('tst')
                 
             logger.info(f"""
-                        Prefix: {prefix}, 
+                        Total Stats for prefix: {prefix} \n
                         Training patches: {counts['trn']}, 
                         Validation patches: {counts['val']}, 
                         Test patches: {counts['tst']},
@@ -272,6 +272,26 @@ class Tiler:
                         Test shards: {tst_shards},
                         """)
         self.export_normalization_stats()
+        result = self.manifest.validate_manifest_consistency()
+        counts = result['counts']
+        
+        if result['is_consistent']:
+            logger.info(f"""
+                        Manifest validation: PASSED \n
+                        Images:{counts['from_images']}, 
+                        Shards:{counts['from_shards']}, 
+                        Stats:{counts['from_statistics']}, 
+                        Running:{counts['from_running_stats']}
+                        """)
+        else:
+            issues_summary = ', '.join(result['issues'])
+            logger.info(f"""
+                        Manifest validation: FAILED ({len(result['issues'])} issues: {issues_summary}) \n
+                        Images:{counts['from_images']}, 
+                        Shards:{counts['from_shards']}, 
+                        Stats:{counts['from_statistics']}, 
+                        Running:{counts['from_running_stats']}
+                        """)
         
         return processing_summary
     
@@ -715,9 +735,10 @@ class Tiler:
                         pbar.update(1)
             logger.info(f"""
                         Tiling Complete for {image_name}!
-                        TRN patches: {trn_patch_count}
-                        VAL patches: {val_patch_count}
-                        TST patches: {tst_patch_count}
+                        Training patches: {trn_patch_count}
+                        Validation patches: {val_patch_count}
+                        Test patches: {tst_patch_count}
+                        ------------------------------
                         Extracted patches: {patch_count}
                         Discarded patches: {discarded_count}
                         Total patches: {total_patches}
