@@ -224,8 +224,8 @@ class TilingManifest:
         self.update_shard_record(prefix, split, index, size, count)
     
     def update_shard_record(self, prefix: str, split: str, shard_index: int, 
-                           size_bytes: int, patch_count: int, 
-                           status: str = "OPEN", images: List[str] = None):
+                        size_bytes: int, patch_count: int, 
+                        status: str = "OPEN", images: List[str] = None):
         """Create or update a detailed shard record"""
         # Ensure structure exists
         if split not in self.shards:
@@ -234,9 +234,17 @@ class TilingManifest:
         # Find shard if it exists
         for shard in self.shards[split]:
             if shard["id"] == shard_index:
+                # Update existing shard - calculate incremental patch count
+                prev_shard_total = 0
+                for s in self.shards[split]:
+                    if s["id"] < shard_index:
+                        prev_shard_total += s.get("patch_count", 0)
+                
+                actual_shard_patches = patch_count - prev_shard_total
+                
                 # Update existing shard
                 shard["size_bytes"] = size_bytes
-                shard["patch_count"] = patch_count
+                shard["patch_count"] = actual_shard_patches
                 shard["status"] = status
                 if images:
                     # Add new images to the shard's image list
@@ -248,14 +256,21 @@ class TilingManifest:
                 shard["last_updated"] = datetime.now().isoformat()
                 return
         
-        # Create new shard
+        # Create new shard - calculate actual per-shard patch count
+        prev_shard_total = 0
+        for shard in self.shards[split]:
+            if shard["id"] < shard_index:
+                prev_shard_total += shard.get("patch_count", 0)
+        
+        actual_shard_patches = patch_count - prev_shard_total
+        
         shard_path = f"{prefix}-{split}-{shard_index:06d}.tar"
         shard_entry = {
             "id": shard_index,
             "path": shard_path,
             "status": status,
             "size_bytes": size_bytes,
-            "patch_count": patch_count,
+            "patch_count": actual_shard_patches,  # Use calculated per-shard count
             "created_at": datetime.now().isoformat(),
             "last_updated": datetime.now().isoformat(),
             "images": images or []
