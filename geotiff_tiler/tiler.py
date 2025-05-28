@@ -711,8 +711,6 @@ class Tiler:
                                                               self.prefix_shard_indices[self.prefix][split])
                         if patch_count % 100 == 0:
                             self.manifest.save_manifest()
-                        
-                        self.prefix_patch_counts[self.prefix][split] += 1
                         patch_count += 1
                         pbar.update(1)
             logger.info(f"""
