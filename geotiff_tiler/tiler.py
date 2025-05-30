@@ -2,8 +2,7 @@ import os
 import gc
 import time
 import json
-import math
-import zarr
+import psutil
 import tracemalloc
 import logging
 import rasterio
@@ -29,6 +28,30 @@ from geotiff_tiler.tiling_manifest import TilingManifest
 
 logger = logging.getLogger(__name__)
 
+
+def log_memory_usage(stage: str, image_name: str = "", force_gc: bool = True):
+    """Log current memory usage with optional garbage collection."""
+    if force_gc:
+        gc.collect()
+    
+    # Process memory
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / 1024 / 1024
+    
+    # Tracemalloc if available
+    if tracemalloc.is_tracing():
+        current, peak = tracemalloc.get_traced_memory()
+        current_mb = current / 1024 / 1024
+        peak_mb = peak / 1024 / 1024
+        logger.info(f"Memory at {stage} {image_name}: "
+                   f"RSS={memory_mb:.1f}MB, "
+                   f"Traced={current_mb:.1f}MB, "
+                   f"Peak={peak_mb:.1f}MB")
+    else:
+        logger.info(f"Memory at {stage} {image_name}: RSS={memory_mb:.1f}MB")
+    
+    return memory_mb
 
 class Tiler:
     """A class for tiling geospatial images and their corresponding labels into patches.
@@ -173,6 +196,7 @@ class Tiler:
         target_distribution = {cls: np.mean(values) for cls, values in global_class_distribution.items()}
         
         logger.info(f"Phase 2: Creating WebDataset files with pre-determined splits")
+        log_memory_usage("Phase 2 Start")
     
         self.prefix_shard_indices = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
         self.prefix_shard_sizes = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
@@ -189,6 +213,8 @@ class Tiler:
         create_val_set = False
         for analysis in tqdm(image_analyses, desc="Creating WebDataset files"):
             image_name = analysis['image_name']
+            
+            memory_before = log_memory_usage(f"Before", image_name, force_gc=True)
             
             if self.manifest.is_image_completed(image_name):
                 logger.info(f"Skipping already completed image for tiling: {image_name} ")
@@ -225,6 +251,8 @@ class Tiler:
                 self._tiling(image, label, analysis, validation_cells, create_val_set)
                 self.manifest.mark_image_completed(image_name)
                 resource_manager.close_all()
+                memory_after = log_memory_usage(f"After", image_name, force_gc=True)
+                logger.info(f"Memory growth: {memory_after - memory_before:.2f}MB")
             except Exception as e:
                 logger.error(f"Error tiling image {image_name}: {e}")
                 self.manifest.mark_image_failed(image_name, str(e))
