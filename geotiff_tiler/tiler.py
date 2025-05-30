@@ -222,10 +222,7 @@ class Tiler:
                 
                 image = results['image']
                 label = results['label']
-                analysis['image'] = image
-                analysis['label'] = label
-                print(f"Tiling {image_name} with {len(validation_cells)} validation cells")
-                self._tiling(analysis, validation_cells, create_val_set)
+                self._tiling(image, label, analysis, validation_cells, create_val_set)
                 self.manifest.mark_image_completed(image_name)
                 resource_manager.close_all()
             except Exception as e:
@@ -559,15 +556,12 @@ class Tiler:
             global_class_distribution[cls].append(value)
     
     def _tiling(self,
+               image: rasterio.DatasetReader,
+               label: rasterio.DatasetReader,
                image_analysis: Dict[str, Any],
                validation_cells: List[str] = None,
                create_val_set: bool = False
-               ):
-        
-        image = image_analysis['image']
-        label = image_analysis['label']
-        
-        
+               ):        
         
         image_width = image.width
         image_height = image.height
