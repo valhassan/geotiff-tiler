@@ -195,17 +195,22 @@ class ResourceManager:
         self.resources = []
         
     def register(self, resource):
-        """Register a resource to be managed and closed later"""
-        self.resources.append(resource)
+        if resource is not None:
+            self.resources.append(resource)
         return resource
         
     def close_all(self):
-        """Close all registered resources and clear the list"""
         for resource in reversed(self.resources):
             try:
                 if hasattr(resource, 'close') and callable(resource.close):
                     resource.close()
             except Exception as e:
                 logger.warning(f"Error closing resource: {e}")
-        self.resources = []
+        self.resources.clear()
         gc.collect()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close_all()
