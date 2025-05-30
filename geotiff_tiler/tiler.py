@@ -156,7 +156,6 @@ class Tiler:
         processing_summary = {"total": len(self.input_dict), "successful": 0, "skipped": 0, "failed": 0}
         
         tracemalloc.start()
-        resource_manager = ResourceManager()
         
         logger.info("Phase 1: Analyzing images")
         for input_dict in tqdm(self.input_dict, desc="Processing input pairs"):
@@ -178,21 +177,19 @@ class Tiler:
             metadata["patch_size"] = self.patch_size
             metadata["stride"] = self.stride
             sensor_type = metadata.get("collection", "unknown")
-            
-            result = self._process_single_pair(image_path, label_path, resource_manager)
-            processing_summary[result["status"]] += 1
-            if result["status"] != "successful":
-                logger.info(f"Pair {input_dict['image']} - {result['reason']}")
-                self.manifest.mark_image_failed(image_name, result["reason"])
-                processing_summary["failed"] += 1
-                resource_manager.close_all()
-                continue
-            self._process_analysis(result["image"], result["label"], image_path, label_path, metadata,
-                                   image_name, sensor_type, image_analyses, global_class_distribution)
-            self.manifest.update_class_distribution(image_analyses[-1]["class_distribution"])
-            resource_manager.close_all()
-            current, peak = tracemalloc.get_traced_memory()
-            logger.info(f"Current memory: {current/1024/1024:.2f}MB, Peak memory: {peak/1024/1024:.2f}MB")
+            with ResourceManager() as resource_manager:
+                result = self._process_single_pair(image_path, label_path, resource_manager)
+                processing_summary[result["status"]] += 1
+                if result["status"] != "successful":
+                    logger.info(f"Pair {input_dict['image']} - {result['reason']}")
+                    self.manifest.mark_image_failed(image_name, result["reason"])
+                    processing_summary["failed"] += 1
+                    continue
+                self._process_analysis(result["image"], result["label"], image_path, label_path, metadata,
+                                    image_name, sensor_type, image_analyses, global_class_distribution)
+                self.manifest.update_class_distribution(image_analyses[-1]["class_distribution"])
+                current, peak = tracemalloc.get_traced_memory()
+                logger.info(f"Current memory: {current/1024/1024:.2f}MB, Peak memory: {peak/1024/1024:.2f}MB")
         target_distribution = {cls: np.mean(values) for cls, values in global_class_distribution.items()}
         
         logger.info(f"Phase 2: Creating WebDataset files with pre-determined splits")
@@ -237,27 +234,24 @@ class Tiler:
             try:
                 image_path = analysis['image_path']
                 label_path = analysis['label_path']
-                
-                results = self._process_single_pair(image_path, label_path, resource_manager)
-                if results['status'] != 'successful':
-                    logger.info(f"Pair {image_path} - {results['reason']}")
-                    self.manifest.mark_image_failed(image_name, results['reason'])
-                    processing_summary["failed"] += 1
-                    resource_manager.close_all()
-                    continue
-                
-                image = results['image']
-                label = results['label']
-                self._tiling(image, label, analysis, validation_cells, create_val_set)
-                self.manifest.mark_image_completed(image_name)
-                resource_manager.close_all()
+                with ResourceManager() as resource_manager:
+                    results = self._process_single_pair(image_path, label_path, resource_manager)
+                    if results['status'] != 'successful':
+                        logger.info(f"Pair {image_path} - {results['reason']}")
+                        self.manifest.mark_image_failed(image_name, results['reason'])
+                        processing_summary["failed"] += 1
+                        continue
+                    
+                    image = results['image']
+                    label = results['label']
+                    self._tiling(image, label, analysis, validation_cells, create_val_set)
+                    self.manifest.mark_image_completed(image_name)
                 memory_after = log_memory_usage(f"After", image_name, force_gc=True)
                 logger.info(f"Memory growth: {memory_after - memory_before:.2f}MB")
             except Exception as e:
                 logger.error(f"Error tiling image {image_name}: {e}")
                 self.manifest.mark_image_failed(image_name, str(e))
                 processing_summary["failed"] += 1
-                resource_manager.close_all()
             
         for prefix, writers in self.prefix_writers.items():
             for split, writer in writers.items():
