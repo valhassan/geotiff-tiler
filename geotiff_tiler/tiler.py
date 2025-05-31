@@ -18,6 +18,7 @@ from pathlib import Path
 from datetime import datetime
 
 from geotiff_tiler.utils.io import load_image, load_mask
+from geotiff_tiler.utils.memory_profiler import MemoryProfiler
 from geotiff_tiler.utils.geoutils import create_nodata_mask, apply_nodata_mask, rasterize_vector, get_intersection
 from geotiff_tiler.utils.geoutils import ensure_crs_match, clip_to_intersection
 from geotiff_tiler.utils.checks import validate_pair, calculate_overlap, ResourceManager
@@ -91,6 +92,7 @@ class Tiler:
                  split: str = "trn",
                  create_viz: bool = False,
                  prefix: str = "sample",
+                 enable_profiling: bool = True,
                  output_dir: str = None
                  ):
         """Initialize the Tiler with configuration parameters.
@@ -139,6 +141,8 @@ class Tiler:
                                        'road': 3,
                                        'building': 4
                                        }
+        self.enable_memory_profiling = enable_profiling
+        self.memory_profiler = None
         
         self.manifest = TilingManifest(output_dir, self.prefix)
     
@@ -151,11 +155,14 @@ class Tiler:
         Returns:
             dict: Summary of processing results including successes, failures, and skips.
         """
+        if self.enable_memory_profiling:
+            self.memory_profiler = MemoryProfiler(self.output_dir)
+            self.memory_profiler.take_snapshot("Start of create_tiles", "")
         image_analyses = []
         global_class_distribution = defaultdict(list)
         processing_summary = {"total": len(self.input_dict), "successful": 0, "skipped": 0, "failed": 0}
         
-        tracemalloc.start()
+        # tracemalloc.start()
         
         logger.info("Phase 1: Analyzing images")
         for input_dict in tqdm(self.input_dict, desc="Processing input pairs"):
@@ -188,8 +195,9 @@ class Tiler:
                 self._process_analysis(result["image"], result["label"], image_path, label_path, metadata,
                                     image_name, sensor_type, image_analyses, global_class_distribution)
                 self.manifest.update_class_distribution(image_analyses[-1]["class_distribution"])
-                current, peak = tracemalloc.get_traced_memory()
-                logger.info(f"Current memory: {current/1024/1024:.2f}MB, Peak memory: {peak/1024/1024:.2f}MB")
+                self.memory_profiler.take_snapshot("After image analysis", image_name)
+                # current, peak = tracemalloc.get_traced_memory()
+                # logger.info(f"Current memory: {current/1024/1024:.2f}MB, Peak memory: {peak/1024/1024:.2f}MB")
         target_distribution = {cls: np.mean(values) for cls, values in global_class_distribution.items()}
         
         logger.info(f"Phase 2: Creating WebDataset files with pre-determined splits")
@@ -235,6 +243,7 @@ class Tiler:
                 image_path = analysis['image_path']
                 label_path = analysis['label_path']
                 with ResourceManager() as resource_manager:
+                    self.memory_profiler.take_snapshot("Before tiling", image_name)
                     results = self._process_single_pair(image_path, label_path, resource_manager)
                     if results['status'] != 'successful':
                         logger.info(f"Pair {image_path} - {results['reason']}")
@@ -246,8 +255,9 @@ class Tiler:
                     label = results['label']
                     self._tiling(image, label, analysis, validation_cells, create_val_set)
                     self.manifest.mark_image_completed(image_name)
-                memory_after = log_memory_usage(f"After", image_name, force_gc=True)
-                logger.info(f"Memory growth: {memory_after - memory_before:.2f}MB")
+                self.memory_profiler.take_snapshot("After tiling", image_name)
+                # memory_after = log_memory_usage(f"After", image_name, force_gc=True)
+                # logger.info(f"Memory growth: {memory_after - memory_before:.2f}MB")
             except Exception as e:
                 logger.error(f"Error tiling image {image_name}: {e}")
                 self.manifest.mark_image_failed(image_name, str(e))
@@ -256,10 +266,12 @@ class Tiler:
         for prefix, writers in self.prefix_writers.items():
             for split, writer in writers.items():
                 writer.close()
+        self.memory_profiler.take_snapshot("After closing writers", "")
         if self.create_viz:
             analysis_images = [analysis['image_name'] for analysis in image_analyses]
             for image_name in analysis_images:
                 self.visualize_completed_image(image_name, n_samples=5)
+        self.memory_profiler.take_snapshot("After visualization", "")
         self.manifest.save_manifest()
         create_dataset_summary_visualization(self.output_dir, self.prefix, samples_per_split=5)
         logger.info(f"Final checkpoint saved")            
@@ -311,7 +323,9 @@ class Tiler:
                         Stats:{counts['from_statistics']}, 
                         Running:{counts['from_running_stats']}
                         """)
-        
+        if self.memory_profiler:
+            report = self.memory_profiler.generate_report()
+            self.memory_profiler.log_summary()
         return processing_summary
     
     def export_normalization_stats(self, output_path: str = None):
