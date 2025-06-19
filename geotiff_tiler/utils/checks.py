@@ -1,4 +1,3 @@
-import gc
 import logging
 import pystac
 import rasterio
@@ -64,17 +63,8 @@ def check_image_validity(image: rasterio.DatasetReader) -> Tuple[bool, str]:
     """
     try:
         # Check if the image has data
-        if image.count == 0:
-            return False, "Image has no bands"
-            
-        # Try reading a small sample to verify data accessibility
-        window = ((0, min(10, image.height)), (0, min(10, image.width)))
-        sample = image.read(1)
-        
-        # Check if data contains any valid values
-        if np.all(sample == image.nodata):
-            return False, "Image contains only nodata values"
-            
+        if image.width <= 0 or image.height <= 0:
+            return False, "Invalid dimensions"
         return True, "Image is valid"
         
     except Exception as e:
@@ -94,14 +84,9 @@ def check_label_validity(
     try:
         if isinstance(label, rasterio.DatasetReader):
             # Check raster label
-            if label.count == 0:
-                return False, "Label raster has no bands"
-                
-            sample = label.read(1, window=((0, min(10, label.height)), 
-                                         (0, min(10, label.width))))
-            
-            if np.all(sample == label.nodata):
-                return False, "Label raster contains only nodata values"
+            if label.width <= 0 or label.height <= 0:
+                return False, "Invalid dimensions"
+            return True, "Label is valid"
                 
         elif isinstance(label, gpd.GeoDataFrame):
             # Check vector label
@@ -118,99 +103,3 @@ def check_label_validity(
         
     except Exception as e:
         return False, f"Error reading label: {str(e)}"
-
-def validate_pair(image, label):
-    """
-    Validate an image-label pair based on georeferencing and data integrity.
-    
-    Returns:
-        dict: Validation result with 'valid' (bool), 'reason' (str), and 'special_case' (bool)
-    """
-    # Check georeferencing for vector labels
-    if isinstance(label, gpd.GeoDataFrame):
-        if not is_image_georeferenced(image) or not is_label_georeferenced(label):
-            return {"valid": False, "reason": "Invalid georeferencing for vector label or image", "special_case": False}
-    # Check georeferencing for raster labels
-    elif isinstance(label, rasterio.DatasetReader):
-        if not is_image_georeferenced(image) or not is_label_georeferenced(label):
-            if check_alignment(image, label):
-                return {"valid": True, "reason": "Non-georeferenced but aligned raster pair", "special_case": True}
-            return {"valid": False, "reason": "Invalid georeferencing or alignment for raster label or image", "special_case": False}
-    
-    # Validate image
-    image_valid, image_msg = check_image_validity(image)
-    if not image_valid:
-        return {"valid": False, "reason": f"Invalid image: {image_msg}", "special_case": False}
-    
-    # Validate label
-    label_valid, label_msg = check_label_validity(label)
-    if not label_valid:
-        return {"valid": False, "reason": f"Invalid label: {label_msg}", "special_case": False}
-    
-    return {"valid": True, "reason": "Valid pair", "special_case": False}
-
-def calculate_overlap(
-    image: rasterio.DatasetReader,
-    label: Union[rasterio.DatasetReader, gpd.GeoDataFrame]) -> Tuple[float, str]:
-    """
-    Calculate the overlap between image and label data.
-    
-    Args:
-        image: Opened rasterio dataset
-        label: Either a rasterio dataset or GeoDataFrame
-        
-    Returns:
-        Tuple of (overlap_percentage, message)
-    """
-    try:
-        # Get image bounds as a box
-        image_bounds = box(*image.bounds)
-        if isinstance(label, rasterio.DatasetReader):
-            label_bounds = box(*label.bounds)
-        else:
-            if hasattr(label, 'attrs') and 'extent_geometry' in label.attrs:
-                label_bounds = label.attrs['extent_geometry']
-            else:
-                label_bounds = box(*label.total_bounds)
-        
-        # Calculate intersection and union areas
-        intersection_area = image_bounds.intersection(label_bounds).area
-        union_area = image_bounds.union(label_bounds).area
-        
-        if union_area == 0:
-            return 0.0, "No valid area found"
-        
-        overlap_percentage = (intersection_area / union_area) * 100
-        
-        if overlap_percentage == 0:
-            return 0.0, "No overlap between image and label"
-        
-        return overlap_percentage, f"Overlap percentage: {overlap_percentage:.2f}%"
-        
-    except Exception as e:
-        return 0.0, f"Error calculating overlap: {str(e)}"
-
-class ResourceManager:
-    def __init__(self):
-        self.resources = []
-        
-    def register(self, resource):
-        if resource is not None:
-            self.resources.append(resource)
-        return resource
-        
-    def close_all(self):
-        for resource in reversed(self.resources):
-            try:
-                if hasattr(resource, 'close') and callable(resource.close):
-                    resource.close()
-            except Exception as e:
-                logger.warning(f"Error closing resource: {e}")
-        self.resources.clear()
-        gc.collect()
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close_all()
