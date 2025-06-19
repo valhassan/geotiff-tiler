@@ -8,63 +8,55 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+def calculate_class_distribution(label_path, class_ids):
+    """
+    Ultra-fast approach using bincount (works when class_ids are small integers).
+    """
+    with rasterio.open(label_path) as src_label:
+        label_arr = src_label.read(1).flatten()
+        
+        # Use bincount for counting
+        max_id = max(class_ids.values()) if class_ids else 0
+        counts = np.bincount(label_arr, minlength=max_id + 1)
+        
+        # Extract counts for our classes
+        class_counts = {}
+        total_pixels = 0
+        
+        for class_name, class_id in class_ids.items():
+            count = counts[class_id] if class_id < len(counts) else 0
+            class_counts[class_name] = count
+            total_pixels += count
+        
+        # Calculate distribution
+        if total_pixels > 0:
+            distribution = {cls: count/total_pixels for cls, count in class_counts.items()}
+        else:
+            distribution = {cls: 0 for cls in class_ids}
+            
+        return distribution
 
-def calculate_class_distribution(label, class_ids):
+def create_spatial_grid(image_path, label_path, stride_size, grid_size, class_ids):
     """
-    Calculate the distribution of classes in a label mask.
-    
-    Args:
-        label: Label array (either rasterio dataset or numpy array)
-        class_ids: Dictionary mapping class names to pixel values
-    
-    Returns:
-        Dictionary with class distribution (percentage of pixels for each class)
+    Ultra-fast vectorized version using numpy operations.
     """
-    # Read data if it's a rasterio dataset
-    if hasattr(label, 'read'):
-        label_data = label.read()
-    else:
-        label_data = label
+    # Get dimensions
+    with rasterio.open(image_path) as src_image:
+        maxx, maxy = src_image.width, src_image.height
     
-    # Count pixels for each class
-    class_counts = {}
-    for class_name, class_id in class_ids.items():
-        class_counts[class_name] = np.sum(label_data == class_id)
-    
-    # Calculate distribution
-    total_pixels = np.sum(list(class_counts.values()))
-    if total_pixels > 0:
-        distribution = {cls: count/total_pixels for cls, count in class_counts.items()}
-    else:
-        distribution = {cls: 0 for cls in class_ids}
-    
-    return distribution
-
-def create_spatial_grid(image, label, stride_size, grid_size, class_ids):
-    """
-    Create a spatial grid over an image and calculate statistics for each cell.
-    
-    Args:
-        image: Image dataset (rasterio)
-        label: Label dataset (rasterio)
-        grid_size: Number of grid cells in each dimension
-    
-    Returns:
-        Dictionary with grid information
-    """
+    # Read label data once
+    with rasterio.open(label_path) as src_label:
+        label_arr = src_label.read(1)
     
     minx, miny = 0, 0
-    maxx, maxy = image.width, image.height
-    
     stridex = maxx / grid_size
     stridey = maxy / grid_size
-    number_of_patches_x = math.ceil(maxx / stride_size)
-    number_of_patches_y = math.ceil(maxy / stride_size)
-    total_patches = number_of_patches_x * number_of_patches_y
     
-    label_array = label.read()
     grid_cells = {}
     
+    # Pre-allocate arrays for vectorized operations
+    class_id_array = np.array(list(class_ids.values()))
+    class_names = list(class_ids.keys())
     
     for grid_x in range(grid_size):
         for grid_y in range(grid_size):
@@ -73,55 +65,40 @@ def create_spatial_grid(image, label, stride_size, grid_size, class_ids):
             cell_maxx = int(min((grid_x + 1) * stridex, maxx))
             cell_maxy = int(min((grid_y + 1) * stridey, maxy))
             
-            cell_data = label_array[cell_miny:cell_maxy, cell_minx:cell_maxx]
-            class_distribution = calculate_class_distribution(cell_data, class_ids)
+            # Extract cell
+            cell_data = label_arr[cell_miny:cell_maxy, cell_minx:cell_maxx]
+            
+            if cell_data.size == 0:
+                distribution = {cls: 0 for cls in class_names}
+            else:
+                # Vectorized counting
+                class_masks = cell_data[..., np.newaxis] == class_id_array
+                class_counts = np.sum(class_masks, axis=(0, 1))
+                
+                # Convert to distribution
+                total_pixels = cell_data.size
+                distribution = {
+                    name: count / total_pixels 
+                    for name, count in zip(class_names, class_counts)
+                }
             
             cell_id = f"{grid_x}_{grid_y}"
             grid_cells[cell_id] = {
-                'distribution': class_distribution,
+                'distribution': distribution,
                 'bounds': (cell_minx, cell_miny, cell_maxx, cell_maxy),
                 'pixel_count': cell_data.size
-                }
-            
-    # Return grid info
+            }
+    
+    # Calculate patch info
+    number_of_patches_x = math.ceil(maxx / stride_size)
+    number_of_patches_y = math.ceil(maxy / stride_size)
+    total_patches = number_of_patches_x * number_of_patches_y
+    
     return {
-        'minx': minx,
-        'miny': miny,
-        'maxx': maxx,
-        'maxy': maxy,
-        'stridex': stridex,
-        'stridey': stridey,
-        'grid_size': grid_size,
-        'cells': grid_cells,
-        'total_patches': total_patches
+        'minx': minx, 'miny': miny, 'maxx': maxx, 'maxy': maxy,
+        'stridex': stridex, 'stridey': stridey, 'grid_size': grid_size,
+        'cells': grid_cells, 'total_patches': total_patches
     }
-
-def is_valid_pair(image, label):
-    """
-    Check if image and label are valid for processing.
-    
-    Args:
-        image: Image dataset (rasterio)
-        label: Label dataset (rasterio)
-    
-    Returns:
-        Boolean indicating if the pair is valid
-    """
-    # Check if both are loaded
-    if image is None or label is None:
-        return False
-    
-    # Check dimensions match
-    if hasattr(image, 'width') and hasattr(label, 'width'):
-        if image.width != label.width or image.height != label.height:
-            return False
-    
-    # Check if both are georeferenced
-    if hasattr(image, 'crs') and hasattr(label, 'crs'):
-        if image.crs is None or label.crs is None:
-            return False
-    
-    return True
 
 def calculate_spatial_penalty(cell_data, validation_cells):
     """Calculate spatial penalty for a cell (lower penalty = better spatial diversity)."""
@@ -295,36 +272,6 @@ def select_validation_cells(grid, target_distribution, val_ratio, class_balance_
     logger.debug(f"Selected cells: {sorted(validation_cells)}")
     
     return validation_cells
-
-def create_shard_manifests(train_dir, val_dir):
-    """
-    Create manifest files listing all shards for train and validation.
-    
-    Args:
-        train_dir: Directory with training shards
-        val_dir: Directory with validation shards
-    """
-    # Find all training shards
-    train_shards = []
-    for sensor_dir in train_dir.glob("*"):
-        if sensor_dir.is_dir():
-            train_shards.extend(list(sensor_dir.glob("*.tar")))
-    
-    # Find all validation shards
-    val_shards = []
-    for sensor_dir in val_dir.glob("*"):
-        if sensor_dir.is_dir():
-            val_shards.extend(list(sensor_dir.glob("*.tar")))
-    
-    # Write train manifest
-    with open(train_dir / "train-shards.txt", "w") as f:
-        for shard in sorted(train_shards):
-            f.write(f"{shard}\n")
-    
-    # Write validation manifest
-    with open(val_dir / "val-shards.txt", "w") as f:
-        for shard in sorted(val_shards):
-            f.write(f"{shard}\n")
 
 def create_validation_report(image_analyses, validation_cells, target_distribution, output_dir):
     """
