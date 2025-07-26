@@ -94,8 +94,6 @@ def check_label_validity(
                 return False, "Label vector is empty"
                 
             if not label.geometry.is_valid.all():
-                logger.info("Found invalid geometries, fixing with make_valid()")
-                label['geometry'] = label.geometry.make_valid()
                 return False, "Label vector contains invalid geometries"
                 
         else:
