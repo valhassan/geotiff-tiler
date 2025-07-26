@@ -84,6 +84,9 @@ def load_vector_mask(
     if main_layer is None:
         raise ValueError(f"No suitable layer found in {mask_path}")
     result = gpd.read_file(mask_path, layer=main_layer)
+    if not result.geometry.is_valid.all():
+        logger.info("Found invalid geometries, fixing with make_valid()")
+        result['geometry'] = result.geometry.make_valid()
     if extent_layer:
         extent_gdf = gpd.read_file(mask_path, layer=extent_layer)
         if not extent_gdf.empty:
