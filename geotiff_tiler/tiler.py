@@ -19,8 +19,8 @@ from datetime import datetime
 from geotiff_tiler.utils.io import validate_image, validate_mask, validate_pair, log_stage
 from geotiff_tiler.utils.io import ensure_crs_match, calculate_overlap, clip_to_intersection
 from geotiff_tiler.utils.io import prepare_vector_labels
-from geotiff_tiler.utils.visualization import visualize_webdataset_patches, create_dataset_summary_visualization
-from geotiff_tiler.config.logging_config import logger
+from geotiff_tiler.utils.visualization import create_dataset_summary_visualization
+from geotiff_tiler.config import logging_config # noqa: F401
 from geotiff_tiler.val import calculate_class_distribution, create_spatial_grid, select_validation_cells
 from geotiff_tiler.tiling_manifest import TilingManifest
 
@@ -177,7 +177,7 @@ class Tiler:
         target_distribution = {cls: np.mean(values) for cls, values in global_class_distribution.items()}
         # log_memory_usage("Phase 1 End", force_gc=True)
         
-        logger.info(f"Phase 2: Creating WebDataset files with pre-determined splits")
+        logger.info("Phase 2: Creating WebDataset files with pre-determined splits")
         # log_memory_usage("Phase 2 Start", force_gc=True)
     
         self.prefix_shard_indices = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
@@ -371,7 +371,7 @@ class Tiler:
         
         self.input_dict = original_input_dict
         
-        logger.info(f"\n=== Retry Summary ===")
+        logger.info("\n=== Retry Summary ===")
         logger.info(f"Total images retried: {retry_summary['total']}")
         logger.info(f"Successfully processed: {retry_summary['successful']}")
         logger.info(f"Skipped: {retry_summary['skipped']}")
