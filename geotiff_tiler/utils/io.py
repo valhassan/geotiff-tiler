@@ -19,7 +19,6 @@ from .checks import (
     check_image_validity,
     check_label_type,
     check_label_validity,
-    check_stac,
     is_image_georeferenced,
     is_label_georeferenced,
 )
@@ -86,7 +85,7 @@ def load_vector_mask(
     result = gpd.read_file(mask_path, layer=main_layer)
     if not result.geometry.is_valid.all():
         logger.info("Found invalid geometries, fixing with make_valid()")
-        result['geometry'] = result.geometry.make_valid()
+        result["geometry"] = result.geometry.make_valid()
     if extent_layer:
         extent_gdf = gpd.read_file(mask_path, layer=extent_layer)
         if not extent_gdf.empty:
@@ -119,14 +118,17 @@ def validate_image(
 ):
     """Validates an image from a path or stac item"""
     image_asset = None
-    if check_stac(image_path):
-        item = SingleBandItemEO(
-            item=pystac.Item.from_file(image_path), bands_requested=bands_requested
-        )
+
+    try:
+        stac_item = pystac.Item.from_file(image_path)
+        item = SingleBandItemEO(item=stac_item, bands_requested=bands_requested)
         stac_bands = [value["meta"].href for value in item.bands_requested.values()]
         image_asset = stack_bands(stac_bands)
         return image_asset
-    elif Path(image_path).exists():
+    except Exception:
+        pass
+
+    if Path(image_path).exists():
         if band_indices:
             image_asset = select_bands(image_path, band_indices)
         else:
