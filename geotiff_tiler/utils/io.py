@@ -83,9 +83,24 @@ def load_vector_mask(
     if main_layer is None:
         raise ValueError(f"No suitable layer found in {mask_path}")
     result = gpd.read_file(mask_path, layer=main_layer)
+
     if not result.geometry.is_valid.all():
         logger.info("Found invalid geometries, fixing with make_valid()")
         result["geometry"] = result.geometry.make_valid()
+
+        # Filter out any geometries that are still invalid after make_valid()
+        if not result.geometry.is_valid.all():
+            invalid_count = (~result.geometry.is_valid).sum()
+            logger.warning(
+                f"Filtering out {invalid_count} geometries that remain invalid after make_valid()"
+            )
+            result = result[result.geometry.is_valid].copy()
+
+        if result.geometry.isna().any() or result.geometry.is_empty.any():
+            empty_count = (result.geometry.isna() | result.geometry.is_empty).sum()
+            logger.warning(f"Filtering out {empty_count} empty/null geometries")
+            result = result[~(result.geometry.isna() | result.geometry.is_empty)].copy()
+
     if extent_layer:
         extent_gdf = gpd.read_file(mask_path, layer=extent_layer)
         if not extent_gdf.empty:
@@ -93,7 +108,8 @@ def load_vector_mask(
             if not extent_geom.is_valid:
                 logger.info("Found invalid extent geometry, fixing with make_valid()")
                 extent_geom = extent_geom.make_valid()
-            result.attrs["extent_geometry"] = extent_geom
+            if extent_geom.is_valid and not extent_geom.is_empty:
+                result.attrs["extent_geometry"] = extent_geom
     return result
 
 
