@@ -104,6 +104,9 @@ def load_vector_mask(
     if extent_layer:
         extent_gdf = gpd.read_file(mask_path, layer=extent_layer)
         if not extent_gdf.empty:
+            if extent_gdf.crs != result.crs:
+                logger.warning(f"Extent layer CRS ({extent_gdf.crs}) doesn't match main layer CRS ({result.crs}). Reprojecting extent layer.")
+                extent_gdf = extent_gdf.to_crs(result.crs)
             extent_geom = extent_gdf.geometry.iloc[0]
             if not extent_geom.is_valid:
                 logger.info("Found invalid extent geometry, fixing with make_valid()")
