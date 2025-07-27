@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "geotiff-tiler"
-version = "1.2.3"
+version = "1.2.4"
 description = "Tool for creating patches from geo-referenced and non geo-referenced image and label pairs"
 readme = "README.md"
 authors = [{name = "Victor Alhassan", email = "victor.alhassan@nrcan-rncan.gc.ca"}]
