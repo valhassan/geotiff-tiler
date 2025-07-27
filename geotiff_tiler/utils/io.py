@@ -89,7 +89,11 @@ def load_vector_mask(
     if extent_layer:
         extent_gdf = gpd.read_file(mask_path, layer=extent_layer)
         if not extent_gdf.empty:
-            result.attrs["extent_geometry"] = extent_gdf.geometry.iloc[0]
+            extent_geom = extent_gdf.geometry.iloc[0]
+            if not extent_geom.is_valid:
+                logger.info("Found invalid extent geometry, fixing with make_valid()")
+                extent_geom = extent_geom.make_valid()
+            result.attrs["extent_geometry"] = extent_geom
     return result
 
 
