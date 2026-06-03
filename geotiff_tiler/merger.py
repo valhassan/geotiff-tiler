@@ -1,9 +1,12 @@
 import hashlib
+import io
 import json
 import logging
 import os
 import re
-from collections import defaultdict
+import sqlite3
+import tarfile
+from collections import OrderedDict, defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -219,6 +222,69 @@ class GeospatialDatasetMerger:
         for cls, count in enumerate(bincount):
             self.global_class_pixels[cls] += count
 
+    def _write_and_track_paired(
+        self,
+        split: str,
+        tar_key: str,
+        low_img: np.ndarray,
+        high_img: np.ndarray,
+        lbl: np.ndarray,
+        meta: dict,
+    ):
+        pm = meta["patch_metadata"]
+        img_name = pm["image_name"]
+        self._initialize_image(img_name, meta)
+
+        estimated_size = (
+            low_img.nbytes
+            + high_img.nbytes
+            + lbl.nbytes
+            + len(json.dumps(meta).encode("utf-8"))
+        )
+        if self.current_shard_sizes[split] + estimated_size > self.max_shard_size:
+            self._rotate_writer(split)
+
+        writer = self._get_or_create_writer(split, img_name)
+        writer.write(
+            {
+                "__key__": tar_key,
+                "image_low.npy": low_img,
+                "image_high.npy": high_img,
+                "label_patch.npy": lbl,
+                "metadata.json": meta,
+            }
+        )
+
+        self.current_shard_sizes[split] += estimated_size
+        self.global_patch_counts[split] += 1
+        idx = self.current_shard_indices[split]
+        x, y = pm["pixel_coordinates"]
+
+        self.manifest_manager.update_shard_record(
+            prefix=self.prefix,
+            split=split,
+            shard_index=idx,
+            size_bytes=self.current_shard_sizes[split],
+            patch_count=self.global_patch_counts[split],
+            status="OPEN",
+            images=[img_name],
+        )
+        self.manifest_manager.update_image_patch_info(img_name, split, idx)
+        self.manifest_manager.mark_patch_completed(img_name, x, y)
+
+        if split == "trn":
+            # Track normalization stats separately for each variant
+            self.manifest_manager.update_running_statistics(
+                f"{self.prefix}_low", low_img
+            )
+            self.manifest_manager.update_running_statistics(
+                f"{self.prefix}_high", high_img
+            )
+
+        bincount = np.bincount(lbl.flatten())
+        for cls, count in enumerate(bincount):
+            self.global_class_pixels[cls] += count
+
     # ---------------------------------------------------------
     # MAIN EXECUTION PHASES
     # ---------------------------------------------------------
@@ -275,6 +341,232 @@ class GeospatialDatasetMerger:
 
         self._finalize_manifest()
         self.export_normalization_stats()
+
+    # ---------------------------------------------------------
+    # PAIRED DATASET HELPERS
+    # ---------------------------------------------------------
+    def _build_base_index(self, index_path: Path) -> int:
+        """
+        Pass 1 for execute_pair: iterate base tars with tarfile (no array decoding)
+        and record patch_id → (tar_path, img_offset_data, img_size) in sqlite.
+
+        Returns the total number of base patches indexed.
+        Using TarInfo.offset_data allows O(1) random access later without
+        re-scanning the tar.
+        """
+        conn = sqlite3.connect(str(index_path))
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS base_index (
+                patch_id   TEXT PRIMARY KEY,
+                tar_path   TEXT NOT NULL,
+                img_offset INTEGER NOT NULL,
+                img_size   INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_patch_id ON base_index (patch_id)"
+        )
+
+        base_tars = self._get_safe_tars(self.base_dir)
+        total = 0
+        batch: list[tuple] = []
+        BATCH_SIZE = 2000
+
+        for tar_path in tqdm(base_tars, desc="Phase 1 [pair]: Indexing base tars"):
+            try:
+                with tarfile.open(str(tar_path), "r") as tf:
+                    members_by_key: dict[str, dict[str, tarfile.TarInfo]] = {}
+                    for member in tf.getmembers():
+                        if not member.isfile() or "." not in member.name:
+                            continue
+                        # WebDataset key = everything before first "."
+                        dot = member.name.index(".")
+                        key = member.name[:dot]
+                        field = member.name[dot + 1 :]
+                        members_by_key.setdefault(key, {})[field] = member
+
+                    for key, fields in members_by_key.items():
+                        img_m = fields.get("image_patch.npy")
+                        meta_m = fields.get("metadata.json")
+                        if img_m is None or meta_m is None:
+                            continue
+
+                        raw_meta = tf.extractfile(meta_m).read()
+                        meta = json.loads(raw_meta)
+                        patch_id = self._get_patch_id(meta)
+
+                        batch.append(
+                            (patch_id, str(tar_path), img_m.offset_data, img_m.size)
+                        )
+                        total += 1
+
+                        if len(batch) >= BATCH_SIZE:
+                            conn.executemany(
+                                "INSERT OR REPLACE INTO base_index VALUES (?,?,?,?)",
+                                batch,
+                            )
+                            conn.commit()
+                            batch.clear()
+
+            except Exception as exc:
+                logger.warning(f"Skipping tar during indexing ({tar_path}): {exc}")
+
+        if batch:
+            conn.executemany(
+                "INSERT OR REPLACE INTO base_index VALUES (?,?,?,?)", batch
+            )
+            conn.commit()
+
+        conn.close()
+        logger.info(f"Phase 1 [pair]: indexed {total} base patches → {index_path}")
+        return total
+
+    def _get_tar_handle(self, tar_path: str, max_handles: int = 20):
+        """
+        Return a cached raw binary file handle for tar_path.
+        Uses an OrderedDict as an LRU cache (max_handles open at once).
+        Raw handles are used for O(1) byte-offset seeks into plain .tar files.
+        """
+        if tar_path in self._tar_handle_cache:
+            self._tar_handle_cache.move_to_end(tar_path)
+            return self._tar_handle_cache[tar_path]
+
+        if len(self._tar_handle_cache) >= max_handles:
+            _, evicted = self._tar_handle_cache.popitem(last=False)
+            evicted.close()
+
+        fh = open(tar_path, "rb")
+        self._tar_handle_cache[tar_path] = fh
+        return fh
+
+    def _read_base_img(
+        self, tar_path: str, offset: int, size: int
+    ) -> np.ndarray:
+        """Seek to TarInfo.offset_data and load the .npy bytes directly."""
+        fh = self._get_tar_handle(tar_path)
+        fh.seek(offset)
+        return np.load(io.BytesIO(fh.read(size)))
+
+    def _close_tar_handles(self):
+        for fh in self._tar_handle_cache.values():
+            fh.close()
+        self._tar_handle_cache.clear()
+
+    def execute_pair(self):
+        """
+        Paired-Dataset Mode.
+
+        Each written sample contains both pixel representations of the same
+        spatial patch:
+            image_low.npy   — base (unadjusted) image
+            image_high.npy  — CLAHE-enhanced image
+            label_patch.npy — shared ground-truth label
+            metadata.json   — from the CLAHE stream (canonical)
+
+        CLAHE is the anchor: only patches that have a matching base counterpart
+        are written.  All pairs land in the 'trn' split; the caller is
+        responsible for carving out a validation set separately.
+
+        Normalization stats are tracked independently under:
+            {prefix}_low  → base statistics
+            {prefix}_high → CLAHE statistics
+        so downstream normalisation can treat each variant correctly.
+
+        Implementation uses a two-pass strategy to stay memory-efficient at
+        1M+ scale:
+          Pass 1: tarfile scan of base tars → sqlite index
+                  (patch_id → tar_path + byte offset, ~300 MB for 1M patches)
+          Pass 2: WebDataset stream of CLAHE tars + O(1) seek into base tars
+                  via an LRU-cached raw file-handle pool.
+        """
+        if not self.clahe_dir:
+            raise RuntimeError("execute_pair() requires clahe_dir to be set.")
+
+        self._tar_handle_cache: OrderedDict = OrderedDict()
+        index_path = self.output_dir / f"{self.prefix}_base_index.sqlite"
+
+        # ------------------------------------------------------------------
+        # Phase 1: build byte-offset index of base patches
+        # ------------------------------------------------------------------
+        total_indexed = self._build_base_index(index_path)
+        if total_indexed == 0:
+            raise RuntimeError("Phase 1 produced an empty index — check base_dir.")
+
+        # ------------------------------------------------------------------
+        # Phase 2: stream CLAHE, seek base, write pairs
+        # ------------------------------------------------------------------
+        logger.info("Phase 2 [pair]: Streaming CLAHE and writing paired shards...")
+
+        conn = sqlite3.connect(str(index_path))
+        conn.row_factory = sqlite3.Row
+
+        clahe_tars = self._get_safe_tars(self.clahe_dir)
+        clahe_ds = (
+            wds.WebDataset([str(f) for f in clahe_tars], shardshuffle=False)
+            .decode()
+            .to_tuple(
+                "__key__", "image_patch.npy", "label_patch.npy", "metadata.json"
+            )
+        )
+
+        written = 0
+        skipped_no_base = 0
+        skipped_read_err = 0
+
+        for clahe_key, clahe_img, lbl, meta in tqdm(
+            clahe_ds,
+            total=self.total_clahe_patches,
+            desc="Phase 2 [pair]: Writing pairs",
+        ):
+            patch_id = self._get_patch_id(meta)
+            row = conn.execute(
+                "SELECT tar_path, img_offset, img_size "
+                "FROM base_index WHERE patch_id = ?",
+                (patch_id,),
+            ).fetchone()
+
+            if row is None:
+                skipped_no_base += 1
+                continue
+
+            try:
+                base_img = self._read_base_img(
+                    row["tar_path"], row["img_offset"], row["img_size"]
+                )
+            except Exception as exc:
+                logger.warning(f"Could not read base img for {patch_id}: {exc}")
+                skipped_read_err += 1
+                continue
+
+            meta["patch_metadata"]["split"] = "trn"
+            self._write_and_track_paired(
+                "trn", clahe_key, base_img, clahe_img, lbl, meta
+            )
+            written += 1
+
+        conn.close()
+        self._close_tar_handles()
+
+        logger.info(
+            f"Phase 2 [pair]: {written} pairs written | "
+            f"{skipped_no_base} skipped (no base match) | "
+            f"{skipped_read_err} skipped (read error)"
+        )
+
+        for split in list(self.active_writers.keys()):
+            self._rotate_writer(split)
+
+        self._finalize_manifest()
+        self.export_normalization_stats()
+
+        # Clean up temp index
+        try:
+            index_path.unlink()
+            logger.info(f"Removed temp index: {index_path}")
+        except Exception:
+            pass
 
     def execute_merge(self):
         # ---------------------------------------------------------
