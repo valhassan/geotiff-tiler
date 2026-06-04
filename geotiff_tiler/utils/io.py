@@ -419,13 +419,13 @@ def clip_raster_to_geometry(image_path: str, geometry: box, prefix: str, tmp_dir
             "-cutline",
             str(temp_geom_path),
             "-crop_to_cutline",
-            "-dstnodata",
-            str(nodata),
             "-of",
             "GTiff",
             str(source_path),
             str(clipped_image_path),
         ]
+        if nodata is not None:
+            cmd[4:4] = ["-dstnodata", str(nodata)]
         subprocess.run(cmd, capture_output=True, text=True, check=True)
         return clipped_image_path
     finally:
@@ -567,8 +567,18 @@ def rasterize_vector(
         ].copy()
 
         if attr_field and attr_values:
-            field_id = set(attr_field)
-            attr_field = field_id.intersection(vector_clean.columns).pop()
+            candidates = list(set(attr_field).intersection(vector_clean.columns))
+            if not candidates:
+                raise ValueError(
+                    f"None of the requested attr_field(s) {attr_field} found in "
+                    f"vector columns {list(vector_clean.columns)}"
+                )
+            if len(candidates) > 1:
+                raise ValueError(
+                    f"Multiple attr_field candidates found: {candidates}. "
+                    "Pass a single unambiguous field name."
+                )
+            attr_field = candidates[0]
             cont_vals_dict = {
                 src: (dst + 1 if continuous else src)
                 for dst, src in enumerate(attr_values)
@@ -594,7 +604,7 @@ def rasterize_vector(
             width, height = src.width, src.height
             transform = src.transform
 
-        if transform is rasterio.Affine.identity():
+        if transform == rasterio.Affine.identity():
             transform = rasterio.transform.from_origin(0, 0, 1, 1)
 
         xmin = str(transform.c)
@@ -633,7 +643,6 @@ def rasterize_vector(
             "GTiff",
             "-init",
             "0",
-            "-at",
             str(temp_vector_path),
             str(rasterized_label_path),
         ]
