@@ -540,6 +540,25 @@ def apply_nodata_mask(
     return res
 
 
+def _compute_erosion_dist(
+    pixel_size: float,
+    target_gap_m: float | None,
+    max_gsd_for_erosion: float,
+) -> float:
+    """Returns per-polygon inward erosion distance in CRS units.
+
+    Uses a sensor-adaptive formula when target_gap_m is not specified:
+    guarantees a ≥2-pixel gap between adjacent instances, capped at 0.6m
+    per side (1.2m total) to avoid collapsing typical building footprints.
+    Returns 0.0 for coarse sensors where erosion is counterproductive.
+    """
+    if pixel_size > max_gsd_for_erosion:
+        return 0.0
+    if target_gap_m is not None:
+        return target_gap_m / 2.0
+    return min(pixel_size, 0.6)
+
+
 @log_stage(stage_name="rasterize_vector", log_memory=True)
 def rasterize_vector(
     vector: gpd.GeoDataFrame,
@@ -551,9 +570,26 @@ def rasterize_vector(
     continuous: bool = True,
     default_burn_value: int = 1,
     dtype: str = "uint8",
+    erosion_classes: List[str] = None,
+    target_gap_m: float = None,
+    max_gsd_for_erosion: float = 1.0,
+    min_erosion_area_m2: float = 4.0,
 ) -> str:
-    """
-    Rasterize vector data to a raster.
+    """Rasterize vector data to a raster.
+
+    Args:
+        erosion_classes: Subset of attr_values whose geometries should be
+            eroded inward before rasterization (e.g. ["Building"]).  Only
+            meaningful when attr_field/attr_values are provided.  Pass None
+            to disable erosion entirely.
+        target_gap_m: Desired total physical gap (metres) to enforce between
+            adjacent eroded instances.  None uses the sensor-adaptive formula
+            (≥2-pixel gap, capped at 1.2 m total).
+        max_gsd_for_erosion: Sensors with GSD above this value (metres) skip
+            erosion — gaps are sub-pixel and erosion only shrinks footprints.
+        min_erosion_area_m2: Eroded geometries whose area falls below this
+            threshold are restored to their original shape to prevent small
+            structures (sheds, garages) from collapsing.
     """
     if vector.empty:
         return None
@@ -593,19 +629,36 @@ def rasterize_vector(
             vector_clean["burn_val"] = vector_clean[attr_field].map(cont_vals_dict)
             vector_clean = vector_clean.sort_values("burn_val")
             burn_attribute = "burn_val"
+            erosion_burn_vals = {
+                cont_vals_dict.get(str(v) if isinstance(v, str) else v)
+                for v in (erosion_classes or [])
+            } - {None}
         else:
             vector_clean["burn_val"] = default_burn_value
             burn_attribute = "burn_val"
-
-        vector_clean.to_file(temp_vector_path, driver="ESRI Shapefile")
-        del vector_clean
+            erosion_burn_vals = set()
 
         with rasterio.open(image_path) as src:
-            width, height = src.width, src.height
             transform = src.transform
 
         if transform == rasterio.Affine.identity():
             transform = rasterio.transform.from_origin(0, 0, 1, 1)
+
+        pixel_size = min(transform.a, -transform.e)
+        erosion_dist = _compute_erosion_dist(pixel_size, target_gap_m, max_gsd_for_erosion)
+
+        if erosion_dist > 0 and erosion_burn_vals:
+            erode_mask = vector_clean["burn_val"].isin(erosion_burn_vals)
+            if erode_mask.any():
+                orig = vector_clean.loc[erode_mask, "geometry"]
+                eroded = orig.buffer(-erosion_dist)
+                restore = eroded.is_empty | (eroded.area < min_erosion_area_m2)
+                vector_clean.loc[erode_mask, "geometry"] = eroded.where(~restore, orig)
+
+        vector_clean = vector_clean[~vector_clean.geometry.is_empty].copy()
+
+        vector_clean.to_file(temp_vector_path, driver="ESRI Shapefile")
+        del vector_clean
 
         xmin = str(transform.c)
         ymin = str(transform.f + src.height * transform.e)
@@ -625,24 +678,13 @@ def rasterize_vector(
 
         cmd = [
             "gdal_rasterize",
-            "-a",
-            burn_attribute,
-            "-a_nodata",
-            "255",
-            "-tr",
-            xres,
-            yres,
-            "-te",
-            xmin,
-            ymin,
-            xmax,
-            ymax,
-            "-ot",
-            mapping.get(dtype, "Byte"),
-            "-of",
-            "GTiff",
-            "-init",
-            "0",
+            "-a", burn_attribute,
+            "-a_nodata", "255",
+            "-tr", xres, yres,
+            "-te", xmin, ymin, xmax, ymax,
+            "-ot", mapping.get(dtype, "Byte"),
+            "-of", "GTiff",
+            "-init", "0",
             str(temp_vector_path),
             str(rasterized_label_path),
         ]
@@ -664,13 +706,21 @@ def prepare_vector_labels(
     tmp_dir: str,
     attr_field: List[str] = None,
     attr_values: list = None,
+    erosion_classes: List[str] = None,
+    target_gap_m: float = None,
+    max_gsd_for_erosion: float = 1.0,
+    min_erosion_area_m2: float = 4.0,
 ):
     """Prepares vector labels for tiling"""
     nodata_mask_gdf = create_nodata_mask(image_path)
     label_gdf = apply_nodata_mask(label_path, nodata_mask_gdf)
     label_name = Path(label_path).stem
     rasterized_label_path = rasterize_vector(
-        label_gdf, image_path, label_name, tmp_dir, attr_field, attr_values
+        label_gdf, image_path, label_name, tmp_dir, attr_field, attr_values,
+        erosion_classes=erosion_classes,
+        target_gap_m=target_gap_m,
+        max_gsd_for_erosion=max_gsd_for_erosion,
+        min_erosion_area_m2=min_erosion_area_m2,
     )
     del nodata_mask_gdf, label_gdf
     return rasterized_label_path
