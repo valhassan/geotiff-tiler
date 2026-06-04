@@ -560,6 +560,7 @@ class Tiler:
                     val_patch_count = 0
                     tst_patch_count = 0
                     start_time = time.time()
+                    image_nodata = src_image.nodata
                     with tqdm(total=total_patches, desc="Tiling patches") as pbar:
                         for y in range(0, image_height, self.stride):
                             for x in range(0, image_width, self.stride):
@@ -569,20 +570,39 @@ class Tiler:
                                     pbar.update(1)
                                     continue
                                 
-                                window_width = min(self.patch_size[1], image_width - x)
-                                window_height = min(self.patch_size[0], image_height - y)
-                                window = Window(col_off=x, row_off=y, width=window_width, height=window_height)
+                                # Always request full patch_size; boundless=True fills
+                                # out-of-bounds pixels with fill_value instead of
+                                # returning a smaller array at image borders.
+                                window = Window(
+                                    col_off=x, row_off=y,
+                                    width=self.patch_size[1], height=self.patch_size[0]
+                                )
                                 
-                                label_patch = src_label.read(window=window, boundless=False)
+                                # fill_value=0 keeps _filter_patches correct:
+                                # out-of-bounds pixels become background (0), not a
+                                # fake class value that inflates non-zero counts.
+                                label_patch = src_label.read(
+                                    window=window, boundless=True, fill_value=0
+                                )
                                 if not self._filter_patches(label_patch):
                                     discarded_count += 1
                                     continue
                                 
-                                image_patch = src_image.read(window=window, boundless=False)
+                                # Use the raster's nodata as fill so we can identify
+                                # out-of-bounds pixels precisely.  Fall back to 0 only
+                                # when nodata is not defined (avoids masking valid dark
+                                # pixels when nodata is unset).
+                                nodata_fill = image_nodata if image_nodata is not None else 0
+                                image_patch = src_image.read(
+                                    window=window, boundless=True, fill_value=nodata_fill
+                                )
                                 
-                                if image_patch.shape[1:] != self.patch_size or label_patch.shape[1:] != self.patch_size:
-                                    image_patch = self.pad_patch(image_patch, self.patch_size)
-                                    label_patch = self.pad_patch(label_patch, self.patch_size)
+                                # Mark border fill and any in-image nodata pixels as
+                                # ignore (255) in the label so the model computes no
+                                # loss on them — matches the old pipeline's mask_nodata.
+                                if image_nodata is not None:
+                                    nodata_mask = np.all(image_patch == image_nodata, axis=0)
+                                    label_patch[0, nodata_mask] = 255
                                 
                                 if create_val_set:
                                     grid_x = int(x // (image_width / grid_size))
