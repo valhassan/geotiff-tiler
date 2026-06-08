@@ -22,6 +22,7 @@ from .checks import (
     is_image_georeferenced,
     is_label_georeferenced,
 )
+from .build_targets import compute_building_targets
 from .geoutils import select_bands, stack_bands, with_connection_retry
 from .stacitem import SingleBandItemEO
 
@@ -710,6 +711,8 @@ def prepare_vector_labels(
     target_gap_m: float = None,
     max_gsd_for_erosion: float = 1.0,
     min_erosion_area_m2: float = 4.0,
+    building_class_val: int | None = None,
+    compute_build_targets: bool = True,
 ):
     """Prepares vector labels for tiling"""
     nodata_mask_gdf = create_nodata_mask(image_path)
@@ -722,5 +725,18 @@ def prepare_vector_labels(
         max_gsd_for_erosion=max_gsd_for_erosion,
         min_erosion_area_m2=min_erosion_area_m2,
     )
+    build_targets_paths = {}
+    if compute_build_targets and building_class_val is not None:
+        if attr_field and attr_values:
+            field = list(set(attr_field).intersection(label_gdf.columns))[0] \
+                if isinstance(attr_field, list) else attr_field
+        building_mask = label_gdf[field].astype(str) == str(building_class_val)
+        building_gdf = label_gdf[building_mask]
+
+        if not building_gdf.empty:
+            build_targets_paths = compute_building_targets(
+                building_gdf, image_path, tmp_dir, label_name
+            )
+    
     del nodata_mask_gdf, label_gdf
-    return rasterized_label_path
+    return rasterized_label_path, build_targets_paths
