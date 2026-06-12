@@ -14,6 +14,7 @@ import pystac
 import rasterio
 from shapely.geometry import box, shape
 
+from .build_targets import compute_building_targets
 from .checks import (
     check_alignment,
     check_image_validity,
@@ -22,7 +23,6 @@ from .checks import (
     is_image_georeferenced,
     is_label_georeferenced,
 )
-from .build_targets import compute_building_targets
 from .geoutils import select_bands, stack_bands, with_connection_retry
 from .stacitem import SingleBandItemEO
 
@@ -106,7 +106,9 @@ def load_vector_mask(
         extent_gdf = gpd.read_file(mask_path, layer=extent_layer)
         if not extent_gdf.empty:
             if extent_gdf.crs != result.crs:
-                logger.warning(f"Extent layer CRS ({extent_gdf.crs}) doesn't match main layer CRS ({result.crs}). Reprojecting extent layer.")
+                logger.warning(
+                    f"Extent layer CRS ({extent_gdf.crs}) doesn't match main layer CRS ({result.crs}). Reprojecting extent layer."
+                )
                 extent_gdf = extent_gdf.to_crs(result.crs)
             extent_geom = extent_gdf.geometry.iloc[0]
             if not extent_geom.is_valid:
@@ -574,7 +576,7 @@ def rasterize_vector(
     erosion_classes: List[str] = None,
     target_gap_m: float = None,
     max_gsd_for_erosion: float = 1.0,
-    min_erosion_area_m2: float = 4.0,
+    min_erosion_area_m2: float = 10.0,
 ) -> str:
     """Rasterize vector data to a raster.
 
@@ -646,17 +648,33 @@ def rasterize_vector(
             transform = rasterio.transform.from_origin(0, 0, 1, 1)
 
         pixel_size = min(transform.a, -transform.e)
-        erosion_dist = _compute_erosion_dist(pixel_size, target_gap_m, max_gsd_for_erosion)
+        erosion_dist = _compute_erosion_dist(
+            pixel_size, target_gap_m, max_gsd_for_erosion
+        )
+        min_width_m = 1.5
 
         if erosion_dist > 0 and erosion_burn_vals:
             erode_mask = vector_clean["burn_val"].isin(erosion_burn_vals)
             if erode_mask.any():
                 orig = vector_clean.loc[erode_mask, "geometry"]
+                too_small_to_erode = orig.area < (min_erosion_area_m2 * 3.0)
                 eroded = orig.buffer(-erosion_dist)
-                restore = eroded.is_empty | (eroded.area < min_erosion_area_m2)
+                eroded_bounds = eroded.bounds
+                eroded_width = (eroded_bounds["maxx"] - eroded_bounds["minx"]).combine(
+                    eroded_bounds["maxy"] - eroded_bounds["miny"], min
+                )
+                restore = (
+                    eroded.is_empty
+                    | (eroded.area < min_erosion_area_m2)
+                    | (eroded_width < min_width_m)
+                    | too_small_to_erode
+                )
                 vector_clean.loc[erode_mask, "geometry"] = eroded.where(~restore, orig)
 
         vector_clean = vector_clean[~vector_clean.geometry.is_empty].copy()
+        eroded_building_gdf = vector_clean[
+            vector_clean["burn_val"].isin(erosion_burn_vals)
+        ].copy()
 
         vector_clean.to_file(temp_vector_path, driver="ESRI Shapefile")
         del vector_clean
@@ -679,20 +697,31 @@ def rasterize_vector(
 
         cmd = [
             "gdal_rasterize",
-            "-a", burn_attribute,
-            "-a_nodata", "255",
-            "-tr", xres, yres,
-            "-te", xmin, ymin, xmax, ymax,
-            "-ot", mapping.get(dtype, "Byte"),
-            "-of", "GTiff",
-            "-init", "0",
+            "-a",
+            burn_attribute,
+            "-a_nodata",
+            "255",
+            "-tr",
+            xres,
+            yres,
+            "-te",
+            xmin,
+            ymin,
+            xmax,
+            ymax,
+            "-ot",
+            mapping.get(dtype, "Byte"),
+            "-of",
+            "GTiff",
+            "-init",
+            "0",
             str(temp_vector_path),
             str(rasterized_label_path),
         ]
 
         subprocess.run(cmd, check=True)
 
-        return rasterized_label_path
+        return rasterized_label_path, eroded_building_gdf
     finally:
         for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
             shp_file = temp_vector_path.with_suffix(ext)
@@ -710,7 +739,7 @@ def prepare_vector_labels(
     erosion_classes: List[str] = None,
     target_gap_m: float = None,
     max_gsd_for_erosion: float = 1.0,
-    min_erosion_area_m2: float = 4.0,
+    min_erosion_area_m2: float = 5.0,
     building_class_val: int | None = None,
     compute_build_targets: bool = True,
 ):
@@ -718,8 +747,13 @@ def prepare_vector_labels(
     nodata_mask_gdf = create_nodata_mask(image_path)
     label_gdf = apply_nodata_mask(label_path, nodata_mask_gdf)
     label_name = Path(label_path).stem
-    rasterized_label_path = rasterize_vector(
-        label_gdf, image_path, label_name, tmp_dir, attr_field, attr_values,
+    rasterized_label_path, eroded_building_gdf = rasterize_vector(
+        label_gdf,
+        image_path,
+        label_name,
+        tmp_dir,
+        attr_field,
+        attr_values,
         erosion_classes=erosion_classes,
         target_gap_m=target_gap_m,
         max_gsd_for_erosion=max_gsd_for_erosion,
@@ -727,16 +761,24 @@ def prepare_vector_labels(
     )
     build_targets_paths = {}
     if compute_build_targets and building_class_val is not None:
-        if attr_field and attr_values:
-            field = list(set(attr_field).intersection(label_gdf.columns))[0] \
-                if isinstance(attr_field, list) else attr_field
-        building_mask = label_gdf[field].astype(str) == str(building_class_val)
-        building_gdf = label_gdf[building_mask]
+        if not eroded_building_gdf.empty:
+            build_gdf = eroded_building_gdf
+        else:
+            if attr_field and attr_values:
+                field = (
+                    list(set(attr_field).intersection(label_gdf.columns))[0]
+                    if isinstance(attr_field, list)
+                    else attr_field
+                )
+                building_mask = label_gdf[field].astype(str) == str(building_class_val)
+                build_gdf = label_gdf[building_mask]
+            else:
+                build_gdf = gpd.GeoDataFrame()
 
-        if not building_gdf.empty:
+        if not build_gdf.empty:
             build_targets_paths = compute_building_targets(
-                building_gdf, image_path, tmp_dir, label_name
+                build_gdf, image_path, tmp_dir, label_name
             )
-    
+
     del nodata_mask_gdf, label_gdf
     return rasterized_label_path, build_targets_paths
