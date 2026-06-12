@@ -15,6 +15,7 @@ import rasterio
 from shapely.geometry import box, shape
 
 from .build_targets import compute_building_targets
+from .road_targets import compute_road_targets
 from .checks import (
     check_alignment,
     check_image_validity,
@@ -741,9 +742,11 @@ def prepare_vector_labels(
     max_gsd_for_erosion: float = 1.0,
     min_erosion_area_m2: float = 5.0,
     building_class_val: int | None = None,
+    road_class_val: int | None = None,
     compute_build_targets: bool = True,
+    max_gsd_for_road_targets: float = 1.0,
 ):
-    """Prepares vector labels for tiling"""
+    """Prepares vector labels for tiling."""
     nodata_mask_gdf = create_nodata_mask(image_path)
     label_gdf = apply_nodata_mask(label_path, nodata_mask_gdf)
     label_name = Path(label_path).stem
@@ -759,26 +762,57 @@ def prepare_vector_labels(
         max_gsd_for_erosion=max_gsd_for_erosion,
         min_erosion_area_m2=min_erosion_area_m2,
     )
-    build_targets_paths = {}
+    targets_paths = {}
+
+    def _resolve_field(gdf: gpd.GeoDataFrame) -> str | None:
+        if not (attr_field and attr_values):
+            return None
+        candidates = list(
+            set(attr_field if isinstance(attr_field, list) else [attr_field])
+            .intersection(gdf.columns)
+        )
+        return candidates[0] if candidates else None
+
+    # --- buildings targets -----------------------------------------------
     if compute_build_targets and building_class_val is not None:
         if not eroded_building_gdf.empty:
             build_gdf = eroded_building_gdf
         else:
-            if attr_field and attr_values:
-                field = (
-                    list(set(attr_field).intersection(label_gdf.columns))[0]
-                    if isinstance(attr_field, list)
-                    else attr_field
-                )
-                building_mask = label_gdf[field].astype(str) == str(building_class_val)
-                build_gdf = label_gdf[building_mask]
+            field = _resolve_field(label_gdf)
+            if field:
+                build_gdf = label_gdf[
+                    label_gdf[field].astype(str) == str(building_class_val)
+                ]
             else:
                 build_gdf = gpd.GeoDataFrame()
 
         if not build_gdf.empty:
-            build_targets_paths = compute_building_targets(
-                build_gdf, image_path, tmp_dir, label_name
+            targets_paths.update(
+                compute_building_targets(
+                    build_gdf, image_path, tmp_dir, label_name
+                )
+            )
+
+    # --- roads targets ---------------------------------------------------
+    if compute_build_targets and road_class_val is not None:
+        field = _resolve_field(label_gdf)
+        if field:
+            road_gdf = label_gdf[
+                label_gdf[field].astype(str) == str(road_class_val)
+            ]
+        else:
+            road_gdf = gpd.GeoDataFrame()
+
+        if not road_gdf.empty:
+            targets_paths.update(
+                compute_road_targets(
+                    road_gdf,
+                    image_path,
+                    tmp_dir,
+                    label_name,
+                    max_gsd_for_targets=max_gsd_for_road_targets,
+                )
             )
 
     del nodata_mask_gdf, label_gdf
-    return rasterized_label_path, build_targets_paths
+    return rasterized_label_path, targets_paths
