@@ -4,6 +4,7 @@ All targets are computed at full image resolution and sliced at patch time.
 """
 
 import logging
+import time
 from pathlib import Path
 from typing import Tuple
 
@@ -82,20 +83,28 @@ def compute_building_targets(
     ].geometry.tolist()
 
     # Compute all four targets in a single pass over geometries
+    t = time.time()
     edt_map = _compute_dual_distance_edt(
         valid_geoms, h, w, transform, max_dist_px, sigma
     )
+    logger.info(f"EDT:      {time.time() - t:.1f}s")
+    t = time.time()
     boundary_map = _compute_vector_boundary(valid_geoms, h, w, transform)
+    logger.info(f"Boundary: {time.time() - t:.1f}s")
+    t = time.time()
     vertex_map = _compute_vertex_heatmap(valid_geoms, h, w, transform, vertex_sigma)
+    logger.info(f"Vertices: {time.time() - t:.1f}s")
+    t = time.time()
     sdf_map = _compute_sdf(valid_geoms, h, w, transform)
+    logger.info(f"SDF:      {time.time() - t:.1f}s")
 
     # Write to tif files
     paths = {}
     specs = [
         ("edt", edt_map, "uint8", np.uint8),
-        ("boundary", boundary_map, "float32", np.float32),
-        ("vertices", vertex_map, "float32", np.float32),
-        ("sdf", sdf_map, "float32", np.float32),
+        ("boundary", np.clip(boundary_map * 255, 0, 255), "uint8", np.uint8),
+        ("vertices", np.clip(vertex_map * 255, 0, 255), "uint8", np.uint8),
+        ("sdf", sdf_map, "float16", np.float16),
     ]
 
     for key, arr, dtype_str, dtype_np in specs:
@@ -185,66 +194,60 @@ def _compute_dual_distance_edt(
 
 
 def _compute_vector_boundary(
-    geoms,
-    h: int,
-    w: int,
-    transform: Affine,
+    geoms, h: int, w: int, transform: Affine,
 ) -> np.ndarray:
-    """
-    Soft boundary map from polygon edge segments at sub-pixel precision.
-    Each edge pixel receives a Gaussian weighted by distance to the exact
-    polygon edge line — not a morphological approximation.
-    Stored as float32 [0, 1].
+    """Compute the vector boundary map.
+    Args:
+        geoms: List of geometries.
+        h: Height of the image.
+        w: Width of the image.
+        transform: Transform of the image.
+    Returns:
+        np.ndarray: Vector boundary map.
     """
     boundary = np.zeros((h, w), dtype=np.float32)
-    sigma_px = 0.8  # sub-pixel spread
+    sigma_px = 0.8
+    r = 2
 
     for geom in geoms:
-        coords = np.array(geom.exterior.coords)  # (N, 2) CRS coords
-        # Convert to float pixel coords
+        coords = np.array(geom.exterior.coords)
         px = (coords[:, 0] - transform.c) / transform.a
         py = (coords[:, 1] - transform.f) / transform.e
 
+        # Collect all sample points across all edges at once
+        all_xs, all_ys = [], []
         for i in range(len(px) - 1):
-            _splat_segment(boundary, px[i], py[i], px[i + 1], py[i + 1], sigma_px, h, w)
+            length = np.hypot(px[i+1] - px[i], py[i+1] - py[i])
+            n = max(int(length * 2), 1)
+            ts = np.linspace(0, 1, n)
+            all_xs.append(px[i] + ts * (px[i+1] - px[i]))
+            all_ys.append(py[i] + ts * (py[i+1] - py[i]))
+
+        if not all_xs:
+            continue
+
+        xs = np.concatenate(all_xs)   # (M,)
+        ys = np.concatenate(all_ys)   # (M,)
+
+        # Clip sample centres to valid range
+        cjs = np.clip(xs.astype(int), r, w - r - 1)
+        cis = np.clip(ys.astype(int), r, h - r - 1)
+
+        # Neighbourhood offsets
+        off = np.arange(-r, r + 1)
+        di, dj = np.meshgrid(off, off, indexing='ij')  # (5,5)
+        di = di.ravel()   # (25,)
+        dj = dj.ravel()   # (25,)
+
+        # Vectorized: (M, 25) index arrays
+        ni = cis[:, None] + di[None, :]   # (M, 25)
+        nj = cjs[:, None] + dj[None, :]   # (M, 25)
+        dist2 = (nj - xs[:, None]) ** 2 + (ni - ys[:, None]) ** 2  # (M, 25)
+        weights = np.exp(-dist2 / (2 * sigma_px ** 2))              # (M, 25)
+
+        np.add.at(boundary, (ni.ravel(), nj.ravel()), weights.ravel())
 
     return np.clip(boundary, 0, 1)
-
-
-def _splat_segment(
-    canvas: np.ndarray,
-    x0: float,
-    y0: float,
-    x1: float,
-    y1: float,
-    sigma: float,
-    h: int,
-    w: int,
-) -> None:
-    """
-    Rasterize a line segment as a Gaussian-weighted soft line.
-    Samples points along the segment at 0.5px intervals and splatted
-    each sample onto the canvas in-place.
-    """
-    length = np.hypot(x1 - x0, y1 - y0)
-    if length < 1e-6:
-        return
-
-    n_steps = max(int(length * 2), 1)  # 0.5px spacing
-    ts = np.linspace(0, 1, n_steps)
-    xs = x0 + ts * (x1 - x0)
-    ys = y0 + ts * (y1 - y0)
-
-    # Integer pixel neighbourhood for each sample
-    for sx, sy in zip(xs, ys):
-        for di in range(-2, 3):
-            for dj in range(-2, 3):
-                ni = int(sy) + di
-                nj = int(sx) + dj
-                if 0 <= ni < h and 0 <= nj < w:
-                    dist2 = (nj - sx) ** 2 + (ni - sy) ** 2
-                    canvas[ni, nj] += np.exp(-dist2 / (2 * sigma**2))
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Target 3: Vertex heatmap
@@ -252,33 +255,49 @@ def _splat_segment(
 
 
 def _compute_vertex_heatmap(
-    geoms,
-    h: int,
-    w: int,
-    transform: Affine,
+    geoms, h: int, w: int, transform: Affine,
     sigma: float = 1.5,
 ) -> np.ndarray:
-    """
-    Gaussian blob at each polygon vertex at exact sub-pixel float coordinates.
-    Encodes the rectilinear corner prior for buildings.
-    Stored as float32 [0, 1].
+    """Compute the vertex heatmap.
+    Args:
+        geoms: List of geometries.
+        h: Height of the image.
+        w: Width of the image.
+        transform: Transform of the image.
+        sigma: Sigma of the Gaussian.
+    Returns:
+        np.ndarray: Vertex heatmap.
     """
     heatmap = np.zeros((h, w), dtype=np.float32)
-    r = int(np.ceil(3 * sigma))  # splat radius
+    r = int(np.ceil(3 * sigma))
 
+    # Collect ALL vertices across all geometries at once
+    all_vx, all_vy = [], []
     for geom in geoms:
-        coords = np.array(geom.exterior.coords[:-1])  # drop closing duplicate
-        px = (coords[:, 0] - transform.c) / transform.a
-        py = (coords[:, 1] - transform.f) / transform.e
+        coords = np.array(geom.exterior.coords[:-1])
+        all_vx.append((coords[:, 0] - transform.c) / transform.a)
+        all_vy.append((coords[:, 1] - transform.f) / transform.e)
 
-        for vx, vy in zip(px, py):
-            ci, cj = int(vy), int(vx)
-            for di in range(-r, r + 1):
-                for dj in range(-r, r + 1):
-                    ni, nj = ci + di, cj + dj
-                    if 0 <= ni < h and 0 <= nj < w:
-                        dist2 = (nj - vx) ** 2 + (ni - vy) ** 2
-                        heatmap[ni, nj] += np.exp(-dist2 / (2 * sigma**2))
+    if not all_vx:
+        return heatmap
+
+    vx = np.concatenate(all_vx)   # (V,)
+    vy = np.concatenate(all_vy)   # (V,)
+
+    # Clip centres
+    cjs = np.clip(vx.astype(int), r, w - r - 1)
+    cis = np.clip(vy.astype(int), r, h - r - 1)
+
+    off = np.arange(-r, r + 1)
+    di, dj = np.meshgrid(off, off, indexing='ij')
+    di, dj = di.ravel(), dj.ravel()          # (K,)
+
+    ni = cis[:, None] + di[None, :]          # (V, K)
+    nj = cjs[:, None] + dj[None, :]          # (V, K)
+    dist2 = (nj - vx[:, None]) ** 2 + (ni - vy[:, None]) ** 2
+    weights = np.exp(-dist2 / (2 * sigma ** 2))
+
+    np.add.at(heatmap, (ni.ravel(), nj.ravel()), weights.ravel())
 
     return np.clip(heatmap, 0, 1)
 
