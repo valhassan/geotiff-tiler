@@ -88,6 +88,7 @@ class Tiler:
         target_gap_m: float = None,
         max_gsd_for_erosion: float = 1.0,
         min_erosion_area_m2: float = 4.0,
+        building_class_val: int | None = None,
         class_ids: Dict[str, int] = None,
         discard_empty: bool = True,
         label_threshold: float = 0.01,  # minimum of non-zero pixels in a patch to be considered valid (0-1)
@@ -114,6 +115,7 @@ class Tiler:
             target_gap_m (float, optional): Target gap in meters.
             max_gsd_for_erosion (float, optional): Maximum GSD for erosion.
             min_erosion_area_m2 (float, optional): Minimum erosion area in square meters.
+            building_class_val (int, optional): Building class value. Defaults to None.
             class_ids (Dict[str, int], optional): Dictionary mapping class names to class IDs.
             discard_empty (bool, optional): Whether to discard patches with no label data. Defaults to True.
             label_threshold (float, optional): Minimum ratio of non-zero pixels required in a label patch (0-1).
@@ -138,6 +140,7 @@ class Tiler:
         self.target_gap_m = target_gap_m
         self.max_gsd_for_erosion = max_gsd_for_erosion
         self.min_erosion_area_m2 = min_erosion_area_m2
+        self.building_class_val = building_class_val
         self.grid_size = grid_size
         self.val_ratio = val_ratio
         self.class_balance_weight = class_balance_weight
@@ -499,6 +502,7 @@ class Tiler:
                     target_gap_m=self.target_gap_m,
                     max_gsd_for_erosion=self.max_gsd_for_erosion,
                     min_erosion_area_m2=self.min_erosion_area_m2,
+                    building_class_val=self.building_class_val,
                 )
 
             return {
@@ -995,6 +999,7 @@ if __name__ == "__main__":
         attr_field=["class", "Quatreclasses"],
         attr_values=[1, 2, 3, 4],
         erosion_classes=[4],
+        building_class_val=4,
         stride=1024,
         discard_empty=True,
         label_threshold=0.1,
