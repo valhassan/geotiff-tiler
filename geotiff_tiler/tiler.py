@@ -89,6 +89,7 @@ class Tiler:
         max_gsd_for_erosion: float = 1.0,
         min_erosion_area_m2: float = 4.0,
         building_class_val: int | None = None,
+        road_class_val: int | None = None,
         class_ids: Dict[str, int] = None,
         discard_empty: bool = True,
         label_threshold: float = 0.01,  # minimum of non-zero pixels in a patch to be considered valid (0-1)
@@ -116,6 +117,7 @@ class Tiler:
             max_gsd_for_erosion (float, optional): Maximum GSD for erosion.
             min_erosion_area_m2 (float, optional): Minimum erosion area in square meters.
             building_class_val (int, optional): Building class value. Defaults to None.
+            road_class_val (int, optional): Road class value. Defaults to None.
             class_ids (Dict[str, int], optional): Dictionary mapping class names to class IDs.
             discard_empty (bool, optional): Whether to discard patches with no label data. Defaults to True.
             label_threshold (float, optional): Minimum ratio of non-zero pixels required in a label patch (0-1).
@@ -141,6 +143,7 @@ class Tiler:
         self.max_gsd_for_erosion = max_gsd_for_erosion
         self.min_erosion_area_m2 = min_erosion_area_m2
         self.building_class_val = building_class_val
+        self.road_class_val = road_class_val
         self.grid_size = grid_size
         self.val_ratio = val_ratio
         self.class_balance_weight = class_balance_weight
@@ -503,6 +506,7 @@ class Tiler:
                     max_gsd_for_erosion=self.max_gsd_for_erosion,
                     min_erosion_area_m2=self.min_erosion_area_m2,
                     building_class_val=self.building_class_val,
+                    road_class_val=self.road_class_val,
                 )
 
             return {
@@ -836,6 +840,7 @@ class Tiler:
                                         self.prefix, split, output_tst_dir
                                     )
                                 sample = {
+                                    "__key__": patch_key,
                                     "image_patch.npy": image_patch,
                                     "label_patch.npy": label_patch,
                                     "metadata.json": all_metadata,
@@ -848,14 +853,13 @@ class Tiler:
                                             boundless=True,
                                             fill_value=0,
                                         )
-                                writer.write(
+                                sample.update(
                                     {
-                                        "__key__": patch_key,
-                                        "image_patch.npy": image_patch,
-                                        "label_patch.npy": label_patch,
-                                        "metadata.json": all_metadata,
+                                        f"{k}.npy": v
+                                        for k, v in build_targets_patches.items()
                                     }
                                 )
+                                writer.write(sample)
                                 actual_size = self._get_actual_shard_size(
                                     self.prefix, split
                                 )
