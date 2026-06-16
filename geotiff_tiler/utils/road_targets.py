@@ -18,10 +18,29 @@ import numpy as np
 import rasterio
 from rasterio.transform import Affine
 from scipy.ndimage import distance_transform_edt
+from shapely.geometry import MultiPolygon, Polygon
 
 from geotiff_tiler.utils.build_targets import _rasterize_geom
 
 logger = logging.getLogger(__name__)
+
+
+def _explode_to_polygons(geoms: list) -> list:
+    """
+    Flatten a mixed list of Polygon / MultiPolygon geometries to individual
+    Polygons. Other geometry types are silently dropped.
+
+    Must be called before any code that accesses geom.exterior, since
+    MultiPolygon does not have that attribute.
+    """
+    out = []
+    for geom in geoms:
+        if isinstance(geom, Polygon):
+            if not geom.is_empty:
+                out.append(geom)
+        elif isinstance(geom, MultiPolygon):
+            out.extend(p for p in geom.geoms if not p.is_empty)
+    return out
 
 
 def compute_road_targets(
@@ -56,6 +75,7 @@ def compute_road_targets(
     """
     with rasterio.open(image_path) as src:
         transform = src.transform
+        crs = src.crs
         h, w = src.height, src.width
 
     pixel_size = abs(transform.a)
@@ -66,9 +86,11 @@ def compute_road_targets(
         )
         return {}
 
-    valid_geoms = road_gdf[
-        ~road_gdf.geometry.is_empty & road_gdf.geometry.notnull()
-    ].geometry.tolist()
+    valid_geoms = _explode_to_polygons(
+        road_gdf[
+            ~road_gdf.geometry.is_empty & road_gdf.geometry.notnull()
+        ].geometry.tolist()
+    )
 
     if not valid_geoms:
         return {}
@@ -86,7 +108,7 @@ def compute_road_targets(
         width=w,
         count=1,
         dtype="uint8",
-        crs=None,
+        crs=crs,
         transform=transform,
     ) as dst:
         dst.write(centerline_weight, 1)
