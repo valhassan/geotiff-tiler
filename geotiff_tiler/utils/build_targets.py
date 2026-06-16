@@ -170,9 +170,9 @@ def _compute_dual_distance_edt(
         minx, miny, maxx, maxy = geom.bounds
         # Pad by max_dist_px
         c0 = max(0, int((minx - transform.c) / transform.a) - int(max_dist_px) - 1)
-        r0 = max(0, int((miny - transform.f) / transform.e) - int(max_dist_px) - 1)
+        r0 = max(0, int((maxy - transform.f) / transform.e) - int(max_dist_px) - 1)
         c1 = min(w, int((maxx - transform.c) / transform.a) + int(max_dist_px) + 2)
-        r1 = min(h, int((maxy - transform.f) / transform.e) + int(max_dist_px) + 2)
+        r1 = min(h, int((miny - transform.f) / transform.e) + int(max_dist_px) + 2)
 
         local_shape = (r1 - r0, c1 - c0)
         if local_shape[0] <= 0 or local_shape[1] <= 0:
