@@ -495,7 +495,7 @@ class Tiler:
                     "reason": "No intersection between image and label",
                 }
             if label_type == "vector":
-                clipped_label_path, build_targets_paths = prepare_vector_labels(
+                clipped_label_path, targets_paths = prepare_vector_labels(
                     clipped_label_path,
                     clipped_image_path,
                     tmp_dir,
@@ -512,7 +512,7 @@ class Tiler:
             return {
                 "image_path": str(clipped_image_path),
                 "label_path": str(clipped_label_path),
-                "build_targets_paths": build_targets_paths,
+                "targets_paths": targets_paths,
                 "status": "successful",
                 "reason": "Processed successfully",
             }
@@ -1004,6 +1004,7 @@ if __name__ == "__main__":
         attr_values=[1, 2, 3, 4],
         erosion_classes=[4],
         building_class_val=4,
+        road_class_val=3,
         stride=1024,
         discard_empty=True,
         label_threshold=0.1,
