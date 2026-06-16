@@ -14,6 +14,7 @@ import rasterio
 from rasterio.features import rasterize
 from rasterio.transform import Affine
 from scipy.ndimage import distance_transform_edt
+from shapely.geometry import Polygon, MultiPolygon
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,22 @@ def _rasterize_geom(
         dtype=np.uint8,
     )
 
+def _explode_to_polygons(geoms: list) -> list:
+    """
+    Flatten a mixed list of Polygon / MultiPolygon geometries to individual
+    Polygons. Other geometry types are silently dropped.
+ 
+    Must be called before any code that accesses geom.exterior, since
+    MultiPolygon does not have that attribute.
+    """
+    out = []
+    for geom in geoms:
+        if isinstance(geom, Polygon):
+            if not geom.is_empty:
+                out.append(geom)
+        elif isinstance(geom, MultiPolygon):
+            out.extend(p for p in geom.geoms if not p.is_empty)
+    return out
 
 def compute_building_targets(
     building_gdf: gpd.GeoDataFrame,
@@ -73,14 +90,15 @@ def compute_building_targets(
     """
     with rasterio.open(image_path) as src:
         transform = src.transform
+        crs = src.crs
         h, w = src.height, src.width
 
     pixel_size = abs(transform.a)
     max_dist_px = max_dist_meters / pixel_size
 
-    valid_geoms = building_gdf[
+    valid_geoms = _explode_to_polygons(building_gdf[
         ~building_gdf.geometry.is_empty & building_gdf.geometry.notnull()
-    ].geometry.tolist()
+    ].geometry.tolist())
 
     # Compute all four targets in a single pass over geometries
     t = time.time()
@@ -104,7 +122,7 @@ def compute_building_targets(
         ("edt", edt_map, "uint8", np.uint8),
         ("boundary", np.clip(boundary_map * 255, 0, 255), "uint8", np.uint8),
         ("vertices", np.clip(vertex_map * 255, 0, 255), "uint8", np.uint8),
-        ("sdf", sdf_map, "float16", np.float16),
+        ("sdf", sdf_map, "float32", np.float32),
     ]
 
     for key, arr, dtype_str, dtype_np in specs:
@@ -117,7 +135,7 @@ def compute_building_targets(
             width=w,
             count=1,
             dtype=dtype_str,
-            crs=None,
+            crs=crs,
             transform=transform,
         ) as dst:
             dst.write(arr.astype(dtype_np), 1)
