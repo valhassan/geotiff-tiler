@@ -743,7 +743,7 @@ def prepare_vector_labels(
     min_erosion_area_m2: float = 5.0,
     building_class_val: int | None = None,
     road_class_val: int | None = None,
-    compute_build_targets: bool = True,
+    compute_targets: bool = True,
     max_gsd_for_road_targets: float = 1.0,
 ):
     """Prepares vector labels for tiling."""
@@ -774,7 +774,7 @@ def prepare_vector_labels(
         return candidates[0] if candidates else None
 
     # --- buildings targets -----------------------------------------------
-    if compute_build_targets and building_class_val is not None:
+    if compute_targets and building_class_val is not None:
         if not eroded_building_gdf.empty:
             build_gdf = eroded_building_gdf
         else:
@@ -794,7 +794,7 @@ def prepare_vector_labels(
             )
 
     # --- roads targets ---------------------------------------------------
-    if compute_build_targets and road_class_val is not None:
+    if compute_targets and road_class_val is not None:
         field = _resolve_field(label_gdf)
         if field:
             road_gdf = label_gdf[
