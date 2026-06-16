@@ -154,9 +154,9 @@ def _compute_road_centerline_weight(
 
         # Bounding box in pixel space with 1px padding
         c0 = max(0, int((minx - transform.c) / transform.a) - 1)
-        r0 = max(0, int((miny - transform.f) / transform.e) - 1)
+        r0 = max(0, int((maxy - transform.f) / transform.e) - 1)
         c1 = min(w, int((maxx - transform.c) / transform.a) + 2)
-        r1 = min(h, int((maxy - transform.f) / transform.e) + 2)
+        r1 = min(h, int((miny - transform.f) / transform.e) + 2)
 
         local_shape = (r1 - r0, c1 - c0)
         if local_shape[0] <= 0 or local_shape[1] <= 0:
