@@ -30,7 +30,11 @@ from geotiff_tiler.utils.io import (
     validate_pair,
 )
 from geotiff_tiler.utils.visualization import create_dataset_summary_visualization
-from geotiff_tiler.val import calculate_class_distribution, create_spatial_grid
+from geotiff_tiler.val import (
+    calculate_class_distribution,
+    create_spatial_grid,
+    select_validation_cells,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -199,125 +203,146 @@ class Tiler:
             metadata["stride"] = self.stride
             sensor_type = metadata.get("collection", "unknown")
             result = self.process_single_pair(image_path, label_path, image_tmp_dir)
-            print(result)
-        #     processing_summary[result["status"]] += 1
-        #     if result["status"] != "successful":
-        #         logger.info(f"Pair {input_dict['image']} - {result['reason']}")
-        #         self.manifest.mark_image_failed(image_name, result["reason"])
-        #         processing_summary["failed"] += 1
-        #         continue
-        #     logger.info(f"Processing analysis for {image_name}")
-        #     self.process_analysis(result["image_path"],
-        #                             result["label_path"],
-        #                             metadata, image_name, sensor_type, image_analyses, global_class_distribution)
-        #     logger.info(f"Updating class distribution for {image_name}")
-        #     self.manifest.update_class_distribution(image_analyses[-1]["class_distribution"])
-        # target_distribution = {cls: np.mean(values) for cls, values in global_class_distribution.items()}
-        # # log_memory_usage("Phase 1 End", force_gc=True)
+            processing_summary[result["status"]] += 1
+            if result["status"] != "successful":
+                logger.info(f"Pair {input_dict['image']} - {result['reason']}")
+                self.manifest.mark_image_failed(image_name, result["reason"])
+                processing_summary["failed"] += 1
+                continue
+            logger.info(f"Processing analysis for {image_name}")
+            self.process_analysis(
+                result["image_path"],
+                result["label_path"],
+                metadata,
+                image_name,
+                sensor_type,
+                image_analyses,
+                global_class_distribution,
+            )
+            logger.info(f"Updating class distribution for {image_name}")
+            self.manifest.update_class_distribution(
+                image_analyses[-1]["class_distribution"]
+            )
+        target_distribution = {
+            cls: np.mean(values) for cls, values in global_class_distribution.items()
+        }
+        # log_memory_usage("Phase 1 End", force_gc=True)
 
-        # logger.info("Phase 2: Creating WebDataset files with pre-determined splits")
-        # # log_memory_usage("Phase 2 Start", force_gc=True)
+        logger.info("Phase 2: Creating WebDataset files with pre-determined splits")
+        # log_memory_usage("Phase 2 Start", force_gc=True)
 
-        # self.prefix_shard_indices = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
-        # self.prefix_shard_sizes = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
-        # self.prefix_patch_counts = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+        self.prefix_shard_indices = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+        self.prefix_shard_sizes = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+        self.prefix_patch_counts = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
 
-        # for split in ["trn", "val", "tst"]:
-        #     index, size, count = self.manifest.get_shard_info(self.prefix, split)
-        #     self.prefix_shard_indices[self.prefix][split] = index
-        #     self.prefix_shard_sizes[self.prefix][split] = size
-        #     self.prefix_patch_counts[self.prefix][split] = count
-        # self.prefix_writers = {}
-        # create_val_set = False
+        for split in ["trn", "val", "tst"]:
+            index, size, count = self.manifest.get_shard_info(self.prefix, split)
+            self.prefix_shard_indices[self.prefix][split] = index
+            self.prefix_shard_sizes[self.prefix][split] = size
+            self.prefix_patch_counts[self.prefix][split] = count
+        self.prefix_writers = {}
+        create_val_set = False
 
-        # for analysis in tqdm(image_analyses, desc="Creating WebDataset files"):
-        #     image_name = analysis['image_name']
-        #     # memory_before = log_memory_usage(f"Before", image_name, force_gc=True)
-        #     if self.manifest.is_image_completed(image_name):
-        #         logger.info(f"Skipping already completed image for tiling: {image_name} ")
-        #         processing_summary["skipped"] += 1
-        #         continue
-        #     if self.split == "trn":
-        #         val_ratio = self.manifest.get_validation_ratio(self.val_ratio)
-        #         validation_cells = select_validation_cells(analysis['grid'],
-        #                                                    target_distribution,
-        #                                                    val_ratio,
-        #                                                    self.class_balance_weight,
-        #                                                    self.spatial_weight
-        #                                                    )
-        #         create_val_set = True
-        #     else:
-        #         validation_cells = None
+        for analysis in tqdm(image_analyses, desc="Creating WebDataset files"):
+            image_name = analysis["image_name"]
+            # memory_before = log_memory_usage(f"Before", image_name, force_gc=True)
+            if self.manifest.is_image_completed(image_name):
+                logger.info(
+                    f"Skipping already completed image for tiling: {image_name} "
+                )
+                processing_summary["skipped"] += 1
+                continue
+            if self.split == "trn":
+                val_ratio = self.manifest.get_validation_ratio(self.val_ratio)
+                validation_cells = select_validation_cells(
+                    analysis["grid"],
+                    target_distribution,
+                    val_ratio,
+                    self.class_balance_weight,
+                    self.spatial_weight,
+                )
+                create_val_set = True
+            else:
+                validation_cells = None
 
-        #     self.manifest.mark_image_in_progress(image_name)
-        #     try:
-        #         self.tiling(analysis['image_path'], analysis['label_path'], analysis, validation_cells, create_val_set)
-        #         self.manifest.mark_image_completed(image_name)
-        #     # memory_after = log_memory_usage(f"After", image_name, force_gc=True)
-        #     # logger.info(f"Memory growth: {memory_after - memory_before:.2f}MB")
-        #     except Exception as e:
-        #         logger.error(f"Error tiling image {image_name}: {e}")
-        #         self.manifest.mark_image_failed(image_name, str(e))
-        #         processing_summary["failed"] += 1
-        #     finally:
-        #         self._close_all_writers(flush_only=True)
-        #         self.manifest.save_manifest()
+            self.manifest.mark_image_in_progress(image_name)
+            try:
+                self.tiling(
+                    analysis["image_path"],
+                    analysis["label_path"],
+                    analysis,
+                    validation_cells,
+                    create_val_set,
+                )
+                self.manifest.mark_image_completed(image_name)
+            # memory_after = log_memory_usage(f"After", image_name, force_gc=True)
+            # logger.info(f"Memory growth: {memory_after - memory_before:.2f}MB")
+            except Exception as e:
+                logger.error(f"Error tiling image {image_name}: {e}")
+                self.manifest.mark_image_failed(image_name, str(e))
+                processing_summary["failed"] += 1
+            finally:
+                self._close_all_writers(flush_only=True)
+                self.manifest.save_manifest()
 
-        # for prefix in list(self.prefix_writers.keys()):
-        #     for split in list(self.prefix_writers[prefix].keys()):
-        #         self._close_writer(prefix, split, flush_only=False)
-        # self.manifest.save_manifest()
-        # self.create_summary_visualization(self.output_dir, self.prefix, samples_per_split=5)
-        # logger.info(f"Processing complete. Summary: {processing_summary}")
-        # total_sizes = self.manifest.get_total_sizes_by_split()
-        # for prefix, counts in self.prefix_patch_counts.items():
-        #     def get_shard_count(split_name):
-        #         if counts[split_name] > 0:
-        #             return self.prefix_shard_indices[prefix][split_name] + 1
-        #         else:
-        #             return 0
+        for prefix in list(self.prefix_writers.keys()):
+            for split in list(self.prefix_writers[prefix].keys()):
+                self._close_writer(prefix, split, flush_only=False)
+        self.manifest.save_manifest()
+        self.create_summary_visualization(
+            self.output_dir, self.prefix, samples_per_split=5
+        )
+        logger.info(f"Processing complete. Summary: {processing_summary}")
+        total_sizes = self.manifest.get_total_sizes_by_split()
+        for prefix, counts in self.prefix_patch_counts.items():
 
-        #     trn_shards = get_shard_count('trn')
-        #     val_shards = get_shard_count('val')
-        #     tst_shards = get_shard_count('tst')
+            def get_shard_count(split_name):
+                if counts[split_name] > 0:
+                    return self.prefix_shard_indices[prefix][split_name] + 1
+                else:
+                    return 0
 
-        #     logger.info(f"""
-        #                 Total Stats for prefix: {prefix} \n
-        #                 Training patches: {counts['trn']},
-        #                 Validation patches: {counts['val']},
-        #                 Test patches: {counts['tst']},
-        #                 Total patches: {sum(counts.values())},
-        #                 Training size: {total_sizes['trn'] / 1024**2:.2f} MB,
-        #                 Validation size: {total_sizes['val'] / 1024**2:.2f} MB,
-        #                 Test size: {total_sizes['tst'] / 1024**2:.2f} MB,
-        #                 Training shards: {trn_shards},
-        #                 Validation shards: {val_shards},
-        #                 Test shards: {tst_shards},
-        #                 """)
-        # self.export_normalization_stats()
-        # result = self.manifest.validate_manifest_consistency()
-        # counts = result['counts']
+            trn_shards = get_shard_count("trn")
+            val_shards = get_shard_count("val")
+            tst_shards = get_shard_count("tst")
 
-        # if result['is_consistent']:
-        #     logger.info(f"""
-        #                 Manifest validation: PASSED \n
-        #                 Images:{counts['from_images']},
-        #                 Shards:{counts['from_shards']},
-        #                 Stats:{counts['from_statistics']},
-        #                 Running:{counts['from_running_stats']}
-        #                 """)
-        # else:
-        #     issues_summary = ', '.join(result['issues'])
-        #     logger.info(f"""
-        #                 Manifest validation: FAILED ({len(result['issues'])} issues: {issues_summary}) \n
-        #                 Images:{counts['from_images']},
-        #                 Shards:{counts['from_shards']},
-        #                 Stats:{counts['from_statistics']},
-        #                 Running:{counts['from_running_stats']}
-        #                 """)
-        # if tmp_dir.exists():
-        #     shutil.rmtree(tmp_dir)
-        # return processing_summary
+            logger.info(f"""
+                        Total Stats for prefix: {prefix} \n
+                        Training patches: {counts["trn"]},
+                        Validation patches: {counts["val"]},
+                        Test patches: {counts["tst"]},
+                        Total patches: {sum(counts.values())},
+                        Training size: {total_sizes["trn"] / 1024**2:.2f} MB,
+                        Validation size: {total_sizes["val"] / 1024**2:.2f} MB,
+                        Test size: {total_sizes["tst"] / 1024**2:.2f} MB,
+                        Training shards: {trn_shards},
+                        Validation shards: {val_shards},
+                        Test shards: {tst_shards},
+                        """)
+        self.export_normalization_stats()
+        result = self.manifest.validate_manifest_consistency()
+        counts = result["counts"]
+
+        if result["is_consistent"]:
+            logger.info(f"""
+                        Manifest validation: PASSED \n
+                        Images:{counts["from_images"]},
+                        Shards:{counts["from_shards"]},
+                        Stats:{counts["from_statistics"]},
+                        Running:{counts["from_running_stats"]}
+                        """)
+        else:
+            issues_summary = ", ".join(result["issues"])
+            logger.info(f"""
+                        Manifest validation: FAILED ({len(result["issues"])} issues: {issues_summary}) \n
+                        Images:{counts["from_images"]},
+                        Shards:{counts["from_shards"]},
+                        Stats:{counts["from_statistics"]},
+                        Running:{counts["from_running_stats"]}
+                        """)
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        return processing_summary
 
     @log_stage(stage_name="export_normalization_stats", log_memory=True)
     def export_normalization_stats(self, output_path: str = None):
@@ -687,7 +712,7 @@ class Tiler:
                     start_time = time.time()
                     image_nodata = src_image.nodata
                     target_srcs = {}
-                    for k, v in image_analysis.get("build_targets_paths", {}).items():
+                    for k, v in image_analysis.get("targets_paths", {}).items():
                         p = Path(v)
                         if p.exists():
                             try:
