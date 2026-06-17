@@ -763,7 +763,7 @@ class Tiler:
                                     boundless=True,
                                     fill_value=nodata_fill,
                                 )
-                                build_targets_patches = {
+                                targets_patches = {
                                     k: src.read(
                                         1, window=window, boundless=True, fill_value=0
                                     )
@@ -870,18 +870,10 @@ class Tiler:
                                     "label_patch.npy": label_patch,
                                     "metadata.json": all_metadata,
                                 }
-                                if build_targets_patches:
-                                    for k, src in build_targets_patches.items():
-                                        sample[f"build_{k}_patch.npy"] = src.read(
-                                            1,
-                                            window=window,
-                                            boundless=True,
-                                            fill_value=0,
-                                        )
                                 sample.update(
                                     {
                                         f"{k}.npy": v
-                                        for k, v in build_targets_patches.items()
+                                        for k, v in targets_patches.items()
                                     }
                                 )
                                 writer.write(sample)
