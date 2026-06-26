@@ -8,7 +8,7 @@ import tracemalloc
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import IO, Any, Dict, List, Tuple
 
 import numpy as np
 import psutil
@@ -34,6 +34,7 @@ from geotiff_tiler.val import (
     calculate_class_distribution,
     create_spatial_grid,
     select_validation_cells,
+    select_validation_cells_random,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,9 @@ class Tiler:
         split: str = "trn",
         prefix: str = "sample",
         output_dir: str = None,
+        output_format: str = "tar",  # "tar" | "csv"
+        val_strategy: str = "spatial",  # "spatial" | "random"
+        val_seed: int | None = None,
     ):
         """Initialize the Tiler with configuration parameters.
 
@@ -129,6 +133,12 @@ class Tiler:
             split (str, optional): Split to use for tiling. Defaults to "trn".
             prefix (str, optional): Prefix for output files. Defaults to "sample".
             output_dir (str, optional): Directory where output patches will be saved.
+            output_format (str, optional): Output format — "tar" (WebDataset shards) or
+                "csv" (GeoTIFF patches + CSV index). Defaults to "tar".
+            val_strategy (str, optional): Validation cell selection strategy —
+                "spatial" (class-aware greedy, default) or "random" (uniform random sample).
+            val_seed (int, optional): RNG seed for reproducible random validation splits.
+                Only used when val_strategy="random".
         """
         self.input_dict = input_dict
         self.patch_size = patch_size
@@ -159,6 +169,13 @@ class Tiler:
             "road": 3,
             "building": 4,
         }
+        if output_format not in ("tar", "csv"):
+            raise ValueError(f"output_format must be 'tar' or 'csv', got {output_format!r}")
+        if val_strategy not in ("spatial", "random"):
+            raise ValueError(f"val_strategy must be 'spatial' or 'random', got {val_strategy!r}")
+        self.val_strategy = val_strategy
+        self.val_seed = val_seed
+        self.output_format = output_format
         self.manifest = TilingManifest(output_dir, self.prefix)
 
     def create_tiles(self):
@@ -213,6 +230,7 @@ class Tiler:
             self.process_analysis(
                 result["image_path"],
                 result["label_path"],
+                result.get("targets_paths", {}),
                 metadata,
                 image_name,
                 sensor_type,
@@ -228,19 +246,23 @@ class Tiler:
         }
         # log_memory_usage("Phase 1 End", force_gc=True)
 
-        logger.info("Phase 2: Creating WebDataset files with pre-determined splits")
+        logger.info("Phase 2: Creating output files with pre-determined splits")
         # log_memory_usage("Phase 2 Start", force_gc=True)
 
-        self.prefix_shard_indices = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
-        self.prefix_shard_sizes = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
         self.prefix_patch_counts = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
 
-        for split in ["trn", "val", "tst"]:
-            index, size, count = self.manifest.get_shard_info(self.prefix, split)
-            self.prefix_shard_indices[self.prefix][split] = index
-            self.prefix_shard_sizes[self.prefix][split] = size
-            self.prefix_patch_counts[self.prefix][split] = count
-        self.prefix_writers = {}
+        if self.output_format == "tar":
+            self.prefix_shard_indices = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+            self.prefix_shard_sizes = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
+            for split in ["trn", "val", "tst"]:
+                index, size, count = self.manifest.get_shard_info(self.prefix, split)
+                self.prefix_shard_indices[self.prefix][split] = index
+                self.prefix_shard_sizes[self.prefix][split] = size
+                self.prefix_patch_counts[self.prefix][split] = count
+            self.prefix_writers = {}
+        else:
+            self._csv_writers: Dict[str, IO[str]] = {}
+
         create_val_set = False
 
         for analysis in tqdm(image_analyses, desc="Creating WebDataset files"):
@@ -254,13 +276,18 @@ class Tiler:
                 continue
             if self.split == "trn":
                 val_ratio = self.manifest.get_validation_ratio(self.val_ratio)
-                validation_cells = select_validation_cells(
-                    analysis["grid"],
-                    target_distribution,
-                    val_ratio,
-                    self.class_balance_weight,
-                    self.spatial_weight,
-                )
+                if self.val_strategy == "random":
+                    validation_cells = select_validation_cells_random(
+                        analysis["grid"], val_ratio, seed=self.val_seed
+                    )
+                else:
+                    validation_cells = select_validation_cells(
+                        analysis["grid"],
+                        target_distribution,
+                        val_ratio,
+                        self.class_balance_weight,
+                        self.spatial_weight,
+                    )
                 create_val_set = True
             else:
                 validation_cells = None
@@ -282,43 +309,55 @@ class Tiler:
                 self.manifest.mark_image_failed(image_name, str(e))
                 processing_summary["failed"] += 1
             finally:
-                self._close_all_writers(flush_only=True)
+                if self.output_format == "tar":
+                    self._close_all_writers(flush_only=True)
                 self.manifest.save_manifest()
 
-        for prefix in list(self.prefix_writers.keys()):
-            for split in list(self.prefix_writers[prefix].keys()):
-                self._close_writer(prefix, split, flush_only=False)
+        if self.output_format == "tar":
+            for prefix in list(self.prefix_writers.keys()):
+                for split in list(self.prefix_writers[prefix].keys()):
+                    self._close_writer(prefix, split, flush_only=False)
+        else:
+            self._close_all_csv_writers()
         self.manifest.save_manifest()
         self.create_summary_visualization(
             self.output_dir, self.prefix, samples_per_split=5
         )
         logger.info(f"Processing complete. Summary: {processing_summary}")
-        total_sizes = self.manifest.get_total_sizes_by_split()
         for prefix, counts in self.prefix_patch_counts.items():
+            if self.output_format == "tar":
+                total_sizes = self.manifest.get_total_sizes_by_split()
 
-            def get_shard_count(split_name):
-                if counts[split_name] > 0:
-                    return self.prefix_shard_indices[prefix][split_name] + 1
-                else:
-                    return 0
+                def get_shard_count(split_name):
+                    if counts[split_name] > 0:
+                        return self.prefix_shard_indices[prefix][split_name] + 1
+                    else:
+                        return 0
 
-            trn_shards = get_shard_count("trn")
-            val_shards = get_shard_count("val")
-            tst_shards = get_shard_count("tst")
-
-            logger.info(f"""
-                        Total Stats for prefix: {prefix} \n
-                        Training patches: {counts["trn"]},
-                        Validation patches: {counts["val"]},
-                        Test patches: {counts["tst"]},
-                        Total patches: {sum(counts.values())},
-                        Training size: {total_sizes["trn"] / 1024**2:.2f} MB,
-                        Validation size: {total_sizes["val"] / 1024**2:.2f} MB,
-                        Test size: {total_sizes["tst"] / 1024**2:.2f} MB,
-                        Training shards: {trn_shards},
-                        Validation shards: {val_shards},
-                        Test shards: {tst_shards},
-                        """)
+                trn_shards = get_shard_count("trn")
+                val_shards = get_shard_count("val")
+                tst_shards = get_shard_count("tst")
+                logger.info(f"""
+                            Total Stats for prefix: {prefix} \n
+                            Training patches: {counts["trn"]},
+                            Validation patches: {counts["val"]},
+                            Test patches: {counts["tst"]},
+                            Total patches: {sum(counts.values())},
+                            Training size: {total_sizes["trn"] / 1024**2:.2f} MB,
+                            Validation size: {total_sizes["val"] / 1024**2:.2f} MB,
+                            Test size: {total_sizes["tst"] / 1024**2:.2f} MB,
+                            Training shards: {trn_shards},
+                            Validation shards: {val_shards},
+                            Test shards: {tst_shards},
+                            """)
+            else:
+                logger.info(f"""
+                            Total Stats for prefix: {prefix} \n
+                            Training patches: {counts["trn"]},
+                            Validation patches: {counts["val"]},
+                            Test patches: {counts["tst"]},
+                            Total patches: {sum(counts.values())},
+                            """)
         self.export_normalization_stats()
         result = self.manifest.validate_manifest_consistency()
         counts = result["counts"]
@@ -519,6 +558,7 @@ class Tiler:
                     "status": "skipped",
                     "reason": "No intersection between image and label",
                 }
+            targets_paths = {}
             if label_type == "vector":
                 clipped_label_path, targets_paths = prepare_vector_labels(
                     clipped_label_path,
@@ -550,6 +590,7 @@ class Tiler:
         self,
         image_path,
         label_path,
+        targets_paths,
         metadata,
         image_name,
         sensor_type,
@@ -573,6 +614,7 @@ class Tiler:
             {
                 "image_path": image_path,
                 "label_path": label_path,
+                "targets_paths": targets_paths or {},
                 "metadata": metadata,
                 "image_name": image_name,
                 "sensor_type": sensor_type,
@@ -691,7 +733,7 @@ class Tiler:
                         f"image with patch size {self.patch_size} and stride {self.stride}"
                     )
 
-                    if not hasattr(self, "prefix_shard_indices"):
+                    if self.output_format == "tar" and not hasattr(self, "prefix_shard_indices"):
                         self.prefix_shard_indices = defaultdict(
                             lambda: {"trn": 0, "val": 0, "tst": 0}
                         )
@@ -702,6 +744,8 @@ class Tiler:
                         self.prefix_patch_counts = defaultdict(
                             lambda: {"trn": 0, "val": 0, "tst": 0}
                         )
+                    elif self.output_format == "csv" and not hasattr(self, "_csv_writers"):
+                        self._csv_writers = {}
 
                     MAX_SHARD_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2GB
                     discarded_count = 0
@@ -820,83 +864,104 @@ class Tiler:
                                         logger.error(
                                             f"Error updating running statistics: {e}"
                                         )
-                                current_shard_size = self._get_actual_shard_size(
-                                    self.prefix, split
-                                )
-                                estimated_patch_size = self._estimate_patch_size(
-                                    image_patch, label_patch, all_metadata
-                                )
-                                if (
-                                    current_shard_size + estimated_patch_size
-                                    > MAX_SHARD_SIZE_BYTES
-                                ):
-                                    self._close_writer(self.prefix, split)
-                                    self.manifest.close_shard(
-                                        self.prefix,
-                                        split,
-                                        self.prefix_shard_indices[self.prefix][split],
-                                    )
-                                    self.prefix_shard_indices[self.prefix][split] += 1
 
-                                    self.manifest.update_shard_record(
-                                        self.prefix,
-                                        split,
-                                        self.prefix_shard_indices[self.prefix][split],
-                                        0,
-                                        0,
-                                        "OPEN",
-                                        [image_name],
+                                if self.output_format == "tar":
+                                    current_shard_size = self._get_actual_shard_size(
+                                        self.prefix, split
                                     )
-                                    logger.debug(
-                                        f"Rotating to new {split} shard index: {self.prefix_shard_indices[self.prefix][split]}"
+                                    estimated_patch_size = self._estimate_patch_size(
+                                        image_patch, label_patch, all_metadata
                                     )
-                                    self.prefix_shard_sizes[self.prefix][split] = 0
+                                    if (
+                                        current_shard_size + estimated_patch_size
+                                        > MAX_SHARD_SIZE_BYTES
+                                    ):
+                                        self._close_writer(self.prefix, split)
+                                        self.manifest.close_shard(
+                                            self.prefix,
+                                            split,
+                                            self.prefix_shard_indices[self.prefix][split],
+                                        )
+                                        self.prefix_shard_indices[self.prefix][split] += 1
+                                        self.manifest.update_shard_record(
+                                            self.prefix,
+                                            split,
+                                            self.prefix_shard_indices[self.prefix][split],
+                                            0,
+                                            0,
+                                            "OPEN",
+                                            [image_name],
+                                        )
+                                        logger.debug(
+                                            f"Rotating to new {split} shard index: "
+                                            f"{self.prefix_shard_indices[self.prefix][split]}"
+                                        )
+                                        self.prefix_shard_sizes[self.prefix][split] = 0
 
-                                if split == "trn":
-                                    writer = self._get_or_create_writer(
-                                        self.prefix, split, output_train_dir
-                                    )
-                                elif split == "val":
-                                    writer = self._get_or_create_writer(
-                                        self.prefix, split, output_val_dir
-                                    )
-                                else:
-                                    writer = self._get_or_create_writer(
-                                        self.prefix, split, output_tst_dir
-                                    )
-                                sample = {
-                                    "__key__": patch_key,
-                                    "image_patch.npy": image_patch,
-                                    "label_patch.npy": label_patch,
-                                    "metadata.json": all_metadata,
-                                }
-                                sample.update(
-                                    {
-                                        f"{k}.npy": v
-                                        for k, v in targets_patches.items()
+                                    if split == "trn":
+                                        writer = self._get_or_create_writer(
+                                            self.prefix, split, output_train_dir
+                                        )
+                                    elif split == "val":
+                                        writer = self._get_or_create_writer(
+                                            self.prefix, split, output_val_dir
+                                        )
+                                    else:
+                                        writer = self._get_or_create_writer(
+                                            self.prefix, split, output_tst_dir
+                                        )
+                                    sample = {
+                                        "__key__": patch_key,
+                                        "image_patch.npy": image_patch,
+                                        "label_patch.npy": label_patch,
+                                        "metadata.json": all_metadata,
                                     }
-                                )
-                                writer.write(sample)
-                                actual_size = self._get_actual_shard_size(
-                                    self.prefix, split
-                                )
-                                self.prefix_shard_sizes[self.prefix][split] = (
-                                    actual_size
-                                )
-                                self.manifest.mark_patch_completed(image_name, x, y)
-                                self.prefix_patch_counts[self.prefix][split] += 1
-                                self.manifest.update_shard_info(
-                                    self.prefix,
-                                    split,
-                                    self.prefix_shard_indices[self.prefix][split],
-                                    self.prefix_shard_sizes[self.prefix][split],
-                                    self.prefix_patch_counts[self.prefix][split],
-                                )
-                                self.manifest.update_image_patch_info(
-                                    image_name,
-                                    split,
-                                    self.prefix_shard_indices[self.prefix][split],
-                                )
+                                    sample.update(
+                                        {
+                                            f"{k}.npy": v
+                                            for k, v in targets_patches.items()
+                                        }
+                                    )
+                                    writer.write(sample)
+                                    actual_size = self._get_actual_shard_size(
+                                        self.prefix, split
+                                    )
+                                    self.prefix_shard_sizes[self.prefix][split] = actual_size
+                                    self.manifest.mark_patch_completed(image_name, x, y)
+                                    self.prefix_patch_counts[self.prefix][split] += 1
+                                    self.manifest.update_shard_info(
+                                        self.prefix,
+                                        split,
+                                        self.prefix_shard_indices[self.prefix][split],
+                                        self.prefix_shard_sizes[self.prefix][split],
+                                        self.prefix_patch_counts[self.prefix][split],
+                                    )
+                                    self.manifest.update_image_patch_info(
+                                        image_name,
+                                        split,
+                                        self.prefix_shard_indices[self.prefix][split],
+                                    )
+                                else:  # csv
+                                    output_root = Path(self.output_dir) / self.prefix
+                                    rel_img, rel_lbl, rel_targets = self._write_patch_as_geotiff(
+                                        image_patch,
+                                        label_patch,
+                                        targets_patches,
+                                        patch_key,
+                                        split,
+                                        src_image,
+                                        src_label,
+                                        output_root,
+                                    )
+                                    csv_writer = self._get_or_create_csv_writer(
+                                        split, output_root
+                                    )
+                                    target_cols = "".join(
+                                        f";{p}" for p in rel_targets.values()
+                                    )
+                                    csv_writer.write(f"{rel_img};{rel_lbl}{target_cols}\n")
+                                    self.manifest.mark_patch_completed(image_name, x, y)
+                                    self.prefix_patch_counts[self.prefix][split] += 1
                                 if patch_count % 100 == 0:
                                     self.manifest.save_manifest()
                                 patch_count += 1
@@ -972,6 +1037,88 @@ class Tiler:
 
         return 0
 
+    # ------------------------------------------------------------------
+    # CSV output helpers
+    # ------------------------------------------------------------------
+
+    def _get_or_create_csv_writer(self, split: str, output_dir: Path) -> "IO[str]":
+        """Return an open CSV file handle for *split*, creating it if needed."""
+        if split not in self._csv_writers:
+            csv_path = Path(output_dir) / f"{split}.csv"
+            self._csv_writers[split] = open(csv_path, "a", buffering=1)
+        return self._csv_writers[split]
+
+    def _close_all_csv_writers(self) -> None:
+        """Flush and close all open CSV file handles."""
+        for fh in self._csv_writers.values():
+            try:
+                fh.flush()
+                fh.close()
+            except Exception:
+                pass
+        self._csv_writers.clear()
+
+    def _write_patch_as_geotiff(
+        self,
+        image_patch: np.ndarray,
+        label_patch: np.ndarray,
+        targets_patches: Dict[str, np.ndarray],
+        patch_key: str,
+        split: str,
+        src_image: rasterio.DatasetReader,
+        src_label: rasterio.DatasetReader,
+        output_root: Path,
+    ) -> Tuple[Path, Path, Dict[str, Path]]:
+        """Write image and label patches as GeoTIFFs under *output_root/{split}/*.
+
+        Returns a tuple of (rel_image_path, rel_label_path, rel_targets) where
+        all paths are relative to *output_root* and suitable for CSV index columns.
+        """
+        img_dir = output_root / split / "image"
+        lbl_dir = output_root / split / "label"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        lbl_dir.mkdir(parents=True, exist_ok=True)
+
+        img_path = img_dir / f"{patch_key}.tif"
+        lbl_path = lbl_dir / f"{patch_key}_lbl.tif"
+
+        img_profile = src_image.profile.copy()
+        img_profile.update(
+            width=self.patch_size[1],
+            height=self.patch_size[0],
+            count=image_patch.shape[0],
+            driver="GTiff",
+            compress="lzw",
+        )
+        with rasterio.open(img_path, "w", **img_profile) as dst:
+            dst.write(image_patch)
+
+        lbl_profile = src_label.profile.copy()
+        lbl_profile.update(
+            width=self.patch_size[1],
+            height=self.patch_size[0],
+            count=label_patch.shape[0],
+            driver="GTiff",
+            compress="lzw",
+        )
+        with rasterio.open(lbl_path, "w", **lbl_profile) as dst:
+            dst.write(label_patch)
+
+        rel_targets: Dict[str, Path] = {}
+        for target_key, target_arr in targets_patches.items():
+            tgt_dir = output_root / split / target_key
+            tgt_dir.mkdir(parents=True, exist_ok=True)
+            tgt_path = tgt_dir / f"{patch_key}_{target_key}.tif"
+            tgt_profile = lbl_profile.copy()
+            tgt_profile.update(count=1)
+            with rasterio.open(tgt_path, "w", **tgt_profile) as dst:
+                dst.write(target_arr[np.newaxis])
+            rel_targets[target_key] = tgt_path.relative_to(output_root)
+
+        rel_img = img_path.relative_to(output_root)
+        rel_lbl = lbl_path.relative_to(output_root)
+        return rel_img, rel_lbl, rel_targets
+
     @staticmethod
     def pad_patch(patch: np.ndarray, patch_size: Tuple[int, int], mode="edge"):
         """Pads the patch to the patch size."""
@@ -1001,16 +1148,24 @@ if __name__ == "__main__":
     #          "label": "/home/valhassa/Projects/geotiff-tiler/data/GF2_PMS1__L1A0000564539-MSS1_24label.tif",
     #          "metadata": {"collection": "gaofen-2-pansharp", "gsd": 0.8, "lat_lon":(45.0, -75.0), "datetime":"2020-01-01T00:00:00Z"}}]
 
+    # data = [
+    #     {
+    #         "image": "https://int.datacube.services.geo.ca/stac/api/collections/geoeye-1-ortho-pansharp/items/ON_Cookstown_GE01_20210615_C-017161504010_01_P001-GE01",
+    #         "label": "/gpfs/fs5/nrcan/nrcan_geobase/work/transfer/work/deep_learning/GDL_all_images/digitalglobe_trn_gpkg_VIC20240927/ON46.gpkg",
+    #         "metadata": {
+    #             "collection": "geoeye-1-ortho-pansharp",
+    #             "gsd": 0.41,
+    #             "lat_lon": (45.0, -75.0),
+    #             "datetime": "2016-10-02T18:40:15Z",
+    #         },
+    #     }
+    # ]
+    
     data = [
         {
-            "image": "https://int.datacube.services.geo.ca/stac/api/collections/geoeye-1-ortho-pansharp/items/ON_Cookstown_GE01_20210615_C-017161504010_01_P001-GE01",
-            "label": "/gpfs/fs5/nrcan/nrcan_geobase/work/transfer/work/deep_learning/GDL_all_images/digitalglobe_trn_gpkg_VIC20240927/ON46.gpkg",
-            "metadata": {
-                "collection": "geoeye-1-ortho-pansharp",
-                "gsd": 0.41,
-                "lat_lon": (45.0, -75.0),
-                "datetime": "2016-10-02T18:40:15Z",
-            },
+            "image": "/home/valhassa/Projects/geotiff-tiler/data/ns2_small_rgbn_clahe25_corr.tif",
+            "label": "/home/valhassa/Projects/geotiff-tiler/data/ns2_small_4cls.gpkg",
+            "metadata": {"collection": "worldview-2", "gsd": 0.5, "lat_lon":(45.0, -75.0), "datetime":"2020-01-01T00:00:00Z"}
         }
     ]
 
@@ -1019,13 +1174,16 @@ if __name__ == "__main__":
         patch_size=(1024, 1024),
         attr_field=["class", "Quatreclasses"],
         attr_values=[1, 2, 3, 4],
-        erosion_classes=[4],
-        building_class_val=4,
+        erosion_classes=None,
+        building_class_val=None,
         road_class_val=3,
         stride=1024,
         discard_empty=True,
         label_threshold=0.1,
-        output_dir="/gpfs/fs5/nrcan/nrcan_geobase/work/transfer/work/deep_learning/models/multi/RGBN/demo",
+        output_dir="/home/valhassa/Projects/geotiff-tiler/data/patches",
+        output_format="csv",
+        val_strategy="random",
+        val_seed=42,
     )
 
     initial_result = tiler.create_tiles()
