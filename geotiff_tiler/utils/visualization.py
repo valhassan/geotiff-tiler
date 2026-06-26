@@ -1,6 +1,8 @@
 import logging
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import rasterio
 import webdataset as wds
 from pathlib import Path
 from typing import Tuple, Optional, Union
@@ -144,6 +146,97 @@ def visualize_webdataset_patches(
     plt.close()
 
 
+def visualize_csv_patches(
+    output_dir: Union[str, Path],
+    prefix: str,
+    split: str,
+    samples_per_split: int = 5,
+    seed: int = 0,
+) -> None:
+    """Visualize image, label, and (optionally) first target from a CSV-format dataset.
+
+    Reads up to *samples_per_split* random rows from ``{output_dir}/{prefix}/{split}.csv``
+    and saves a PNG grid to ``{output_dir}/{prefix}/{prefix}_{split}.png``.
+    Columns beyond image and label are treated as additional target bands.
+
+    Args:
+        output_dir: Root output directory (parent of the prefix folder).
+        prefix: Dataset prefix used when tiling.
+        split: One of "trn", "val", "tst".
+        samples_per_split: Number of rows to visualise.
+        seed: RNG seed for reproducible row sampling.
+    """
+    output_dir = Path(output_dir)
+    csv_path = output_dir / prefix / f"{split}.csv"
+    if not csv_path.exists():
+        logger.debug(f"No CSV found for {split} split at {csv_path}")
+        return
+
+    df = pd.read_csv(csv_path, header=None, sep=";")
+    if df.empty:
+        logger.debug(f"CSV for {split} split is empty")
+        return
+
+    has_target = len(df.columns) >= 3
+    n_cols = 3 if has_target else 2
+
+    sample_df = df.sample(n=min(samples_per_split, len(df)), random_state=seed)
+    n_rows = len(sample_df)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 4, n_rows * 3))
+    if n_rows == 1:
+        axes = axes.reshape(1, n_cols)
+
+    patches_root = output_dir / prefix
+
+    for row_idx, (_, row) in enumerate(sample_df.iterrows()):
+        img_path = patches_root / row.iloc[0]
+        lbl_path = patches_root / row.iloc[1]
+
+        with rasterio.open(img_path) as src:
+            img = src.read()
+        with rasterio.open(lbl_path) as src:
+            lbl = src.read(1)
+
+        img_display = np.transpose(img, (1, 2, 0))
+        if img_display.shape[2] >= 3:
+            img_rgb = img_display[:, :, :3].astype(np.float32)
+            img_rgb = (img_rgb - img_rgb.min()) / (img_rgb.max() - img_rgb.min() + 1e-6)
+            axes[row_idx, 0].imshow(img_rgb)
+        else:
+            axes[row_idx, 0].imshow(img_display[:, :, 0], cmap="gray")
+
+        axes[row_idx, 1].imshow(lbl, cmap="tab10", interpolation="nearest")
+
+        stem = img_path.stem
+        axes[row_idx, 0].set_title(stem, fontsize=7)
+        axes[row_idx, 1].set_title(f"Label | {len(np.unique(lbl))} classes", fontsize=7)
+
+        if has_target:
+            tgt_path = patches_root / row.iloc[2]
+            if Path(tgt_path).exists():
+                with rasterio.open(tgt_path) as src:
+                    tgt = src.read(1)
+                axes[row_idx, 2].imshow(tgt, cmap="tab10", interpolation="nearest")
+                axes[row_idx, 2].set_title(
+                    Path(row.iloc[2]).parent.name, fontsize=7
+                )
+            else:
+                axes[row_idx, 2].axis("off")
+
+        for ax in axes[row_idx]:
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+    plt.suptitle(f"{prefix} – {split.upper()} Split (CSV)", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    save_path = output_dir / prefix / f"{prefix}_{split}.png"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    logger.debug(f"Saved CSV visualization for {split} split: {save_path}")
+
+
 def create_dataset_summary_visualization(
     output_dir: str,
     prefix: str,
@@ -165,9 +258,14 @@ def create_dataset_summary_visualization(
     for split in ["trn", "val", "tst"]:
         dataset_path = Path(output_dir) / prefix / split
         tar_files = sorted(dataset_path.glob(f"{prefix}-{split}-*.tar"))
-        
+
+        # CSV-format dataset: delegate to dedicated visualizer
         if not tar_files:
-            logger.debug(f"No tar files found for {split} split")
+            csv_path = Path(output_dir) / prefix / f"{split}.csv"
+            if csv_path.exists():
+                visualize_csv_patches(output_dir, prefix, split, samples_per_split)
+            else:
+                logger.debug(f"No tar files or CSV found for {split} split")
             continue
         
         if len(tar_files) > max_shards_to_read:
