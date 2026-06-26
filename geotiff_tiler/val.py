@@ -129,6 +129,29 @@ def calculate_spatial_penalty(cell_data, validation_cells):
     # Return negative distance so that larger distances give lower penalties
     return -min_distance
 
+def select_validation_cells_random(
+    grid: dict, val_ratio: float, seed: int | None = None
+) -> set:
+    """Randomly sample grid cells for validation.
+
+    Simpler alternative to the class-aware spatial strategy — useful for
+    large, uniformly-labeled datasets or quick exploratory runs.
+
+    Args:
+        grid: Output of :func:`create_spatial_grid`.
+        val_ratio: Fraction of cells to assign to validation (0–1).
+        seed: Optional RNG seed for reproducibility.
+
+    Returns:
+        Set of cell IDs selected for validation.
+    """
+    rng = np.random.default_rng(seed)
+    all_cell_ids = list(grid["cells"].keys())
+    n = max(1, round(len(all_cell_ids) * val_ratio))
+    chosen = rng.choice(all_cell_ids, size=min(n, len(all_cell_ids)), replace=False)
+    return set(chosen)
+
+
 def select_validation_cells(grid, target_distribution, val_ratio, class_balance_weight, spatial_weight):
     """Select grid cells for validation with guaranteed class coverage and spatial diversity."""
     grid_size = grid['grid_size']
