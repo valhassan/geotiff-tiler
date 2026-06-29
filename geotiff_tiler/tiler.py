@@ -30,6 +30,7 @@ from geotiff_tiler.utils.io import (
     validate_pair,
 )
 from geotiff_tiler.utils.visualization import create_dataset_summary_visualization
+from geotiff_tiler.utils.vector import clip_gdf_to_window, gdf_to_geojson
 from geotiff_tiler.val import (
     calculate_class_distribution,
     create_spatial_grid,
@@ -220,17 +221,18 @@ class Tiler:
             metadata["stride"] = self.stride
             sensor_type = metadata.get("collection", "unknown")
             result = self.process_single_pair(image_path, label_path, image_tmp_dir)
-            processing_summary[result["status"]] += 1
             if result["status"] != "successful":
                 logger.info(f"Pair {input_dict['image']} - {result['reason']}")
                 self.manifest.mark_image_failed(image_name, result["reason"])
                 processing_summary["failed"] += 1
                 continue
+            processing_summary["successful"] += 1
             logger.info(f"Processing analysis for {image_name}")
             self.process_analysis(
                 result["image_path"],
                 result["label_path"],
                 result.get("targets_paths", {}),
+                result.get("label_gdf"),
                 metadata,
                 image_name,
                 sensor_type,
@@ -559,8 +561,9 @@ class Tiler:
                     "reason": "No intersection between image and label",
                 }
             targets_paths = {}
+            label_gdf = None
             if label_type == "vector":
-                clipped_label_path, targets_paths = prepare_vector_labels(
+                clipped_label_path, targets_paths, label_gdf = prepare_vector_labels(
                     clipped_label_path,
                     clipped_image_path,
                     tmp_dir,
@@ -578,6 +581,8 @@ class Tiler:
                 "image_path": str(clipped_image_path),
                 "label_path": str(clipped_label_path),
                 "targets_paths": targets_paths,
+                # label_gdf kept only for CSV mode (pixel-space GeoJSON export)
+                "label_gdf": label_gdf,
                 "status": "successful",
                 "reason": "Processed successfully",
             }
@@ -591,6 +596,7 @@ class Tiler:
         image_path,
         label_path,
         targets_paths,
+        label_gdf,
         metadata,
         image_name,
         sensor_type,
@@ -615,6 +621,7 @@ class Tiler:
                 "image_path": image_path,
                 "label_path": label_path,
                 "targets_paths": targets_paths or {},
+                "label_gdf": label_gdf,
                 "metadata": metadata,
                 "image_name": image_name,
                 "sensor_type": sensor_type,
@@ -706,6 +713,7 @@ class Tiler:
                     total_patches = image_analysis["grid"]["total_patches"]
                     grid_size = image_analysis["grid"]["grid_size"]
                     image_name = image_analysis["image_name"]
+                    label_gdf = image_analysis.get("label_gdf")
 
                     self.manifest.update_image_metadata(
                         image_name,
@@ -865,6 +873,25 @@ class Tiler:
                                             f"Error updating running statistics: {e}"
                                         )
 
+                                # Geographic-CRS GeoJSON — generated once, consumed by
+                                # both tar and csv branches.
+                                if label_gdf is not None and not label_gdf.empty:
+                                    try:
+                                        patch_gdf = clip_gdf_to_window(
+                                            label_gdf, window, src_image.transform
+                                        )
+                                        geojson_str = gdf_to_geojson(
+                                            patch_gdf, window, src_image.transform
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"GeoJSON generation failed for patch "
+                                            f"{patch_key}: {e}"
+                                        )
+                                        geojson_str = None
+                                else:
+                                    geojson_str = None
+
                                 if self.output_format == "tar":
                                     current_shard_size = self._get_actual_shard_size(
                                         self.prefix, split
@@ -922,6 +949,8 @@ class Tiler:
                                             for k, v in targets_patches.items()
                                         }
                                     )
+                                    if geojson_str is not None:
+                                        sample["vectors.geojson"] = geojson_str.encode("utf-8")
                                     writer.write(sample)
                                     actual_size = self._get_actual_shard_size(
                                         self.prefix, split
@@ -943,15 +972,19 @@ class Tiler:
                                     )
                                 else:  # csv
                                     output_root = Path(self.output_dir) / self.prefix
-                                    rel_img, rel_lbl, rel_targets = self._write_patch_as_geotiff(
-                                        image_patch,
-                                        label_patch,
-                                        targets_patches,
-                                        patch_key,
-                                        split,
-                                        src_image,
-                                        src_label,
-                                        output_root,
+                                    rel_img, rel_lbl, rel_targets, rel_vector = (
+                                        self._write_patch_as_geotiff(
+                                            image_patch,
+                                            label_patch,
+                                            targets_patches,
+                                            patch_key,
+                                            split,
+                                            src_image,
+                                            src_label,
+                                            output_root,
+                                            window=window,
+                                            geojson_str=geojson_str,
+                                        )
                                     )
                                     csv_writer = self._get_or_create_csv_writer(
                                         split, output_root
@@ -959,7 +992,10 @@ class Tiler:
                                     target_cols = "".join(
                                         f";{p}" for p in rel_targets.values()
                                     )
-                                    csv_writer.write(f"{rel_img};{rel_lbl}{target_cols}\n")
+                                    vector_col = f";{rel_vector}" if rel_vector else ""
+                                    csv_writer.write(
+                                        f"{rel_img};{rel_lbl}{target_cols}{vector_col}\n"
+                                    )
                                     self.manifest.mark_patch_completed(image_name, x, y)
                                     self.prefix_patch_counts[self.prefix][split] += 1
                                 if patch_count % 100 == 0:
@@ -1068,11 +1104,14 @@ class Tiler:
         src_image: rasterio.DatasetReader,
         src_label: rasterio.DatasetReader,
         output_root: Path,
-    ) -> Tuple[Path, Path, Dict[str, Path]]:
-        """Write image and label patches as GeoTIFFs under *output_root/{split}/*.
+        window: "Window | None" = None,
+        geojson_str: str | None = None,
+    ) -> Tuple[Path, Path, Dict[str, Path], Path | None]:
+        """Write image, label, targets, and optional GeoJSON under *output_root/{split}/*.
 
-        Returns a tuple of (rel_image_path, rel_label_path, rel_targets) where
-        all paths are relative to *output_root* and suitable for CSV index columns.
+        Returns ``(rel_image, rel_label, rel_targets, rel_vector)`` where all paths
+        are relative to *output_root*. ``rel_vector`` is ``None`` when no GeoJSON
+        was written.
         """
         img_dir = output_root / split / "image"
         lbl_dir = output_root / split / "label"
@@ -1082,6 +1121,10 @@ class Tiler:
         img_path = img_dir / f"{patch_key}.tif"
         lbl_path = lbl_dir / f"{patch_key}_lbl.tif"
 
+        patch_transform = (
+            src_image.window_transform(window) if window is not None else src_image.transform
+        )
+
         img_profile = src_image.profile.copy()
         img_profile.update(
             width=self.patch_size[1],
@@ -1089,6 +1132,7 @@ class Tiler:
             count=image_patch.shape[0],
             driver="GTiff",
             compress="lzw",
+            transform=patch_transform,
         )
         with rasterio.open(img_path, "w", **img_profile) as dst:
             dst.write(image_patch)
@@ -1100,6 +1144,7 @@ class Tiler:
             count=label_patch.shape[0],
             driver="GTiff",
             compress="lzw",
+            transform=patch_transform,
         )
         with rasterio.open(lbl_path, "w", **lbl_profile) as dst:
             dst.write(label_patch)
@@ -1115,9 +1160,17 @@ class Tiler:
                 dst.write(target_arr[np.newaxis])
             rel_targets[target_key] = tgt_path.relative_to(output_root)
 
+        rel_vector: Path | None = None
+        if geojson_str is not None:
+            vec_dir = output_root / split / "vector"
+            vec_dir.mkdir(parents=True, exist_ok=True)
+            vec_path = vec_dir / f"{patch_key}.geojson"
+            vec_path.write_text(geojson_str, encoding="utf-8")
+            rel_vector = vec_path.relative_to(output_root)
+
         rel_img = img_path.relative_to(output_root)
         rel_lbl = lbl_path.relative_to(output_root)
-        return rel_img, rel_lbl, rel_targets
+        return rel_img, rel_lbl, rel_targets, rel_vector
 
     @staticmethod
     def pad_patch(patch: np.ndarray, patch_size: Tuple[int, int], mode="edge"):
