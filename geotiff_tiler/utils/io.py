@@ -596,7 +596,7 @@ def rasterize_vector(
             structures (sheds, garages) from collapsing.
     """
     if vector.empty:
-        return None
+        return None, gpd.GeoDataFrame()
 
     temp_vector_path = Path(tmp_dir) / f"{label_name}.shp"
     rasterized_label_path = Path(tmp_dir) / f"{label_name}_rasterized.tif"
@@ -644,6 +644,8 @@ def rasterize_vector(
 
         with rasterio.open(image_path) as src:
             transform = src.transform
+            src_width = src.width
+            src_height = src.height
 
         if transform == rasterio.Affine.identity():
             transform = rasterio.transform.from_origin(0, 0, 1, 1)
@@ -681,8 +683,8 @@ def rasterize_vector(
         del vector_clean
 
         xmin = str(transform.c)
-        ymin = str(transform.f + src.height * transform.e)
-        xmax = str(transform.c + src.width * transform.a)
+        ymin = str(transform.f + src_height * transform.e)
+        xmax = str(transform.c + src_width * transform.a)
         ymax = str(transform.f)
         xres, yres = str(transform.a), str(-transform.e)
 
@@ -814,5 +816,5 @@ def prepare_vector_labels(
                 )
             )
 
-    del nodata_mask_gdf, label_gdf
-    return rasterized_label_path, targets_paths
+    del nodata_mask_gdf
+    return rasterized_label_path, targets_paths, label_gdf
