@@ -3,7 +3,9 @@ Low-contrast (no-DRA) detection for Maxar imagery (WV2/3/4, GeoEye-1, QuickBird-
 
 Core detection is pure numpy/scipy on in-memory band arrays. The CLI opens
 local GeoTIFFs or FOM paired CSVs (STAC ``image_url`` + ``is_draon`` ground
-truth) and writes a diagnostics CSV. No correction logic — detection only.
+truth) and writes a diagnostics CSV. With ``--csv``, a post-pass stamps
+DRAOFF/DRAON footprint coverage / ``pair_geom_status`` for mispair gating.
+No correction logic — detection only.
 
     # FOM DRAON/DRAOFF paired calibration CSV (preferred)
     python -m geotiff_tiler.contrast_detection \\
@@ -43,6 +45,11 @@ import numpy as np
 import rasterio
 from scipy.signal import find_peaks
 
+from geotiff_tiler.pair_geometry import (
+    DEFAULT_MIN_COVERAGE_BOTH,
+    DEFAULT_MIN_COVERAGE_DRAON,
+    annotate_records_with_pair_geometry,
+)
 from geotiff_tiler.utils.io import validate_image
 
 logger = logging.getLogger(__name__)
@@ -492,6 +499,9 @@ def diagnose_fom_csv(
     max_side: int = 2048,
     stac_bands: Sequence[str] = _DEFAULT_STAC_BANDS,
     sensor: str | None = None,
+    check_geometry: bool = True,
+    min_coverage_draon: float = DEFAULT_MIN_COVERAGE_DRAON,
+    min_coverage_both: float = DEFAULT_MIN_COVERAGE_BOTH,
     **detect_kwargs,
 ) -> tuple[list[dict], int]:
     """
@@ -499,6 +509,11 @@ def diagnose_fom_csv(
 
     Requires ``image_url`` and ``is_draon``. Carries pair metadata through so
     DRAON vs DRAOFF EDR distributions can be compared for threshold calibration.
+
+    When ``check_geometry`` is True (default), a post-pass stamps each twin
+    with footprint IoU / coverage / ``pair_geom_status``. Any non-empty
+    intersection is usable; Stage 1 holds only empty / mispair / incomplete /
+    error. Coverage thresholds label nested vs overlap only (do not gate).
 
     Returns
     -------
@@ -552,6 +567,15 @@ def diagnose_fom_csv(
         except Exception as exc:
             errors += 1
             logger.exception("failed on %s: %s", image_name, exc)
+
+    if check_geometry and records:
+        logger.info("computing DRAOFF/DRAON footprint geometry for %d records", len(records))
+        annotate_records_with_pair_geometry(
+            records,
+            stac_bands=stac_bands,
+            min_coverage_draon=min_coverage_draon,
+            min_coverage_both=min_coverage_both,
+        )
     return records, errors
 
 
@@ -601,6 +625,12 @@ def _write_csv(records: list[dict], output: Path) -> None:
         "clipped",
         "bimodal_any",
         "insufficient_valid_data",
+        "pair_geom_status",
+        "pair_nested",
+        "pair_iou",
+        "coverage_draoff",
+        "coverage_draon",
+        "pair_crs_match",
     ]
     fieldnames: list[str] = []
     seen: set[str] = set()
@@ -793,6 +823,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="min valid pixel fraction per band (default: 0.05)",
     )
     p.add_argument(
+        "--skip-geom",
+        action="store_true",
+        help="skip DRAOFF/DRAON footprint IoU post-pass on --csv",
+    )
+    p.add_argument(
+        "--min-coverage-draon",
+        type=float,
+        default=DEFAULT_MIN_COVERAGE_DRAON,
+        help=(
+            "labeling only: coverage_draon >= this → ok_nested "
+            f"(default: {DEFAULT_MIN_COVERAGE_DRAON}; does not gate pass/fail)"
+        ),
+    )
+    p.add_argument(
+        "--min-coverage-both",
+        type=float,
+        default=DEFAULT_MIN_COVERAGE_BOTH,
+        help=(
+            "labeling only: both coverages >= this → ok_overlap "
+            f"(default: {DEFAULT_MIN_COVERAGE_BOTH}; does not gate pass/fail)"
+        ),
+    )
+    p.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -837,6 +890,9 @@ def main(argv: list[str] | None = None) -> int:
                 max_side=args.max_side,
                 stac_bands=stac_bands,
                 sensor=args.sensor,
+                check_geometry=not args.skip_geom,
+                min_coverage_draon=args.min_coverage_draon,
+                min_coverage_both=args.min_coverage_both,
                 **detect_kwargs,
             )
         except ValueError as exc:
