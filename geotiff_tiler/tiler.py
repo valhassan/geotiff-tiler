@@ -6,6 +6,7 @@ import shutil
 import time
 import tracemalloc
 from collections import defaultdict
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Any, Dict, List, Tuple
@@ -17,6 +18,11 @@ import webdataset as wds
 from rasterio.windows import Window
 from tqdm import tqdm
 
+from geotiff_tiler.apply_transform import (
+    apply_dra_to_file,
+    load_calibration,
+    resolve_sensor,
+)
 from geotiff_tiler.config import logging_config  # noqa: F401
 from geotiff_tiler.tiling_manifest import TilingManifest
 from geotiff_tiler.utils.io import (
@@ -105,6 +111,8 @@ class Tiler:
         output_format: str = "tar",  # "tar" | "csv"
         val_strategy: str = "spatial",  # "spatial" | "random"
         val_seed: int | None = None,
+        apply_dra: bool = False,
+        dra_cal: str | Path | None = None,
     ):
         """Initialize the Tiler with configuration parameters.
 
@@ -140,6 +148,10 @@ class Tiler:
                 "spatial" (class-aware greedy, default) or "random" (uniform random sample).
             val_seed (int, optional): RNG seed for reproducible random validation splits.
                 Only used when val_strategy="random".
+            apply_dra (bool, optional): If True, gate each clipped scene on EDR and
+                apply the isotonic DRA simulation when contrast_status is draoff.
+            dra_cal (str or Path, optional): Path to calibration_params.json. Required
+                when apply_dra is True.
         """
         self.input_dict = input_dict
         self.patch_size = patch_size
@@ -177,6 +189,12 @@ class Tiler:
         self.val_strategy = val_strategy
         self.val_seed = val_seed
         self.output_format = output_format
+        self.apply_dra = apply_dra
+        self.dra_cals = None
+        if apply_dra:
+            if dra_cal is None:
+                raise ValueError("apply_dra=True requires dra_cal path")
+            self.dra_cals = load_calibration(dra_cal)
         self.manifest = TilingManifest(output_dir, self.prefix)
 
     def create_tiles(self):
@@ -220,12 +238,22 @@ class Tiler:
             metadata["patch_size"] = self.patch_size
             metadata["stride"] = self.stride
             sensor_type = metadata.get("collection", "unknown")
-            result = self.process_single_pair(image_path, label_path, image_tmp_dir)
+            result = self.process_single_pair(
+                image_path,
+                label_path,
+                image_tmp_dir,
+                collection=metadata.get("collection"),
+            )
             if result["status"] != "successful":
                 logger.info(f"Pair {input_dict['image']} - {result['reason']}")
                 self.manifest.mark_image_failed(image_name, result["reason"])
                 processing_summary["failed"] += 1
                 continue
+            if result.get("dra"):
+                metadata["dra"] = result["dra"]
+                self.manifest.update_image_metadata(
+                    image_name, {"dra": result["dra"]}
+                )
             processing_summary["successful"] += 1
             logger.info(f"Processing analysis for {image_name}")
             self.process_analysis(
@@ -521,7 +549,7 @@ class Tiler:
         )
 
     @log_stage(stage_name="process_single_pair", log_memory=True)
-    def process_single_pair(self, image_path, label_path, tmp_dir):
+    def process_single_pair(self, image_path, label_path, tmp_dir, collection=None):
         """Process a single image-label pair and return the result status."""
         image_name = Path(image_path).stem
         try:
@@ -577,7 +605,13 @@ class Tiler:
                     road_class_val=self.road_class_val,
                 )
 
-            return {
+            dra = None
+            if self.apply_dra:
+                clipped_image_path, dra = self._apply_dra(
+                    clipped_image_path, tmp_dir, image_name, collection
+                )
+
+            result = {
                 "image_path": str(clipped_image_path),
                 "label_path": str(clipped_label_path),
                 "targets_paths": targets_paths,
@@ -586,9 +620,38 @@ class Tiler:
                 "status": "successful",
                 "reason": "Processed successfully",
             }
+            if dra is not None:
+                result["dra"] = dra
+            return result
         except Exception as e:
             logger.error(f"Error processing image {image_name}: {e}")
             return {"status": "failed", "reason": str(e)}
+
+    def _apply_dra(self, image_path, tmp_dir, image_name, collection):
+        """Gate + apply DRA on the clipped scene. Returns (path, decision dict)."""
+        sensor = resolve_sensor(collection)
+        if sensor is None or sensor not in self.dra_cals:
+            logger.warning(
+                "%s: no DRA calibration for sensor %r (collection=%r) — skipping",
+                image_name,
+                sensor,
+                collection,
+            )
+            return image_path, {
+                "scene_id": image_name,
+                "sensor": sensor,
+                "contrast_status": None,
+                "edr_min": None,
+                "action": "skipped",
+                "reason": "no calibration for sensor",
+            }
+        new_path, decision = apply_dra_to_file(
+            image_path,
+            self.dra_cals[sensor],
+            scene_id=image_name,
+            tmp_dir=tmp_dir,
+        )
+        return new_path, asdict(decision)
 
     @log_stage(stage_name="process_analysis", log_memory=True)
     def process_analysis(
