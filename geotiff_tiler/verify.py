@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import argparse
-import ast
 import json
 import logging
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -19,8 +16,8 @@ from rasterio.enums import Resampling
 from shapely.geometry import box
 from tqdm import tqdm
 
-from geotiff_tiler.utils.checks import check_label_validity
-from geotiff_tiler.utils.io import load_vector_mask, validate_image
+from geotiff_tiler.lib.geo import check_label_validity
+from geotiff_tiler.lib.io import load_vector_mask, validate_image
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +45,6 @@ LABEL_CHECKS = (
 SAMPLE_MAX_DIM = 256
 VECTOR_EXTS = (".geojson", ".gpkg", ".shp")
 RASTER_EXTS = (".tif", ".tiff")
-_CSV_RESERVED = {"image", "label"}
 
 
 @dataclass
@@ -575,100 +571,3 @@ def verify_dataset(
         len(df),
     )
     return df
-
-
-def _load_input_dict(path: str) -> list[dict]:
-    p = Path(path)
-    if p.suffix.lower() == ".json":
-        data = json.loads(p.read_text())
-        if not isinstance(data, list):
-            raise ValueError("JSON input must be a list of {image, label, metadata}")
-        return data
-
-    if p.suffix.lower() == ".csv":
-        df = pd.read_csv(p)
-        if "image" not in df.columns:
-            raise ValueError(
-                f"CSV must include an 'image' column, got {list(df.columns)}"
-            )
-        rows = []
-        for rec in df.to_dict(orient="records"):
-            label = rec.get("label")
-            if label is not None and pd.isna(label):
-                label = None
-            meta = {
-                k: v for k, v in rec.items() if k not in _CSV_RESERVED and pd.notna(v)
-            }
-            rows.append({"image": rec["image"], "label": label, "metadata": meta})
-        return rows
-
-    raise ValueError(f"Unsupported input format: {p.suffix} (use .json or .csv)")
-
-
-def _parse_class_ids(raw: str | None) -> dict | None:
-    if raw is None:
-        return None
-    parsed = ast.literal_eval(raw)
-    if not isinstance(parsed, dict):
-        raise ValueError("--class_ids must be a dict literal")
-    return parsed
-
-
-def _parse_attr_values(raw: list[str] | None) -> list | None:
-    if raw is None:
-        return None
-    out = []
-    for v in raw:
-        try:
-            out.append(int(v))
-        except ValueError:
-            out.append(v)
-    return out
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="python -m geotiff_tiler.verify",
-        description="Pre-flight verify image/label pairs before tiling.",
-    )
-    parser.add_argument("input", help="JSON list or CSV with an image column")
-    parser.add_argument(
-        "-o", "--output", default="verification_report.csv", help="Output CSV path"
-    )
-    parser.add_argument("--attr_field", nargs="+", default=None)
-    parser.add_argument("--attr_values", nargs="+", default=None)
-    parser.add_argument(
-        "--class_ids",
-        default=None,
-        help="Dict literal, e.g. \"{'background': 0, 'fore': 1}\"",
-    )
-    parser.add_argument("--bands_expected", type=int, default=None)
-    parser.add_argument(
-        "--bands_requested",
-        nargs="+",
-        default=None,
-        help="STAC common-name bands (default: validate_image default)",
-    )
-    args = parser.parse_args(argv)
-
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-
-    attr_field: str | list[str] | None = args.attr_field
-    if attr_field is not None and len(attr_field) == 1:
-        attr_field = attr_field[0]
-
-    df = verify_dataset(
-        _load_input_dict(args.input),
-        output_report_path=args.output,
-        attr_field=attr_field,
-        attr_values=_parse_attr_values(args.attr_values),
-        class_ids=_parse_class_ids(args.class_ids),
-        bands_expected=args.bands_expected,
-        bands_requested=args.bands_requested,
-    )
-    n_err = int((df["status"] == "error").sum()) if len(df) else 0
-    return 1 if n_err else 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
