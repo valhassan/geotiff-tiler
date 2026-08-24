@@ -1,9 +1,4 @@
-"""Standalone pre-flight verification for Tiler input_dict pairs.
-
-Answers: is this image/label pair safe to tile, and if not, why?
-No Hydra, no AOI — opens files with rasterio/geopandas and emits one report row
-per pair.
-"""
+"""Pre-flight checks for Tiler image/label pairs."""
 
 from __future__ import annotations
 
@@ -11,9 +6,10 @@ import argparse
 import ast
 import json
 import logging
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Sequence
 
 import geopandas as gpd
 import numpy as np
@@ -40,18 +36,38 @@ HARD_CHECKS = frozenset(
     }
 )
 SOFT_CHECKS = frozenset({"attr_values_match", "nonempty_after_filter"})
+LABEL_CHECKS = (
+    "label_valid",
+    "crs_match",
+    "spatial_overlap",
+    "attr_field_exists",
+    "attr_values_match",
+    "nonempty_after_filter",
+)
 
 SAMPLE_MAX_DIM = 256
 VECTOR_EXTS = (".geojson", ".gpkg", ".shp")
 RASTER_EXTS = (".tif", ".tiff")
+_CSV_RESERVED = {"image", "label"}
 
 
 @dataclass
 class VerificationResult:
+    """Rollup for a single pair.
+
+    Attributes:
+        id: Pair identifier.
+        image: Original image path or STAC href.
+        label: Label path, or None for image-only.
+        status: ``ok``, ``warning``, or ``error``.
+        checks: Per-check ``{passed, detail}`` map.
+        errors: Exception messages from hard failures.
+    """
+
     id: str
     image: str
     label: str | None
-    status: str  # ok | warning | error
+    status: str
     checks: dict[str, dict] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
@@ -62,6 +78,12 @@ def _check(passed: bool, detail: Any = None) -> dict:
 
 def _skipped(reason: str) -> dict:
     return {"passed": True, "detail": {"skipped": True, "reason": reason}}
+
+
+def _skip_remaining(checks: dict[str, dict], names: Sequence[str], reason: str) -> None:
+    for name in names:
+        if name not in checks:
+            checks[name] = _skipped(reason)
 
 
 def _label_type(label_path: str) -> str:
@@ -77,21 +99,20 @@ def _label_type(label_path: str) -> str:
 
 
 def _resolve_attr_field(
-    columns: Sequence[str], attr_field: Union[str, Sequence[str], None]
-) -> Optional[str]:
+    columns: Sequence[str], attr_field: str | Sequence[str] | None
+) -> str | None:
     if attr_field is None:
         return None
     fields = [attr_field] if isinstance(attr_field, str) else list(attr_field)
-    candidates = [f for f in fields if f in columns]
-    if not candidates:
-        return None
-    return candidates[0]
+    for name in fields:
+        if name in columns:
+            return name
+    return None
 
 
 def _overlap_fractions(poly_a, poly_b) -> dict[str, float]:
-    """Return containment fractions both ways plus IoU."""
-    area_a = poly_a.area
-    area_b = poly_b.area
+    """Containment both ways plus IoU."""
+    area_a, area_b = poly_a.area, poly_b.area
     inter = poly_a.intersection(poly_b)
     inter_area = 0.0 if inter.is_empty else inter.area
     union_area = poly_a.union(poly_b).area
@@ -103,111 +124,135 @@ def _overlap_fractions(poly_a, poly_b) -> dict[str, float]:
     }
 
 
-def _label_bounds(label_path: str, label_type: str, gdf: gpd.GeoDataFrame | None):
-    if label_type == "raster":
-        with rasterio.open(label_path) as src:
-            return box(*src.bounds), src.crs
-    assert gdf is not None
+def _vector_bounds(gdf: gpd.GeoDataFrame):
     if hasattr(gdf, "attrs") and "extent_geometry" in gdf.attrs:
-        bounds_geom = gdf.attrs["extent_geometry"]
-    else:
-        bounds_geom = box(*gdf.total_bounds)
-    return bounds_geom, gdf.crs
+        return gdf.attrs["extent_geometry"]
+    return box(*gdf.total_bounds)
+
+
+def _overview_hw(src: rasterio.DatasetReader) -> tuple[int, int]:
+    return (
+        max(1, min(SAMPLE_MAX_DIM, src.height)),
+        max(1, min(SAMPLE_MAX_DIM, src.width)),
+    )
 
 
 def _sample_is_degenerate(src: rasterio.DatasetReader) -> tuple[bool, dict]:
-    """Cheap degeneracy check via decimated overview-style read."""
-    h = max(1, min(SAMPLE_MAX_DIM, src.height))
-    w = max(1, min(SAMPLE_MAX_DIM, src.width))
-    out_shape = (src.count, h, w)
-    data = src.read(out_shape=out_shape, resampling=Resampling.nearest)
+    h, w = _overview_hw(src)
+    data = src.read(out_shape=(src.count, h, w), resampling=Resampling.nearest)
     nodata = src.nodata
-
     all_zero = bool(np.all(data == 0))
-    if nodata is None:
-        all_nodata = False
-    else:
-        all_nodata = bool(np.all(data == nodata))
-
-    degenerate = all_zero or all_nodata
-    return degenerate, {
-        "sample_shape": list(out_shape),
+    all_nodata = bool(nodata is not None and np.all(data == nodata))
+    return all_zero or all_nodata, {
+        "sample_shape": [src.count, h, w],
         "all_zero": all_zero,
         "all_nodata": all_nodata,
         "nodata": nodata,
     }
 
 
-def _normalize_values(values: Sequence[Any]) -> set:
-    """Normalize attr/class values for set comparison (int/str tolerant)."""
+def _can_int(v: Any) -> bool:
+    try:
+        if isinstance(v, bool):
+            return False
+        int(v)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _norm_set(values: Sequence[Any]) -> set:
+    """Int/str-tolerant set for attr/class comparisons."""
     out: set = set()
     for v in values:
         if v is None or (isinstance(v, float) and np.isnan(v)):
             continue
         out.add(v)
-        try:
-            if not isinstance(v, bool):
-                out.add(int(v))
-                out.add(str(int(v)))
-        except (TypeError, ValueError):
-            pass
         out.add(str(v))
+        if _can_int(v):
+            iv = int(v)
+            out.add(iv)
+            out.add(str(iv))
     return out
 
 
 def _rollup_status(checks: dict[str, dict], errors: list[str]) -> str:
-    if errors:
-        return "error"
-    hard_fail = any(
+    if errors or any(
         name in HARD_CHECKS and not c.get("passed", False)
         for name, c in checks.items()
-    )
-    if hard_fail:
+    ):
         return "error"
-    soft_fail = any(
+    if any(
         name in SOFT_CHECKS and not c.get("passed", False)
         for name, c in checks.items()
-    )
-    if soft_fail:
+    ):
         return "warning"
     return "ok"
+
+
+def _finish(
+    result_id: str,
+    image: str,
+    label: str | None,
+    checks: dict[str, dict],
+    errors: list[str],
+) -> VerificationResult:
+    return VerificationResult(
+        id=result_id,
+        image=str(image),
+        label=None if label is None else str(label),
+        status=_rollup_status(checks, errors),
+        checks=checks,
+        errors=errors,
+    )
 
 
 def verify_pair(
     image: str,
     label: str | None = None,
     *,
-    attr_field: Union[str, Sequence[str], None] = None,
+    attr_field: str | Sequence[str] | None = None,
     attr_values: list | None = None,
     class_ids: dict | None = None,
     bands_expected: int | None = None,
     bands_requested: Sequence[str] | None = None,
     pair_id: str | None = None,
 ) -> VerificationResult:
-    """Run all verification checks on a single image/label pair."""
+    """Run all verification checks on one image/label pair.
+
+    Args:
+        image: Path or STAC item href.
+        label: Raster/vector label path, or None for image-only.
+        attr_field: Vector attribute field name(s).
+        attr_values: Declared values for ``attr_field``.
+        class_ids: Name-to-id mapping for raster labels.
+        bands_expected: Required image band count, if known.
+        bands_requested: STAC common-name bands for ``validate_image``.
+        pair_id: Report id; defaults to the image stem.
+
+    Returns:
+        VerificationResult with per-check details and a rollup status.
+    """
     result_id = pair_id or Path(str(image)).stem
     checks: dict[str, dict] = {}
     errors: list[str] = []
 
-    image_path: str | None = None
-    label_type: str | None = None
-    label_gdf: gpd.GeoDataFrame | None = None
     image_crs = None
-    label_crs = None
+    image_bounds = None
+    band_count = None
+    degenerate = False
+    deg_detail: dict | None = None
 
-    # --- 1. image_readable ---
-    # Keep original source in the report (STAC URL / path). Do NOT dump the
-    # in-memory VRT XML that validate_image returns for STAC items.
     try:
-        resolved = validate_image(
-            image, bands_requested=bands_requested or ["red", "green", "blue"]
+        resolved = (
+            validate_image(image, bands_requested=bands_requested)
+            if bands_requested is not None
+            else validate_image(image)
         )
         with rasterio.open(resolved) as src:
-            _ = src.meta
-            image_path = str(resolved)
             image_crs = src.crs
+            image_bounds = box(*src.bounds)
             band_count = src.count
-            # Peek for later checks while open
             degenerate, deg_detail = _sample_is_degenerate(src)
         checks["image_readable"] = _check(
             True,
@@ -218,12 +263,7 @@ def verify_pair(
         checks["image_readable"] = _check(False, str(e))
         checks["band_count"] = _skipped("image unreadable")
         checks["not_degenerate"] = _skipped("image unreadable")
-        # Still attempt label-only checks below where possible
-        band_count = None
-        degenerate = None
-        deg_detail = None
 
-    # --- 2. band_count ---
     if "band_count" not in checks:
         if bands_expected is None:
             checks["band_count"] = _check(
@@ -235,55 +275,51 @@ def verify_pair(
                 {"count": band_count, "expected": bands_expected},
             )
 
-    # --- 3. not_degenerate ---
     if "not_degenerate" not in checks:
         checks["not_degenerate"] = _check(not degenerate, deg_detail)
 
-    # --- label path ---
     if label is None:
-        for name in (
-            "label_valid",
-            "crs_match",
-            "spatial_overlap",
-            "attr_field_exists",
-            "attr_values_match",
-            "nonempty_after_filter",
-        ):
-            checks[name] = _skipped("inference-only (label is None)")
-        status = _rollup_status(checks, errors)
-        return VerificationResult(
-            id=result_id,
-            image=str(image),
-            label=None,
-            status=status,
-            checks=checks,
-            errors=errors,
-        )
+        _skip_remaining(checks, LABEL_CHECKS, "inference-only (label is None)")
+        return _finish(result_id, image, None, checks, errors)
 
-    # --- 4. label_valid ---
+    label_type: str | None = None
+    label_gdf: gpd.GeoDataFrame | None = None
+    label_crs = None
+    label_bounds = None
+    raster_sample: np.ndarray | None = None
+    raster_nodata = None
+
     try:
         label_type = _label_type(label)
         if label_type == "vector":
-            if Path(label).suffix.lower() == ".gpkg":
-                label_gdf = load_vector_mask(label)
-            else:
-                label_gdf = gpd.read_file(label)
+            label_gdf = (
+                load_vector_mask(label)
+                if Path(label).suffix.lower() == ".gpkg"
+                else gpd.read_file(label)
+            )
             valid, msg = check_label_validity(label_gdf)
-            # Report invalid geoms even if load_vector_mask auto-fixed gpkg
-            if label_gdf is not None and not label_gdf.empty:
+            detail: dict[str, Any] = {
+                "type": "vector",
+                "n_features": len(label_gdf),
+                "msg": msg,
+            }
+            if not label_gdf.empty:
                 n_invalid = int((~label_gdf.geometry.is_valid).sum())
-                detail = {"type": "vector", "n_features": len(label_gdf), "msg": msg}
                 if n_invalid:
                     detail["n_invalid"] = n_invalid
-                    valid = False
-                checks["label_valid"] = _check(valid, detail)
-            else:
-                checks["label_valid"] = _check(valid, {"type": "vector", "msg": msg})
-            label_crs = label_gdf.crs if label_gdf is not None else None
+            checks["label_valid"] = _check(valid, detail)
+            label_crs = label_gdf.crs
+            label_bounds = _vector_bounds(label_gdf)
         else:
             with rasterio.open(label) as src_label:
                 valid, msg = check_label_validity(src_label)
                 label_crs = src_label.crs
+                label_bounds = box(*src_label.bounds)
+                h, w = _overview_hw(src_label)
+                raster_sample = src_label.read(
+                    1, out_shape=(h, w), resampling=Resampling.nearest
+                )
+                raster_nodata = src_label.nodata
                 checks["label_valid"] = _check(
                     valid,
                     {
@@ -296,27 +332,11 @@ def verify_pair(
     except Exception as e:
         errors.append(f"label_valid: {e}")
         checks["label_valid"] = _check(False, str(e))
-        for name in (
-            "crs_match",
-            "spatial_overlap",
-            "attr_field_exists",
-            "attr_values_match",
-            "nonempty_after_filter",
-        ):
-            checks[name] = _skipped("label unreadable")
-        status = _rollup_status(checks, errors)
-        return VerificationResult(
-            id=result_id,
-            image=str(image),
-            label=str(label),
-            status=status,
-            checks=checks,
-            errors=errors,
-        )
+        _skip_remaining(checks, LABEL_CHECKS, "label unreadable")
+        return _finish(result_id, image, label, checks, errors)
 
-    # --- 5. crs_match ---
     try:
-        if image_path is None:
+        if image_bounds is None:
             checks["crs_match"] = _skipped("image unreadable")
         elif image_crs is None or label_crs is None:
             checks["crs_match"] = _check(
@@ -324,71 +344,58 @@ def verify_pair(
                 {"image_crs": str(image_crs), "label_crs": str(label_crs)},
             )
         else:
-            match = image_crs == label_crs
             checks["crs_match"] = _check(
-                match,
+                image_crs == label_crs,
                 {"image_crs": str(image_crs), "label_crs": str(label_crs)},
             )
     except Exception as e:
         errors.append(f"crs_match: {e}")
         checks["crs_match"] = _check(False, str(e))
 
-    # --- 6. spatial_overlap ---
     try:
-        if image_path is None:
+        if image_bounds is None:
             checks["spatial_overlap"] = _skipped("image unreadable")
         else:
-            with rasterio.open(image_path) as src:
-                image_bounds = box(*src.bounds)
-            label_bounds, _ = _label_bounds(label, label_type, label_gdf)
             fracs = _overlap_fractions(label_bounds, image_bounds)
-            detail = {
-                "overlap_label_rto_raster": fracs["overlap_a_rto_b"],
-                "overlap_raster_rto_label": fracs["overlap_b_rto_a"],
-                "iou": fracs["iou"],
-            }
             checks["spatial_overlap"] = _check(
-                not fracs["intersection_empty"], detail
+                not fracs["intersection_empty"],
+                {
+                    "overlap_label_rto_raster": fracs["overlap_a_rto_b"],
+                    "overlap_raster_rto_label": fracs["overlap_b_rto_a"],
+                    "iou": fracs["iou"],
+                },
             )
     except Exception as e:
         errors.append(f"spatial_overlap: {e}")
         checks["spatial_overlap"] = _check(False, str(e))
 
-    # --- 7–9 attribute / class checks ---
     _run_attr_checks(
         checks,
         errors,
-        label=label,
         label_type=label_type,
         label_gdf=label_gdf,
+        raster_sample=raster_sample,
+        raster_nodata=raster_nodata,
         attr_field=attr_field,
         attr_values=attr_values,
         class_ids=class_ids,
     )
-
-    status = _rollup_status(checks, errors)
-    return VerificationResult(
-        id=result_id,
-        image=str(image),
-        label=str(label),
-        status=status,
-        checks=checks,
-        errors=errors,
-    )
+    return _finish(result_id, image, label, checks, errors)
 
 
 def _run_attr_checks(
     checks: dict[str, dict],
     errors: list[str],
     *,
-    label: str,
     label_type: str,
     label_gdf: gpd.GeoDataFrame | None,
-    attr_field: Union[str, Sequence[str], None],
+    raster_sample: np.ndarray | None,
+    raster_nodata: Any,
+    attr_field: str | Sequence[str] | None,
     attr_values: list | None,
     class_ids: dict | None,
 ) -> None:
-    # --- 7. attr_field_exists (vector + attr_field only) ---
+    resolved: str | None = None
     if label_type != "vector" or attr_field is None:
         checks["attr_field_exists"] = _skipped(
             "not applicable (raster label or no attr_field)"
@@ -406,156 +413,87 @@ def _run_attr_checks(
                         else list(attr_field)
                     ),
                     "resolved": resolved,
-                    "columns": list(map(str, label_gdf.columns)),
                 },
             )
         except Exception as e:
             errors.append(f"attr_field_exists: {e}")
             checks["attr_field_exists"] = _check(False, str(e))
 
-    # --- 8. attr_values_match ---
     try:
         if label_type == "vector":
             if attr_values is None:
                 checks["attr_values_match"] = _skipped("no attr_values declared")
             elif attr_field is None:
                 checks["attr_values_match"] = _skipped("no attr_field declared")
+            elif resolved is None:
+                checks["attr_values_match"] = _skipped("attr_field missing")
             else:
                 assert label_gdf is not None
-                resolved = _resolve_attr_field(label_gdf.columns, attr_field)
-                if resolved is None:
-                    checks["attr_values_match"] = _skipped("attr_field missing")
-                else:
-                    present = set(label_gdf[resolved].dropna().unique().tolist())
-                    declared = set(attr_values)
-                    # Compare with int/str tolerance
-                    present_n = _normalize_values(present)
-                    declared_n = _normalize_values(declared)
-                    extra = [
-                        v
-                        for v in present
-                        if v not in declared_n and str(v) not in declared_n
-                    ]
-                    missing = [
-                        v
-                        for v in declared
-                        if v not in present_n and str(v) not in present_n
-                    ]
-                    # Also try int coercion for missing
-                    missing = [
-                        v
-                        for v in missing
-                        if not (
-                            (isinstance(v, (int, str)) and int(v) in present_n)
-                            if _can_int(v)
-                            else False
-                        )
-                    ]
-                    extra = [
-                        v
-                        for v in extra
-                        if not (
-                            (_can_int(v) and int(v) in declared_n)
-                            or str(v) in {str(d) for d in declared}
-                        )
-                    ]
-                    checks["attr_values_match"] = _check(
-                        len(extra) == 0 and len(missing) == 0,
-                        {
-                            "present": sorted(present, key=str),
-                            "declared": list(attr_values),
-                            "extra_in_data": extra,
-                            "missing_from_data": missing,
-                        },
-                    )
-        else:  # raster
-            if not class_ids:
-                checks["attr_values_match"] = _skipped("no class_ids declared")
-            else:
-                declared = set(class_ids.values())
-                with rasterio.open(label) as src:
-                    h = max(1, min(SAMPLE_MAX_DIM, src.height))
-                    w = max(1, min(SAMPLE_MAX_DIM, src.width))
-                    data = src.read(
-                        1, out_shape=(h, w), resampling=Resampling.nearest
-                    )
-                    nodata = src.nodata
-                present = set(np.unique(data).tolist())
-                if nodata is not None:
-                    present.discard(nodata)
-                extra = sorted(present - declared, key=str)
-                missing = sorted(declared - present, key=str)
-                # Missing declared classes in a sample is soft info; only fail
-                # on values present that aren't declared (corrupt mapping risk).
+                present = list(label_gdf[resolved].dropna().unique())
+                declared = list(attr_values)
+                present_n, declared_n = _norm_set(present), _norm_set(declared)
+                extra = [v for v in present if v not in declared_n]
+                missing = [v for v in declared if v not in present_n]
                 checks["attr_values_match"] = _check(
-                    len(extra) == 0,
+                    not extra and not missing,
                     {
                         "present": sorted(present, key=str),
-                        "declared": sorted(declared, key=str),
+                        "declared": list(attr_values),
                         "extra_in_data": extra,
-                        "missing_from_sample": missing,
+                        "missing_from_data": missing,
                     },
                 )
+        elif not class_ids:
+            checks["attr_values_match"] = _skipped("no class_ids declared")
+        else:
+            declared = set(class_ids.values())
+            present = set(np.unique(raster_sample).tolist())
+            if raster_nodata is not None:
+                present.discard(raster_nodata)
+            extra = sorted(present - declared, key=str)
+            missing = sorted(declared - present, key=str)
+            # Sample may miss rare classes; fail only on undeclared values.
+            checks["attr_values_match"] = _check(
+                not extra,
+                {
+                    "present": sorted(present, key=str),
+                    "declared": sorted(declared, key=str),
+                    "extra_in_data": extra,
+                    "missing_from_sample": missing,
+                },
+            )
     except Exception as e:
         errors.append(f"attr_values_match: {e}")
         checks["attr_values_match"] = _check(False, str(e))
 
-    # --- 9. nonempty_after_filter ---
     try:
         if label_type == "vector":
             if attr_field is None or attr_values is None:
                 checks["nonempty_after_filter"] = _skipped(
                     "no attr_field/attr_values filter"
                 )
+            elif resolved is None:
+                checks["nonempty_after_filter"] = _check(
+                    False, {"empty_after_filter": True, "n": 0}
+                )
             else:
                 assert label_gdf is not None
-                resolved = _resolve_attr_field(label_gdf.columns, attr_field)
-                if resolved is None:
-                    checks["nonempty_after_filter"] = _check(
-                        False, {"empty_after_filter": True, "n": 0}
-                    )
-                else:
-                    declared_n = _normalize_values(attr_values)
-                    mask = label_gdf[resolved].apply(
-                        lambda v: v in declared_n
-                        or str(v) in declared_n
-                        or (_can_int(v) and int(v) in declared_n)
-                    )
-                    n = int(mask.sum())
-                    checks["nonempty_after_filter"] = _check(
-                        n > 0, {"empty_after_filter": n == 0, "n": n}
-                    )
-        else:  # raster
-            if not class_ids:
-                checks["nonempty_after_filter"] = _skipped("no class_ids declared")
-            else:
-                # Exclude background (0) if present in mapping
-                fg = {v for v in class_ids.values() if v != 0}
-                if not fg:
-                    fg = set(class_ids.values())
-                with rasterio.open(label) as src:
-                    h = max(1, min(SAMPLE_MAX_DIM, src.height))
-                    w = max(1, min(SAMPLE_MAX_DIM, src.width))
-                    data = src.read(
-                        1, out_shape=(h, w), resampling=Resampling.nearest
-                    )
-                n = int(np.isin(data, list(fg)).sum())
+                declared_n = _norm_set(attr_values)
+                n = int(label_gdf[resolved].apply(lambda v: v in declared_n).sum())
                 checks["nonempty_after_filter"] = _check(
-                    n > 0, {"empty_after_filter": n == 0, "n_labeled_sample": n}
+                    n > 0, {"empty_after_filter": n == 0, "n": n}
                 )
+        elif not class_ids:
+            checks["nonempty_after_filter"] = _skipped("no class_ids declared")
+        else:
+            fg = {v for v in class_ids.values() if v != 0} or set(class_ids.values())
+            n = int(np.isin(raster_sample, list(fg)).sum())
+            checks["nonempty_after_filter"] = _check(
+                n > 0, {"empty_after_filter": n == 0, "n_labeled_sample": n}
+            )
     except Exception as e:
         errors.append(f"nonempty_after_filter: {e}")
         checks["nonempty_after_filter"] = _check(False, str(e))
-
-
-def _can_int(v: Any) -> bool:
-    try:
-        if isinstance(v, bool):
-            return False
-        int(v)
-        return True
-    except (TypeError, ValueError):
-        return False
 
 
 def _flatten_result(result: VerificationResult) -> dict:
@@ -569,19 +507,39 @@ def _flatten_result(result: VerificationResult) -> dict:
     for name, check in result.checks.items():
         row[f"check_{name}_passed"] = check.get("passed")
         detail = check.get("detail")
-        if isinstance(detail, (dict, list)):
-            row[f"check_{name}_detail"] = json.dumps(detail, default=str)
-        else:
-            row[f"check_{name}_detail"] = detail
+        row[f"check_{name}_detail"] = (
+            json.dumps(detail, default=str)
+            if isinstance(detail, (dict, list))
+            else detail
+        )
     return row
 
 
 def verify_dataset(
     input_dict: list[dict],
     output_report_path: str | None = None,
-    **kwargs,
+    *,
+    attr_field: str | Sequence[str] | None = None,
+    attr_values: list | None = None,
+    class_ids: dict | None = None,
+    bands_expected: int | None = None,
+    bands_requested: Sequence[str] | None = None,
 ) -> pd.DataFrame:
-    """Verify all pairs in a Tiler-style input_dict; optionally write CSV."""
+    """Verify all pairs in a Tiler-style ``input_dict``.
+
+    Args:
+        input_dict: List of ``{image, label, metadata}`` dicts.
+        output_report_path: Optional CSV path. The in-memory frame also
+            keeps a structured ``checks`` column.
+        attr_field: Vector attribute field name(s).
+        attr_values: Declared values for ``attr_field``.
+        class_ids: Name-to-id mapping for raster labels.
+        bands_expected: Required image band count, if known.
+        bands_requested: STAC common-name bands for ``validate_image``.
+
+    Returns:
+        DataFrame with one row per pair and a rollup logged to INFO.
+    """
     results: list[VerificationResult] = []
     for item in tqdm(input_dict, desc="Verifying pairs"):
         meta = item.get("metadata") or {}
@@ -591,30 +549,29 @@ def verify_dataset(
                 image=item["image"],
                 label=item.get("label"),
                 pair_id=str(pair_id),
-                **kwargs,
+                attr_field=attr_field,
+                attr_values=attr_values,
+                class_ids=class_ids,
+                bands_expected=bands_expected,
+                bands_requested=bands_requested,
             )
         )
 
-    rows = [_flatten_result(r) for r in results]
-    df = pd.DataFrame(rows)
-    # Keep structured checks accessible
+    df = pd.DataFrame([_flatten_result(r) for r in results])
     df["checks"] = [r.checks for r in results]
 
     if output_report_path:
         out = Path(output_report_path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        csv_df = df.drop(columns=["checks"])
-        csv_df.to_csv(out, index=False)
+        df.drop(columns=["checks"]).to_csv(out, index=False)
         logger.info("Wrote verification report to %s", out)
 
-    n_ok = int((df["status"] == "ok").sum()) if len(df) else 0
-    n_warn = int((df["status"] == "warning").sum()) if len(df) else 0
-    n_err = int((df["status"] == "error").sum()) if len(df) else 0
+    counts = df["status"].value_counts() if len(df) else pd.Series(dtype=int)
     logger.info(
         "Verification complete: %d ok, %d warning, %d error (total %d)",
-        n_ok,
-        n_warn,
-        n_err,
+        int(counts.get("ok", 0)),
+        int(counts.get("warning", 0)),
+        int(counts.get("error", 0)),
         len(df),
     )
     return df
@@ -630,28 +587,19 @@ def _load_input_dict(path: str) -> list[dict]:
 
     if p.suffix.lower() == ".csv":
         df = pd.read_csv(p)
-        required = {"image"}
-        if not required.issubset(df.columns):
-            raise ValueError(f"CSV must include columns {required}, got {list(df.columns)}")
-        rows = []
-        for _, row in df.iterrows():
-            meta = {}
-            if "collection" in df.columns and pd.notna(row.get("collection")):
-                meta["collection"] = row["collection"]
-            if "gsd" in df.columns and pd.notna(row.get("gsd")):
-                meta["gsd"] = row["gsd"]
-            if "id" in df.columns and pd.notna(row.get("id")):
-                meta["id"] = row["id"]
-            label = row.get("label")
-            if pd.isna(label):
-                label = None
-            rows.append(
-                {
-                    "image": row["image"],
-                    "label": label,
-                    "metadata": meta,
-                }
+        if "image" not in df.columns:
+            raise ValueError(
+                f"CSV must include an 'image' column, got {list(df.columns)}"
             )
+        rows = []
+        for rec in df.to_dict(orient="records"):
+            label = rec.get("label")
+            if label is not None and pd.isna(label):
+                label = None
+            meta = {
+                k: v for k, v in rec.items() if k not in _CSV_RESERVED and pd.notna(v)
+            }
+            rows.append({"image": rec["image"], "label": label, "metadata": meta})
         return rows
 
     raise ValueError(f"Unsupported input format: {p.suffix} (use .json or .csv)")
@@ -662,23 +610,30 @@ def _parse_class_ids(raw: str | None) -> dict | None:
         return None
     parsed = ast.literal_eval(raw)
     if not isinstance(parsed, dict):
-        raise argparse.ArgumentTypeError("--class_ids must be a dict literal")
+        raise ValueError("--class_ids must be a dict literal")
     return parsed
+
+
+def _parse_attr_values(raw: list[str] | None) -> list | None:
+    if raw is None:
+        return None
+    out = []
+    for v in raw:
+        try:
+            out.append(int(v))
+        except ValueError:
+            out.append(v)
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Pre-flight verify image/label pairs before tiling."
+        prog="python -m geotiff_tiler.verify",
+        description="Pre-flight verify image/label pairs before tiling.",
     )
+    parser.add_argument("input", help="JSON list or CSV with an image column")
     parser.add_argument(
-        "input",
-        help="Path to JSON list or CSV with image[, label] columns",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        default="verification_report.csv",
-        help="Output CSV report path",
+        "-o", "--output", default="verification_report.csv", help="Output CSV path"
     )
     parser.add_argument("--attr_field", nargs="+", default=None)
     parser.add_argument("--attr_values", nargs="+", default=None)
@@ -691,32 +646,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--bands_requested",
         nargs="+",
-        default=["red", "green", "blue"],
-        help="STAC common-name bands (default: red green blue)",
+        default=None,
+        help="STAC common-name bands (default: validate_image default)",
     )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    attr_values = None
-    if args.attr_values is not None:
-        attr_values = []
-        for v in args.attr_values:
-            try:
-                attr_values.append(int(v))
-            except ValueError:
-                attr_values.append(v)
-
-    attr_field: Union[str, list[str], None] = args.attr_field
+    attr_field: str | list[str] | None = args.attr_field
     if attr_field is not None and len(attr_field) == 1:
         attr_field = attr_field[0]
 
-    input_dict = _load_input_dict(args.input)
     df = verify_dataset(
-        input_dict,
+        _load_input_dict(args.input),
         output_report_path=args.output,
         attr_field=attr_field,
-        attr_values=attr_values,
+        attr_values=_parse_attr_values(args.attr_values),
         class_ids=_parse_class_ids(args.class_ids),
         bands_expected=args.bands_expected,
         bands_requested=args.bands_requested,
@@ -726,46 +671,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    # --- scratch: geoeye-1 FOM csv (delete before shipping) ---
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-
-    csv_path = Path(
-        "/home/valhassa/Projects/notebooks/data_prep/notebooks/fom/csv/"
-        "processed/geoeye-1.csv"
-    )
-    raw = pd.read_csv(csv_path)
-    # quick subset; drop `.head(...)` to run the full sheet
-    raw = raw.head(3)
-
-    input_dict = [
-        {
-            "image": row["image_url"],
-            "label": row["label_path"] if pd.notna(row["label_path"]) else None,
-            "metadata": {
-                "id": row["image_name"],
-                "collection": row.get("collection"),
-                "gsd": row.get("gsd"),
-                "split": row.get("split"),
-            },
-        }
-        for _, row in raw.iterrows()
-    ]
-
-    report = verify_dataset(
-        input_dict,
-        output_report_path="/tmp/geoeye-1_verify_report.csv",
-        attr_field=["Quatreclasses", "class"],
-        attr_values=[1, 2, 3, 4],
-        class_ids={
-            "background": 0,
-            "fore": 1,
-            "hydro": 2,
-            "road": 3,
-            "building": 4,
-        },
-        bands_expected=4,
-        bands_requested=["red", "green", "blue", "nir"],
-    )
-    print(report[["id", "status", "errors"]].to_string(index=False))
-    print("wrote /tmp/geoeye-1_verify_report.csv")
-    raise SystemExit(1 if (report["status"] == "error").any() else 0)
+    sys.exit(main())
