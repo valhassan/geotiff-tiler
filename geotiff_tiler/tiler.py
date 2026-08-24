@@ -15,7 +15,7 @@ import numpy as np
 import psutil
 import rasterio
 import webdataset as wds
-from rasterio.windows import Window
+from rasterio.windows import Window, bounds as window_bounds
 from tqdm import tqdm
 
 from geotiff_tiler.apply_transform import (
@@ -24,6 +24,7 @@ from geotiff_tiler.apply_transform import (
     resolve_sensor,
 )
 from geotiff_tiler.config import logging_config  # noqa: F401
+from geotiff_tiler.split_planner import classify_patch, load_plan, val_rects_for_image
 from geotiff_tiler.tiling_manifest import TilingManifest
 from geotiff_tiler.utils.io import (
     calculate_overlap,
@@ -37,12 +38,6 @@ from geotiff_tiler.utils.io import (
 )
 from geotiff_tiler.utils.visualization import create_dataset_summary_visualization
 from geotiff_tiler.utils.vector import clip_gdf_to_window, gdf_to_geojson
-from geotiff_tiler.val import (
-    calculate_class_distribution,
-    create_spatial_grid,
-    select_validation_cells,
-    select_validation_cells_random,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +69,23 @@ def log_memory_usage(stage: str, image_name: str = "", force_gc: bool = True):
     return memory_mb
 
 
+def _class_distribution(label_path, class_ids: Dict[str, int]) -> Dict[str, float]:
+    """Foreground-normalized class fractions from a label raster."""
+    with rasterio.open(label_path) as src:
+        arr = src.read(1).ravel()
+    max_id = max(class_ids.values()) if class_ids else 0
+    counts = np.bincount(arr, minlength=max_id + 1)
+    total = 0
+    class_counts = {}
+    for name, cid in class_ids.items():
+        n = int(counts[cid]) if cid < len(counts) else 0
+        class_counts[name] = n
+        total += n
+    if total == 0:
+        return {name: 0.0 for name in class_ids}
+    return {name: n / total for name, n in class_counts.items()}
+
+
 class Tiler:
     """
     A class for tiling geospatial images and their corresponding labels into patches.
@@ -90,10 +102,6 @@ class Tiler:
         bands_requested: List[str] = ["red", "green", "blue", "nir"],
         band_indices: List[int] = None,
         stride: int = None,
-        grid_size: int = 16,
-        val_ratio: float = 0.1,
-        class_balance_weight: float = 0.5,
-        spatial_weight: float = 0.5,
         attr_field: str = None,
         attr_values: List[str] = None,
         erosion_classes: List[str] = None,
@@ -109,8 +117,7 @@ class Tiler:
         prefix: str = "sample",
         output_dir: str = None,
         output_format: str = "tar",  # "tar" | "csv"
-        val_strategy: str = "spatial",  # "spatial" | "random"
-        val_seed: int | None = None,
+        split_plan: str | Path | None = None,
         apply_dra: bool = False,
         dra_cal: str | Path | None = None,
     ):
@@ -123,10 +130,6 @@ class Tiler:
                 - 'metadata': Dictionary with additional metadata (Dict)
             patch_size (Tuple[int, int]): Size of patches to create as (height, width).
             stride (int, optional): Step size between patches. If None, uses max(patch_size).
-            grid_size (int, optional): Size of the grid to create. Defaults to 4.
-            val_ratio (float, optional): Ratio of validation cells to total cells. Defaults to 0.2.
-            class_balance_weight (float, optional): Weight for class balance. Defaults to 0.5.
-            spatial_weight (float, optional): Weight for spatial balance. Defaults to 0.5.
             attr_field (str or List[str], optional): Field(s) in vector data containing classification attributes.
             attr_values (List[str], optional): Values in attr_field to use for classification.
             erosion_classes (List[str], optional): Classes to erode.
@@ -144,10 +147,9 @@ class Tiler:
             output_dir (str, optional): Directory where output patches will be saved.
             output_format (str, optional): Output format — "tar" (WebDataset shards) or
                 "csv" (GeoTIFF patches + CSV index). Defaults to "tar".
-            val_strategy (str, optional): Validation cell selection strategy —
-                "spatial" (class-aware greedy, default) or "random" (uniform random sample).
-            val_seed (int, optional): RNG seed for reproducible random validation splits.
-                Only used when val_strategy="random".
+            split_plan (str or Path, optional): Path to split_plan.json from
+                ``python -m geotiff_tiler.split_planner``. Required to emit a
+                val split when ``split='trn'``; omitted → all patches go to trn.
             apply_dra (bool, optional): If True, gate each clipped scene on EDR and
                 apply the isotonic DRA simulation when contrast_status is draoff.
             dra_cal (str or Path, optional): Path to calibration_params.json. Required
@@ -171,10 +173,6 @@ class Tiler:
         self.min_erosion_area_m2 = min_erosion_area_m2
         self.building_class_val = building_class_val
         self.road_class_val = road_class_val
-        self.grid_size = grid_size
-        self.val_ratio = val_ratio
-        self.class_balance_weight = class_balance_weight
-        self.spatial_weight = spatial_weight
         self.class_ids = class_ids or {
             "background": 0,
             "fore": 1,
@@ -184,11 +182,10 @@ class Tiler:
         }
         if output_format not in ("tar", "csv"):
             raise ValueError(f"output_format must be 'tar' or 'csv', got {output_format!r}")
-        if val_strategy not in ("spatial", "random"):
-            raise ValueError(f"val_strategy must be 'spatial' or 'random', got {val_strategy!r}")
-        self.val_strategy = val_strategy
-        self.val_seed = val_seed
         self.output_format = output_format
+        if split_plan is not None and not Path(split_plan).exists():
+            raise FileNotFoundError(f"split_plan not found: {split_plan}")
+        self.split_plan = load_plan(split_plan) if split_plan else None
         self.apply_dra = apply_dra
         self.dra_cals = None
         if apply_dra:
@@ -214,7 +211,6 @@ class Tiler:
             "failed": 0,
         }
         image_analyses = []
-        global_class_distribution = defaultdict(list)
         tmp_dir = Path(self.output_dir) / self.prefix / "tmp"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         logger.info("Phase 1: Processing images for patch generation")
@@ -265,17 +261,11 @@ class Tiler:
                 image_name,
                 sensor_type,
                 image_analyses,
-                global_class_distribution,
             )
             logger.info(f"Updating class distribution for {image_name}")
             self.manifest.update_class_distribution(
                 image_analyses[-1]["class_distribution"]
             )
-        target_distribution = {
-            cls: np.mean(values) for cls, values in global_class_distribution.items()
-        }
-        # log_memory_usage("Phase 1 End", force_gc=True)
-
         logger.info("Phase 2: Creating output files with pre-determined splits")
         # log_memory_usage("Phase 2 Start", force_gc=True)
 
@@ -293,34 +283,18 @@ class Tiler:
         else:
             self._csv_writers: Dict[str, IO[str]] = {}
 
-        create_val_set = False
+        create_val_set = self.split == "trn"
+        if create_val_set and self.split_plan is None:
+            logger.warning("no split_plan; all patches -> trn")
 
         for analysis in tqdm(image_analyses, desc="Creating WebDataset files"):
             image_name = analysis["image_name"]
-            # memory_before = log_memory_usage(f"Before", image_name, force_gc=True)
             if self.manifest.is_image_completed(image_name):
                 logger.info(
                     f"Skipping already completed image for tiling: {image_name} "
                 )
                 processing_summary["skipped"] += 1
                 continue
-            if self.split == "trn":
-                val_ratio = self.manifest.get_validation_ratio(self.val_ratio)
-                if self.val_strategy == "random":
-                    validation_cells = select_validation_cells_random(
-                        analysis["grid"], val_ratio, seed=self.val_seed
-                    )
-                else:
-                    validation_cells = select_validation_cells(
-                        analysis["grid"],
-                        target_distribution,
-                        val_ratio,
-                        self.class_balance_weight,
-                        self.spatial_weight,
-                    )
-                create_val_set = True
-            else:
-                validation_cells = None
 
             self.manifest.mark_image_in_progress(image_name)
             try:
@@ -328,7 +302,6 @@ class Tiler:
                     analysis["image_path"],
                     analysis["label_path"],
                     analysis,
-                    validation_cells,
                     create_val_set,
                 )
                 self.manifest.mark_image_completed(image_name)
@@ -664,21 +637,9 @@ class Tiler:
         image_name,
         sensor_type,
         image_analyses,
-        global_class_distribution,
     ):
-        """Process class distribution and spatial grid for an image-label pair and store results."""
-        start_time = time.time()
-        class_distribution = calculate_class_distribution(label_path, self.class_ids)
-        class_distribution_time = time.time() - start_time
-        logger.info(
-            f"Class distribution calculated in {class_distribution_time:.2f} seconds"
-        )
-        start_time = time.time()
-        grid = create_spatial_grid(
-            image_path, label_path, self.stride, self.grid_size, self.class_ids
-        )
-        grid_time = time.time() - start_time
-        logger.info(f"Spatial grid created in {grid_time:.2f} seconds")
+        """Record class distribution and paths for an image-label pair."""
+        class_distribution = _class_distribution(label_path, self.class_ids)
         image_analyses.append(
             {
                 "image_path": image_path,
@@ -689,11 +650,8 @@ class Tiler:
                 "image_name": image_name,
                 "sensor_type": sensor_type,
                 "class_distribution": class_distribution,
-                "grid": grid,
             }
         )
-        for cls, value in class_distribution.items():
-            global_class_distribution[cls].append(value)
 
     def _get_or_create_writer(self, prefix, split, output_dir):
         """Get existing writer or create new one."""
@@ -748,7 +706,6 @@ class Tiler:
         image_path: str,
         label_path: str,
         image_analysis: Dict[str, Any],
-        validation_cells: List[str] = None,
         create_val_set: bool = False,
     ):
         try:
@@ -773,10 +730,27 @@ class Tiler:
                     metadata["image_channels"] = image_bands
                     metadata["label_channels"] = label_bands
 
-                    total_patches = image_analysis["grid"]["total_patches"]
-                    grid_size = image_analysis["grid"]["grid_size"]
+                    n_x = (image_width + self.stride - 1) // self.stride
+                    n_y = (image_height + self.stride - 1) // self.stride
+                    total_patches = n_x * n_y
                     image_name = image_analysis["image_name"]
                     label_gdf = image_analysis.get("label_gdf")
+
+                    plan_rects = None
+                    plan_tol = abs(src_image.transform.a)
+                    img_bnds = tuple(src_image.bounds)
+                    if create_val_set and self.split_plan is not None:
+                        plan_rects = val_rects_for_image(
+                            self.split_plan, image_name, src_image.crs
+                        )
+                        if plan_rects is None:
+                            logger.warning(
+                                "%s: not in split plan — all patches -> trn",
+                                image_name,
+                            )
+                            plan_rects = []
+                    elif create_val_set:
+                        plan_rects = []
 
                     self.manifest.update_image_metadata(
                         image_name,
@@ -856,6 +830,18 @@ class Tiler:
                                     height=self.patch_size[0],
                                 )
 
+                                if create_val_set:
+                                    pb = window_bounds(window, src_image.transform)
+                                    split = classify_patch(
+                                        pb, plan_rects, plan_tol, img_bounds=img_bnds
+                                    )
+                                    if split is None:
+                                        discarded_count += 1
+                                        pbar.update(1)
+                                        continue
+                                else:
+                                    split = "tst"
+
                                 # fill_value=0 keeps _filter_patches correct:
                                 # out-of-bounds pixels become background (0), not a
                                 # fake class value that inflates non-zero counts.
@@ -894,18 +880,11 @@ class Tiler:
                                     )
                                     label_patch[0, nodata_mask] = 255
 
-                                if create_val_set:
-                                    grid_x = int(x // (image_width / grid_size))
-                                    grid_y = int(y // (image_height / grid_size))
-                                    cell_id = f"{grid_x}_{grid_y}"
-                                    if cell_id in validation_cells:
-                                        split = "val"
-                                        val_patch_count += 1
-                                    else:
-                                        split = "trn"
-                                        trn_patch_count += 1
+                                if split == "val":
+                                    val_patch_count += 1
+                                elif split == "trn":
+                                    trn_patch_count += 1
                                 else:
-                                    split = "tst"
                                     tst_patch_count += 1
 
                                 patch_key = f"{self.prefix}_{image_name}_{x}_{y}"
