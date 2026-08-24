@@ -15,7 +15,7 @@ python -m geotiff_tiler tile --input_file a.csv -o ./out --split_plan split_plan
 2. **val_plan** — build `split_plan.json` across sensors, before any tiling
 3. **tile** — cut patches (`patch` is an alias)
 
-CSV inputs accept `image`/`image_url` and `label`/`label_path`; extra columns become metadata. JSON is a list of `{image, label, metadata}` dicts.
+CSV inputs require `image`/`image_url`, `label`/`label_path`, and `split` (`trn` or `tst`); extra columns become metadata. JSON is a list of `{image, label, metadata}` dicts with `split` in metadata.
 
 ## Library
 
@@ -26,7 +26,7 @@ tiler = Tiler(
     input_dict=[{
         "image": "./path/to/image.tif",
         "label": "./path/to/label.tif",
-        "metadata": {"collection": "satellite-name", "gsd": 0.5},
+        "metadata": {"split": "trn", "collection": "satellite-name", "gsd": 0.5},
     }],
     patch_size=(256, 256),
     bands_requested=["red", "green", "blue", "nir"],
