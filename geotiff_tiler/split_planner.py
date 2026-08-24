@@ -6,11 +6,9 @@ read-only. Assigned images stay frozen on rerun; only the shortfall is filled.
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
 import math
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -23,15 +21,13 @@ import rasterio.warp
 from rasterio.transform import from_bounds as transform_from_bounds
 from rasterio.windows import from_bounds as window_from_bounds
 
-from geotiff_tiler.utils.io import load_vector_mask
+from geotiff_tiler.lib.io import load_vector_mask
+from geotiff_tiler.lib.pairs import load_pairs
 
 logger = logging.getLogger(__name__)
 
 PLAN_VERSION = 1
 RASTER_EXTS = (".tif", ".tiff")
-_CSV_IMAGE = ("image", "image_url")
-_CSV_LABEL = ("label", "label_path")
-_CSV_SENSOR = ("collection", "sensor")
 
 
 def _now() -> str:
@@ -552,131 +548,19 @@ def classify_patch(
     return None if intersects else "trn"
 
 
-def _col(row: dict, names: tuple[str, ...]):
-    for n in names:
-        if n in row and row[n] is not None:
-            return row[n]
-    return None
-
-
-def _load_pairs(paths: Sequence[str]) -> list[dict]:
-    import pandas as pd
-
+def _planner_pairs(paths: Sequence[str]) -> list[dict]:
     pairs = []
-    for f in paths:
-        p = Path(f)
-        if p.suffix.lower() == ".json":
-            data = json.loads(p.read_text())
-            if not isinstance(data, list):
-                raise ValueError(f"{f}: JSON must be a list of pair dicts")
-            for item in data:
-                meta = item.get("metadata") or {}
-                if str(meta.get("split", "trn")) != "trn":
-                    continue
-                pairs.append(
-                    {
-                        "image": item["image"],
-                        "label": item["label"],
-                        "sensor": str(
-                            meta.get("collection") or meta.get("sensor") or "unknown"
-                        ),
-                    }
-                )
+    for item in load_pairs(*paths, trn_only=True):
+        if not item.get("label"):
             continue
-
-        df = pd.read_csv(p)
-        if "split" in df.columns:
-            df = df[df["split"].astype(str) == "trn"]
-        for rec in df.to_dict(orient="records"):
-            image = _col(rec, _CSV_IMAGE)
-            label = _col(rec, _CSV_LABEL)
-            sensor = _col(rec, _CSV_SENSOR)
-            if image is None or (isinstance(image, float) and pd.isna(image)):
-                raise ValueError(f"{f}: missing image/image_url column")
-            if label is None or (isinstance(label, float) and pd.isna(label)):
-                continue
-            pairs.append(
-                {
-                    "image": image,
-                    "label": label,
-                    "sensor": str(sensor) if sensor is not None else "unknown",
-                }
-            )
+        meta = item.get("metadata") or {}
+        pairs.append(
+            {
+                "image": item["image"],
+                "label": item["label"],
+                "sensor": str(
+                    meta.get("collection") or meta.get("sensor") or "unknown"
+                ),
+            }
+        )
     return pairs
-
-
-def _parse_class_ids(raw: str | None) -> dict:
-    import ast
-
-    if raw is None:
-        raise ValueError("--class_ids is required")
-    parsed = ast.literal_eval(raw)
-    if not isinstance(parsed, dict):
-        raise ValueError("--class_ids must be a dict literal")
-    return parsed
-
-
-def _parse_attr_values(raw: list[str] | None) -> list[int] | None:
-    if raw is None:
-        return None
-    out = []
-    for v in raw:
-        try:
-            out.append(int(v))
-        except ValueError:
-            out.append(v)
-    return out
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="python -m geotiff_tiler.split_planner",
-        description="Build split_plan.json before tiling.",
-    )
-    parser.add_argument(
-        "--input_files",
-        nargs="+",
-        required=True,
-        help="CSV (image/image_url, label/label_path, collection) or JSON pairs",
-    )
-    parser.add_argument("--plan_file", required=True)
-    parser.add_argument("--patch_size", type=int, default=512)
-    parser.add_argument("--stride", type=int, default=256)
-    parser.add_argument("--val_ratio", type=float, default=0.2)
-    parser.add_argument("--cell_strides", type=int, default=4)
-    parser.add_argument("--coarse_factor", type=int, default=4)
-    parser.add_argument("--label_threshold", type=float, default=0.01)
-    parser.add_argument("--attr_field", nargs="+", default=None)
-    parser.add_argument("--attr_values", nargs="+", default=None)
-    parser.add_argument(
-        "--class_ids",
-        required=True,
-        help="Dict literal, e.g. \"{'background': 0, 'fore': 1}\"",
-    )
-    args = parser.parse_args(argv)
-
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    pairs = _load_pairs(args.input_files)
-    logger.info(
-        "Planning split for %d trn images from %d files",
-        len(pairs),
-        len(args.input_files),
-    )
-    run_planner(
-        pairs,
-        args.plan_file,
-        _parse_class_ids(args.class_ids),
-        args.attr_field,
-        _parse_attr_values(args.attr_values),
-        args.patch_size,
-        args.stride,
-        args.val_ratio,
-        args.cell_strides,
-        args.coarse_factor,
-        args.label_threshold,
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
