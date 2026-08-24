@@ -1,15 +1,18 @@
+"""Cut patches from image/label pairs. Last of: verify → val_plan → tile."""
+
+from __future__ import annotations
+
 import gc
 import json
 import logging
 import os
 import shutil
 import time
-import tracemalloc
 from collections import defaultdict
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Any, Dict, List, Tuple
+from typing import IO, Any
 
 import numpy as np
 import psutil
@@ -18,15 +21,13 @@ import webdataset as wds
 from rasterio.windows import Window, bounds as window_bounds
 from tqdm import tqdm
 
-from geotiff_tiler.apply_transform import (
+from geotiff_tiler.lib.dra import (
     apply_dra_to_file,
     load_calibration,
     resolve_sensor,
 )
-from geotiff_tiler.config import logging_config  # noqa: F401
-from geotiff_tiler.split_planner import classify_patch, load_plan, val_rects_for_image
-from geotiff_tiler.tiling_manifest import TilingManifest
-from geotiff_tiler.utils.io import (
+from geotiff_tiler.lib.geo import clip_gdf_to_window, gdf_to_geojson
+from geotiff_tiler.lib.io import (
     calculate_overlap,
     clip_to_intersection,
     ensure_crs_match,
@@ -36,135 +37,80 @@ from geotiff_tiler.utils.io import (
     validate_mask,
     validate_pair,
 )
-from geotiff_tiler.utils.visualization import create_dataset_summary_visualization
-from geotiff_tiler.utils.vector import clip_gdf_to_window, gdf_to_geojson
+from geotiff_tiler.lib.manifest import TilingManifest
+from geotiff_tiler.lib.viz import create_dataset_summary_visualization
+from geotiff_tiler.split_planner import classify_patch, load_plan, val_rects_for_image
 
 logger = logging.getLogger(__name__)
 
-
-def log_memory_usage(stage: str, image_name: str = "", force_gc: bool = True):
-    """Log current memory usage with optional garbage collection."""
-    if force_gc:
-        gc.collect()
-
-    # Process memory
-    process = psutil.Process()
-    memory_info = process.memory_info()
-    memory_mb = memory_info.rss / 1024 / 1024
-
-    # Tracemalloc if available
-    if tracemalloc.is_tracing():
-        current, peak = tracemalloc.get_traced_memory()
-        current_mb = current / 1024 / 1024
-        peak_mb = peak / 1024 / 1024
-        logger.info(
-            f"Memory at {stage} {image_name}: "
-            f"RSS={memory_mb:.1f}MB, "
-            f"Traced={current_mb:.1f}MB, "
-            f"Peak={peak_mb:.1f}MB"
-        )
-    else:
-        logger.info(f"Memory at {stage} {image_name}: RSS={memory_mb:.1f}MB")
-
-    return memory_mb
+_MAX_SHARD = 2 * 1024 * 1024 * 1024
+_SPLITS = ("trn", "val", "tst")
 
 
-def _class_distribution(label_path, class_ids: Dict[str, int]) -> Dict[str, float]:
-    """Foreground-normalized class fractions from a label raster."""
+def _rss_mb() -> float:
+    gc.collect()
+    return psutil.Process().memory_info().rss / 1024 / 1024
+
+
+def _class_distribution(
+    label_path, class_ids: dict[str, int] | None
+) -> dict[str, float]:
+    if not class_ids:
+        return {}
     with rasterio.open(label_path) as src:
         arr = src.read(1).ravel()
-    max_id = max(class_ids.values()) if class_ids else 0
+    max_id = max(class_ids.values())
     counts = np.bincount(arr, minlength=max_id + 1)
-    total = 0
-    class_counts = {}
-    for name, cid in class_ids.items():
-        n = int(counts[cid]) if cid < len(counts) else 0
-        class_counts[name] = n
-        total += n
-    if total == 0:
+    totals = {
+        name: int(counts[cid]) if cid < len(counts) else 0
+        for name, cid in class_ids.items()
+    }
+    n = sum(totals.values())
+    if n == 0:
         return {name: 0.0 for name in class_ids}
-    return {name: n / total for name, n in class_counts.items()}
+    return {name: c / n for name, c in totals.items()}
 
 
 class Tiler:
-    """
-    A class for tiling geospatial images and their corresponding labels into patches.
-    This class handles the process of splitting geospatial images and their corresponding
-    labels (either raster or vector) into smaller patches for machine learning applications.
-    It supports various filtering options, handles coordinate reference system (CRS)
-    mismatches, and ensures proper alignment between images and labels.
-    """
+    """Clip, rasterize labels, and write overlapping patches (tar or csv)."""
 
     def __init__(
         self,
-        input_dict: List[Dict[str, Any]],
-        patch_size: Tuple[int, int],  # (height, width)
-        bands_requested: List[str] = ["red", "green", "blue", "nir"],
-        band_indices: List[int] = None,
-        stride: int = None,
-        attr_field: str = None,
-        attr_values: List[str] = None,
-        erosion_classes: List[str] = None,
-        target_gap_m: float = None,
+        input_dict: list[dict[str, Any]],
+        patch_size: tuple[int, int],
+        bands_requested: list[str] | None = None,
+        band_indices: list[int] | None = None,
+        stride: int | None = None,
+        attr_field=None,
+        attr_values=None,
+        erosion_classes=None,
+        target_gap_m: float | None = None,
         max_gsd_for_erosion: float = 1.0,
         min_erosion_area_m2: float = 4.0,
         building_class_val: int | None = None,
         road_class_val: int | None = None,
-        class_ids: Dict[str, int] = None,
+        class_ids: dict[str, int] | None = None,
         discard_empty: bool = True,
-        label_threshold: float = 0.01,  # minimum of non-zero pixels in a patch to be considered valid (0-1)
+        label_threshold: float = 0.01,
         split: str = "trn",
         prefix: str = "sample",
-        output_dir: str = None,
-        output_format: str = "tar",  # "tar" | "csv"
+        output_dir: str | None = None,
+        output_format: str = "tar",
         split_plan: str | Path | None = None,
         apply_dra: bool = False,
         dra_cal: str | Path | None = None,
     ):
-        """Initialize the Tiler with configuration parameters.
-
-        Args:
-            input_dict (List[Dict[str, Any]]): List of dictionaries containing:
-                - 'image': Path to the image file (str)
-                - 'label': Path to the label file (str)
-                - 'metadata': Dictionary with additional metadata (Dict)
-            patch_size (Tuple[int, int]): Size of patches to create as (height, width).
-            stride (int, optional): Step size between patches. If None, uses max(patch_size).
-            attr_field (str or List[str], optional): Field(s) in vector data containing classification attributes.
-            attr_values (List[str], optional): Values in attr_field to use for classification.
-            erosion_classes (List[str], optional): Classes to erode.
-            target_gap_m (float, optional): Target gap in meters.
-            max_gsd_for_erosion (float, optional): Maximum GSD for erosion.
-            min_erosion_area_m2 (float, optional): Minimum erosion area in square meters.
-            building_class_val (int, optional): Building class value. Defaults to None.
-            road_class_val (int, optional): Road class value. Defaults to None.
-            class_ids (Dict[str, int], optional): Dictionary mapping class names to class IDs.
-            discard_empty (bool, optional): Whether to discard patches with no label data. Defaults to True.
-            label_threshold (float, optional): Minimum ratio of non-zero pixels required in a label patch (0-1).
-                Defaults to 0.01.
-            split (str, optional): Split to use for tiling. Defaults to "trn".
-            prefix (str, optional): Prefix for output files. Defaults to "sample".
-            output_dir (str, optional): Directory where output patches will be saved.
-            output_format (str, optional): Output format — "tar" (WebDataset shards) or
-                "csv" (GeoTIFF patches + CSV index). Defaults to "tar".
-            split_plan (str or Path, optional): Path to split_plan.json from
-                ``python -m geotiff_tiler.split_planner``. Required to emit a
-                val split when ``split='trn'``; omitted → all patches go to trn.
-            apply_dra (bool, optional): If True, gate each clipped scene on EDR and
-                apply the isotonic DRA simulation when contrast_status is draoff.
-            dra_cal (str or Path, optional): Path to calibration_params.json. Required
-                when apply_dra is True.
-        """
+        if output_format not in ("tar", "csv"):
+            raise ValueError(
+                f"output_format must be 'tar' or 'csv', got {output_format!r}"
+            )
+        if output_dir is None:
+            raise ValueError("output_dir is required")
         self.input_dict = input_dict
         self.patch_size = patch_size
-        self.bands_requested = bands_requested
+        self.bands_requested = bands_requested or ["red", "green", "blue", "nir"]
         self.band_indices = band_indices
         self.stride = stride if stride is not None else max(patch_size)
-        self.discard_empty = discard_empty
-        self.label_threshold = label_threshold
-        self.split = split if split in ["trn", "tst"] else "trn"
-        self.output_dir = output_dir
-        self.prefix = prefix
         self.attr_field = attr_field
         self.attr_values = attr_values
         self.erosion_classes = erosion_classes
@@ -173,15 +119,12 @@ class Tiler:
         self.min_erosion_area_m2 = min_erosion_area_m2
         self.building_class_val = building_class_val
         self.road_class_val = road_class_val
-        self.class_ids = class_ids or {
-            "background": 0,
-            "fore": 1,
-            "hydro": 2,
-            "road": 3,
-            "building": 4,
-        }
-        if output_format not in ("tar", "csv"):
-            raise ValueError(f"output_format must be 'tar' or 'csv', got {output_format!r}")
+        self.class_ids = class_ids or {}
+        self.discard_empty = discard_empty
+        self.label_threshold = label_threshold
+        self.split = split if split in ("trn", "tst") else "trn"
+        self.prefix = prefix
+        self.output_dir = output_dir
         self.output_format = output_format
         if split_plan is not None and not Path(split_plan).exists():
             raise FileNotFoundError(f"split_plan not found: {split_plan}")
@@ -193,356 +136,170 @@ class Tiler:
                 raise ValueError("apply_dra=True requires dra_cal path")
             self.dra_cals = load_calibration(dra_cal)
         self.manifest = TilingManifest(output_dir, self.prefix)
+        self.prefix_patch_counts = defaultdict(lambda: {s: 0 for s in _SPLITS})
+        self.prefix_shard_indices = defaultdict(lambda: {s: 0 for s in _SPLITS})
+        self.prefix_shard_sizes = defaultdict(lambda: {s: 0 for s in _SPLITS})
+        self.prefix_writers: dict = {}
+        self._csv_writers: dict[str, IO[str]] = {}
 
-    def create_tiles(self):
-        """Process all input image-label pairs and create tiles.
-
-        This method iterates through all input image-label pairs, performs validation checks,
-        handles CRS mismatches, and generates patches. Results are saved to the specified output_dir.
-
-        Returns:
-            dict: Summary of processing results including successes, failures, and skips.
-        """
-        # tracemalloc.start()
-        processing_summary = {
+    def create_tiles(self) -> dict[str, int]:
+        summary = {
             "total": len(self.input_dict),
             "successful": 0,
             "skipped": 0,
             "failed": 0,
         }
-        image_analyses = []
-        tmp_dir = Path(self.output_dir) / self.prefix / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        logger.info("Phase 1: Processing images for patch generation")
-        # log_memory_usage("Phase 1 Start", force_gc=True)
-        for input_dict in tqdm(self.input_dict, desc="Processing input pairs"):
-            image_path = input_dict["image"]
-            label_path = input_dict["label"]
-            metadata = input_dict["metadata"]
-            image_name = Path(image_path).stem
-            image_tmp_dir = tmp_dir / image_name
-            if image_tmp_dir.exists():
-                shutil.rmtree(image_tmp_dir)
-            else:
-                image_tmp_dir.mkdir()
+        tmp_root = Path(self.output_dir) / self.prefix / "tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        analyses = []
+
+        logger.info("Phase 1: prepare pairs")
+        for item in tqdm(self.input_dict, desc="Processing input pairs"):
+            image_path, label_path = item["image"], item["label"]
+            metadata = dict(item.get("metadata") or {})
+            image_name = Path(str(image_path)).stem
+            image_tmp = tmp_root / image_name
+            if image_tmp.exists():
+                shutil.rmtree(image_tmp)
+            image_tmp.mkdir(parents=True, exist_ok=True)
+
             if self.manifest.is_image_completed(image_name):
-                logger.info(f"Skipping already completed image: {image_name} ")
-                processing_summary["skipped"] += 1
+                logger.info("Skipping already completed image: %s", image_name)
+                summary["skipped"] += 1
                 continue
             self.manifest.mark_image_in_progress(image_name)
             metadata["image_name"] = image_name
             metadata["patch_size"] = self.patch_size
             metadata["stride"] = self.stride
-            sensor_type = metadata.get("collection", "unknown")
-            result = self.process_single_pair(
-                image_path,
-                label_path,
-                image_tmp_dir,
-                collection=metadata.get("collection"),
+
+            result = self._prepare_pair(
+                image_path, label_path, image_tmp, metadata.get("collection")
             )
             if result["status"] != "successful":
-                logger.info(f"Pair {input_dict['image']} - {result['reason']}")
+                logger.info("Pair %s - %s", image_path, result["reason"])
                 self.manifest.mark_image_failed(image_name, result["reason"])
-                processing_summary["failed"] += 1
+                summary["failed"] += 1
                 continue
             if result.get("dra"):
                 metadata["dra"] = result["dra"]
-                self.manifest.update_image_metadata(
-                    image_name, {"dra": result["dra"]}
-                )
-            processing_summary["successful"] += 1
-            logger.info(f"Processing analysis for {image_name}")
-            self.process_analysis(
-                result["image_path"],
-                result["label_path"],
-                result.get("targets_paths", {}),
-                result.get("label_gdf"),
-                metadata,
-                image_name,
-                sensor_type,
-                image_analyses,
+                self.manifest.update_image_metadata(image_name, {"dra": result["dra"]})
+
+            dist = _class_distribution(result["label_path"], self.class_ids)
+            analyses.append(
+                {
+                    "image_path": result["image_path"],
+                    "label_path": result["label_path"],
+                    "targets_paths": result.get("targets_paths") or {},
+                    "label_gdf": result.get("label_gdf"),
+                    "metadata": metadata,
+                    "image_name": image_name,
+                    "class_distribution": dist,
+                }
             )
-            logger.info(f"Updating class distribution for {image_name}")
-            self.manifest.update_class_distribution(
-                image_analyses[-1]["class_distribution"]
-            )
-        logger.info("Phase 2: Creating output files with pre-determined splits")
-        # log_memory_usage("Phase 2 Start", force_gc=True)
+            self.manifest.update_class_distribution(dist)
+            summary["successful"] += 1
 
-        self.prefix_patch_counts = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
-
-        if self.output_format == "tar":
-            self.prefix_shard_indices = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
-            self.prefix_shard_sizes = defaultdict(lambda: {"trn": 0, "val": 0, "tst": 0})
-            for split in ["trn", "val", "tst"]:
-                index, size, count = self.manifest.get_shard_info(self.prefix, split)
-                self.prefix_shard_indices[self.prefix][split] = index
-                self.prefix_shard_sizes[self.prefix][split] = size
-                self.prefix_patch_counts[self.prefix][split] = count
-            self.prefix_writers = {}
-        else:
-            self._csv_writers: Dict[str, IO[str]] = {}
-
+        self._init_writers()
         create_val_set = self.split == "trn"
         if create_val_set and self.split_plan is None:
             logger.warning("no split_plan; all patches -> trn")
 
-        for analysis in tqdm(image_analyses, desc="Creating WebDataset files"):
-            image_name = analysis["image_name"]
-            if self.manifest.is_image_completed(image_name):
-                logger.info(
-                    f"Skipping already completed image for tiling: {image_name} "
-                )
-                processing_summary["skipped"] += 1
+        logger.info("Phase 2: tile")
+        for analysis in tqdm(analyses, desc="Tiling"):
+            name = analysis["image_name"]
+            if self.manifest.is_image_completed(name):
+                summary["skipped"] += 1
                 continue
-
-            self.manifest.mark_image_in_progress(image_name)
+            self.manifest.mark_image_in_progress(name)
             try:
-                self.tiling(
-                    analysis["image_path"],
-                    analysis["label_path"],
-                    analysis,
-                    create_val_set,
-                )
-                self.manifest.mark_image_completed(image_name)
-            # memory_after = log_memory_usage(f"After", image_name, force_gc=True)
-            # logger.info(f"Memory growth: {memory_after - memory_before:.2f}MB")
+                self._tile_image(analysis, create_val_set)
+                self.manifest.mark_image_completed(name)
             except Exception as e:
-                logger.error(f"Error tiling image {image_name}: {e}")
-                self.manifest.mark_image_failed(image_name, str(e))
-                processing_summary["failed"] += 1
+                logger.error("Error tiling image %s: %s", name, e)
+                self.manifest.mark_image_failed(name, str(e))
+                summary["failed"] += 1
             finally:
                 if self.output_format == "tar":
                     self._close_all_writers(flush_only=True)
                 self.manifest.save_manifest()
 
         if self.output_format == "tar":
-            for prefix in list(self.prefix_writers.keys()):
-                for split in list(self.prefix_writers[prefix].keys()):
-                    self._close_writer(prefix, split, flush_only=False)
+            self._close_all_writers(flush_only=False)
         else:
             self._close_all_csv_writers()
         self.manifest.save_manifest()
-        self.create_summary_visualization(
+        create_dataset_summary_visualization(
             self.output_dir, self.prefix, samples_per_split=5
         )
-        logger.info(f"Processing complete. Summary: {processing_summary}")
-        for prefix, counts in self.prefix_patch_counts.items():
-            if self.output_format == "tar":
-                total_sizes = self.manifest.get_total_sizes_by_split()
+        self._export_norm_stats()
+        self._log_finish(summary)
+        if tmp_root.exists():
+            shutil.rmtree(tmp_root)
+        return summary
 
-                def get_shard_count(split_name):
-                    if counts[split_name] > 0:
-                        return self.prefix_shard_indices[prefix][split_name] + 1
-                    else:
-                        return 0
-
-                trn_shards = get_shard_count("trn")
-                val_shards = get_shard_count("val")
-                tst_shards = get_shard_count("tst")
-                logger.info(f"""
-                            Total Stats for prefix: {prefix} \n
-                            Training patches: {counts["trn"]},
-                            Validation patches: {counts["val"]},
-                            Test patches: {counts["tst"]},
-                            Total patches: {sum(counts.values())},
-                            Training size: {total_sizes["trn"] / 1024**2:.2f} MB,
-                            Validation size: {total_sizes["val"] / 1024**2:.2f} MB,
-                            Test size: {total_sizes["tst"] / 1024**2:.2f} MB,
-                            Training shards: {trn_shards},
-                            Validation shards: {val_shards},
-                            Test shards: {tst_shards},
-                            """)
-            else:
-                logger.info(f"""
-                            Total Stats for prefix: {prefix} \n
-                            Training patches: {counts["trn"]},
-                            Validation patches: {counts["val"]},
-                            Test patches: {counts["tst"]},
-                            Total patches: {sum(counts.values())},
-                            """)
-        self.export_normalization_stats()
-        result = self.manifest.validate_manifest_consistency()
-        counts = result["counts"]
-
-        if result["is_consistent"]:
-            logger.info(f"""
-                        Manifest validation: PASSED \n
-                        Images:{counts["from_images"]},
-                        Shards:{counts["from_shards"]},
-                        Stats:{counts["from_statistics"]},
-                        Running:{counts["from_running_stats"]}
-                        """)
-        else:
-            issues_summary = ", ".join(result["issues"])
-            logger.info(f"""
-                        Manifest validation: FAILED ({len(result["issues"])} issues: {issues_summary}) \n
-                        Images:{counts["from_images"]},
-                        Shards:{counts["from_shards"]},
-                        Stats:{counts["from_statistics"]},
-                        Running:{counts["from_running_stats"]}
-                        """)
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
-        return processing_summary
-
-    @log_stage(stage_name="export_normalization_stats", log_memory=True)
-    def export_normalization_stats(self, output_path: str = None):
-        """Export normalization statistics to a JSON file."""
-        if output_path is None:
-            output_path = (
-                Path(self.output_dir)
-                / self.prefix
-                / f"{self.prefix}_normalization_stats.json"
-            )
-
-        try:
-            all_stats = self.manifest.get_all_dataset_statistics()
-
-            stats_with_metadata = {
-                "created_at": datetime.now().isoformat(),
-                "dataset_prefix": self.prefix,
-                "statistics": all_stats,
-            }
-
-            with open(output_path, "w") as f:
-                json.dump(stats_with_metadata, f, indent=2)
-
-            logger.info(f"Normalization statistics saved to {output_path}")
-
-            for prefix, stats in all_stats.items():
-                logger.info(f"\nStatistics for {prefix}:")
-                logger.info(f"  Bands: {stats['band_count']}")
-                logger.info(f"  Patches processed: {stats['patch_count']}")
-                logger.info(f"  Mean: {[f'{m:.4f}' for m in stats['mean']]}")
-                logger.info(f"  Std:  {[f'{s:.4f}' for s in stats['std']]}")
-
-        except Exception as e:
-            logger.error(f"Failed to export normalization statistics: {e}")
-
-    def retry_failed_images(self, max_retries: int = 3) -> Dict[str, Any]:
-        """Retry all failed images from the manifest."""
-        failed_images = self.manifest.failed_images.copy()
-
-        if not failed_images:
+    def retry_failed_images(self, max_retries: int = 3) -> dict[str, int]:
+        failed = dict(self.manifest.failed_images)
+        if not failed:
             logger.info("No failed images to retry")
             return {"total": 0, "successful": 0, "skipped": 0, "failed": 0}
-
-        logger.info(f"Found {len(failed_images)} failed images to retry")
-
-        retry_dict = []
-        for input_item in self.input_dict:
-            image_name = Path(input_item["image"]).stem
-            if image_name in failed_images:
-                retry_dict.append(input_item)
-                logger.info(
-                    f"Queuing {image_name} for retry (previous failure: {failed_images[image_name]})"
-                )
-
-        if not retry_dict:
-            logger.warning(
-                "Failed images not found in input_dict. They may have been removed."
-            )
+        retry = [
+            item
+            for item in self.input_dict
+            if Path(str(item["image"])).stem in failed
+        ]
+        if not retry:
+            logger.warning("Failed images not found in input_dict")
             return {
-                "total": len(failed_images),
+                "total": len(failed),
                 "successful": 0,
                 "skipped": 0,
-                "failed": len(failed_images),
+                "failed": len(failed),
             }
 
-        original_input_dict = self.input_dict
-        self.input_dict = retry_dict
-
-        retry_summary = {
-            "total": len(retry_dict),
-            "successful": 0,
-            "skipped": 0,
-            "failed": 0,
-        }
-
-        for attempt in range(1, max_retries + 1):
-            if not self.input_dict:
-                break
-
-            logger.info(f"\n=== Retry attempt {attempt}/{max_retries} ===")
-
-            result = self.create_tiles()
-
-            retry_summary["successful"] += result["successful"]
-            retry_summary["skipped"] += result["skipped"]
-
-            still_failed = []
-            for input_item in self.input_dict:
-                image_name = Path(input_item["image"]).stem
-                if self.manifest.is_image_failed(image_name):
-                    still_failed.append(input_item)
-
-            self.input_dict = still_failed
-
-            if not still_failed:
-                logger.info(
-                    f"All images processed successfully after {attempt} attempt(s)"
-                )
-                break
-
-            logger.info(
-                f"{len(still_failed)} images still failing after attempt {attempt}"
-            )
-
-            if attempt < max_retries:
-                wait_time = min(2**attempt, 30)
-                logger.info(f"Waiting {wait_time} seconds before next retry...")
-                time.sleep(wait_time)
-
-        retry_summary["failed"] = len(self.input_dict)
-
-        self.input_dict = original_input_dict
-
-        logger.info("\n=== Retry Summary ===")
-        logger.info(f"Total images retried: {retry_summary['total']}")
-        logger.info(f"Successfully processed: {retry_summary['successful']}")
-        logger.info(f"Skipped: {retry_summary['skipped']}")
-        logger.info(f"Still failing: {retry_summary['failed']}")
-
-        if retry_summary["failed"] > 0:
-            logger.warning(
-                "The following images are still failing after all retry attempts:"
-            )
-            for input_item in self.input_dict:
-                image_name = Path(input_item["image"]).stem
-                reason = self.manifest.failed_images.get(image_name, "Unknown reason")
-                logger.warning(f"  - {image_name}: {reason}")
-
-        return retry_summary
-
-    @log_stage(stage_name="create_summary_visualization", log_memory=True)
-    def create_summary_visualization(self, output_dir, prefix, samples_per_split=5):
-        create_dataset_summary_visualization(
-            output_dir, prefix, samples_per_split=samples_per_split
-        )
+        original, self.input_dict = self.input_dict, retry
+        totals = {"total": len(retry), "successful": 0, "skipped": 0, "failed": 0}
+        try:
+            for attempt in range(1, max_retries + 1):
+                if not self.input_dict:
+                    break
+                logger.info("Retry attempt %d/%d", attempt, max_retries)
+                result = self.create_tiles()
+                totals["successful"] += result["successful"]
+                totals["skipped"] += result["skipped"]
+                still = [
+                    item
+                    for item in self.input_dict
+                    if self.manifest.is_image_failed(Path(str(item["image"])).stem)
+                ]
+                self.input_dict = still
+                if not still:
+                    break
+                if attempt < max_retries:
+                    time.sleep(min(2**attempt, 30))
+            totals["failed"] = len(self.input_dict)
+        finally:
+            self.input_dict = original
+        return totals
 
     @log_stage(stage_name="process_single_pair", log_memory=True)
-    def process_single_pair(self, image_path, label_path, tmp_dir, collection=None):
-        """Process a single image-label pair and return the result status."""
-        image_name = Path(image_path).stem
+    def _prepare_pair(self, image_path, label_path, tmp_dir, collection=None):
+        image_name = Path(str(image_path)).stem
         try:
             image_path = validate_image(
                 image_path, self.bands_requested, self.band_indices
             )
             label_path, label_type = validate_mask(label_path)
-            validation_result = validate_pair(image_path, label_path, label_type)
-            if not validation_result["valid"]:
-                return {"status": "skipped", "reason": validation_result["reason"]}
-            special_case = validation_result.get("special_case", False)
-            if special_case:
+            check = validate_pair(image_path, label_path, label_type)
+            if not check["valid"]:
+                return {"status": "skipped", "reason": check["reason"]}
+            if check.get("special_case"):
                 return {
                     "image_path": str(image_path),
                     "label_path": str(label_path),
                     "status": "successful",
-                    "reason": validation_result["reason"],
+                    "reason": check["reason"],
                 }
 
-            # Standard processing: CRS, overlap, intersection
             image_path, label_path = ensure_crs_match(
                 image_path, label_path, label_type, tmp_dir
             )
@@ -551,22 +308,24 @@ class Tiler:
             )
             if overlap_pct == 0:
                 return {"status": "skipped", "reason": f"No overlap: {overlap_msg}"}
-            logger.info(f"Image: {image_name} with {overlap_msg}")
-            clipped_image_path, clipped_label_path = clip_to_intersection(
+            logger.info(
+                "Image: %s with %s (rss=%.0fMB)", image_name, overlap_msg, _rss_mb()
+            )
+            clipped_image, clipped_label = clip_to_intersection(
                 image_path, label_path, label_type, tmp_dir
             )
-            log_memory_usage("After clip_to_intersection", force_gc=True)
-            if clipped_image_path is None and clipped_label_path is None:
+            if clipped_image is None and clipped_label is None:
                 return {
                     "status": "skipped",
                     "reason": "No intersection between image and label",
                 }
-            targets_paths = {}
+
+            targets_paths: dict = {}
             label_gdf = None
             if label_type == "vector":
-                clipped_label_path, targets_paths, label_gdf = prepare_vector_labels(
-                    clipped_label_path,
-                    clipped_image_path,
+                clipped_label, targets_paths, label_gdf = prepare_vector_labels(
+                    clipped_label,
+                    clipped_image,
                     tmp_dir,
                     self.attr_field,
                     self.attr_values,
@@ -580,35 +339,29 @@ class Tiler:
 
             dra = None
             if self.apply_dra:
-                clipped_image_path, dra = self._apply_dra(
-                    clipped_image_path, tmp_dir, image_name, collection
+                clipped_image, dra = self._apply_dra(
+                    clipped_image, tmp_dir, image_name, collection
                 )
-
-            result = {
-                "image_path": str(clipped_image_path),
-                "label_path": str(clipped_label_path),
+            out = {
+                "image_path": str(clipped_image),
+                "label_path": str(clipped_label),
                 "targets_paths": targets_paths,
-                # label_gdf kept only for CSV mode (pixel-space GeoJSON export)
                 "label_gdf": label_gdf,
                 "status": "successful",
                 "reason": "Processed successfully",
             }
             if dra is not None:
-                result["dra"] = dra
-            return result
+                out["dra"] = dra
+            return out
         except Exception as e:
-            logger.error(f"Error processing image {image_name}: {e}")
+            logger.error("Error processing image %s: %s", image_name, e)
             return {"status": "failed", "reason": str(e)}
 
     def _apply_dra(self, image_path, tmp_dir, image_name, collection):
-        """Gate + apply DRA on the clipped scene. Returns (path, decision dict)."""
         sensor = resolve_sensor(collection)
         if sensor is None or sensor not in self.dra_cals:
             logger.warning(
-                "%s: no DRA calibration for sensor %r (collection=%r) — skipping",
-                image_name,
-                sensor,
-                collection,
+                "%s: no DRA calibration for sensor %r — skipping", image_name, sensor
             )
             return image_path, {
                 "scene_id": image_name,
@@ -619,515 +372,383 @@ class Tiler:
                 "reason": "no calibration for sensor",
             }
         new_path, decision = apply_dra_to_file(
-            image_path,
-            self.dra_cals[sensor],
-            scene_id=image_name,
-            tmp_dir=tmp_dir,
+            image_path, self.dra_cals[sensor], scene_id=image_name, tmp_dir=tmp_dir
         )
         return new_path, asdict(decision)
 
-    @log_stage(stage_name="process_analysis", log_memory=True)
-    def process_analysis(
-        self,
-        image_path,
-        label_path,
-        targets_paths,
-        label_gdf,
-        metadata,
-        image_name,
-        sensor_type,
-        image_analyses,
-    ):
-        """Record class distribution and paths for an image-label pair."""
-        class_distribution = _class_distribution(label_path, self.class_ids)
-        image_analyses.append(
-            {
-                "image_path": image_path,
-                "label_path": label_path,
-                "targets_paths": targets_paths or {},
-                "label_gdf": label_gdf,
-                "metadata": metadata,
-                "image_name": image_name,
-                "sensor_type": sensor_type,
-                "class_distribution": class_distribution,
-            }
-        )
-
-    def _get_or_create_writer(self, prefix, split, output_dir):
-        """Get existing writer or create new one."""
-        if prefix not in self.prefix_writers:
-            self.prefix_writers[prefix] = {}
-
-        if split not in self.prefix_writers[prefix]:
-            shard_idx = self.prefix_shard_indices[prefix][split]
-            shard_path = self._get_shard_path(output_dir, prefix, split, shard_idx)
-            file_obj = open(shard_path, "wb")
-            writer = wds.TarWriter(file_obj)
-            self.prefix_writers[prefix][split] = {
-                "writer": writer,
-                "file_obj": file_obj,
-                "path": shard_path,
-                "start_size": 0,
-            }
-
-        return self.prefix_writers[prefix][split]["writer"]
-
-    def _close_writer(self, prefix, split, flush_only=False):
-        """Close or flush a specific writer"""
-        if (
-            prefix not in self.prefix_writers
-            or split not in self.prefix_writers[prefix]
-        ):
-            return
-        writer_info = self.prefix_writers[prefix][split]
-        writer = writer_info["writer"]
-        file_obj = writer_info["file_obj"]
-
-        if flush_only:
-            if hasattr(writer, "tarfile") and hasattr(writer.tarfile, "fileobj"):
-                writer.tarfile.fileobj.flush()
-                os.fsync(writer.tarfile.fileobj.fileno())
+    def _init_writers(self) -> None:
+        self.prefix_patch_counts = defaultdict(lambda: {s: 0 for s in _SPLITS})
+        if self.output_format == "tar":
+            self.prefix_shard_indices = defaultdict(lambda: {s: 0 for s in _SPLITS})
+            self.prefix_shard_sizes = defaultdict(lambda: {s: 0 for s in _SPLITS})
+            for split in _SPLITS:
+                idx, size, count = self.manifest.get_shard_info(self.prefix, split)
+                self.prefix_shard_indices[self.prefix][split] = idx
+                self.prefix_shard_sizes[self.prefix][split] = size
+                self.prefix_patch_counts[self.prefix][split] = count
+            self.prefix_writers = {}
         else:
-            writer.close()
-            file_obj.close()
-            del self.prefix_writers[prefix][split]
-
-    def _close_all_writers(self, flush_only=False):
-        """Close or flush all writers"""
-        for prefix in list(self.prefix_writers.keys()):
-            for split in list(self.prefix_writers[prefix].keys()):
-                self._close_writer(prefix, split, flush_only)
-        if not flush_only:
-            self.prefix_writers.clear()
+            self._csv_writers = {}
 
     @log_stage(stage_name="tiling", log_memory=True)
-    def tiling(
-        self,
-        image_path: str,
-        label_path: str,
-        image_analysis: Dict[str, Any],
-        create_val_set: bool = False,
-    ):
+    def _tile_image(self, analysis: dict[str, Any], create_val_set: bool) -> None:
+        image_path, label_path = analysis["image_path"], analysis["label_path"]
+        image_name = analysis["image_name"]
+        metadata = analysis["metadata"]
+        label_gdf = analysis.get("label_gdf")
+        target_srcs: dict = {}
+        t0 = time.time()
         try:
-            with rasterio.open(image_path) as src_image:
-                with rasterio.open(label_path) as src_label:
-                    image_width = src_image.width
-                    image_height = src_image.height
-                    image_bands = src_image.count
+            with rasterio.open(image_path) as src_image, rasterio.open(
+                label_path
+            ) as src_label:
+                w, h, n_bands = src_image.width, src_image.height, src_image.count
+                if (w, h) != (src_label.width, src_label.height):
+                    raise ValueError("Image and label dimensions must match")
+                if self.patch_size[0] > h or self.patch_size[1] > w:
+                    raise ValueError("Patch size must be smaller than image dimensions")
 
-                    label_width = src_label.width
-                    label_height = src_label.height
-                    label_bands = src_label.count
-                    assert (
-                        image_width == label_width and image_height == label_height
-                    ), "Image and label dimensions must match"
-                    assert (
-                        self.patch_size[0] <= image_height
-                        and self.patch_size[1] <= image_width
-                    ), "Patch size must be smaller than image dimensions"
+                metadata["image_channels"] = n_bands
+                metadata["label_channels"] = src_label.count
+                n_x = (w + self.stride - 1) // self.stride
+                n_y = (h + self.stride - 1) // self.stride
+                total = n_x * n_y
 
-                    metadata = image_analysis["metadata"]
-                    metadata["image_channels"] = image_bands
-                    metadata["label_channels"] = label_bands
-
-                    n_x = (image_width + self.stride - 1) // self.stride
-                    n_y = (image_height + self.stride - 1) // self.stride
-                    total_patches = n_x * n_y
-                    image_name = image_analysis["image_name"]
-                    label_gdf = image_analysis.get("label_gdf")
-
-                    plan_rects = None
-                    plan_tol = abs(src_image.transform.a)
-                    img_bnds = tuple(src_image.bounds)
-                    if create_val_set and self.split_plan is not None:
-                        plan_rects = val_rects_for_image(
-                            self.split_plan, image_name, src_image.crs
-                        )
-                        if plan_rects is None:
-                            logger.warning(
-                                "%s: not in split plan — all patches -> trn",
-                                image_name,
-                            )
-                            plan_rects = []
-                    elif create_val_set:
-                        plan_rects = []
-
-                    self.manifest.update_image_metadata(
-                        image_name,
-                        {
-                            "path": image_path,
-                            "label_path": label_path,
-                            "metadata": metadata,
-                            "sensor_type": metadata.get("collection", "unknown"),
-                            "class_distribution": image_analysis.get(
-                                "class_distribution", {}
-                            ),
-                        },
+                plan_rects: list = []
+                plan_tol = abs(src_image.transform.a)
+                img_bnds = tuple(src_image.bounds)
+                if create_val_set and self.split_plan is not None:
+                    rects = val_rects_for_image(
+                        self.split_plan, image_name, src_image.crs
                     )
-                    if create_val_set:
-                        output_train_dir = Path(self.output_dir) / self.prefix / "trn"
-                        output_val_dir = Path(self.output_dir) / self.prefix / "val"
-                        output_train_dir.mkdir(parents=True, exist_ok=True)
-                        output_val_dir.mkdir(parents=True, exist_ok=True)
+                    if rects is None:
+                        logger.warning(
+                            "%s: not in split plan — all patches -> trn", image_name
+                        )
                     else:
-                        output_tst_dir = Path(self.output_dir) / self.prefix / "tst"
-                        output_tst_dir.mkdir(parents=True, exist_ok=True)
+                        plan_rects = rects
 
-                    logger.info(
-                        f"Tiling {image_height} x {image_width} x {image_bands} "
-                        f"image with patch size {self.patch_size} and stride {self.stride}"
-                    )
+                self.manifest.update_image_metadata(
+                    image_name,
+                    {
+                        "path": image_path,
+                        "label_path": label_path,
+                        "metadata": metadata,
+                        "sensor_type": metadata.get("collection", "unknown"),
+                        "class_distribution": analysis.get("class_distribution", {}),
+                    },
+                )
+                out_root = Path(self.output_dir) / self.prefix
+                splits = ("trn", "val") if create_val_set else ("tst",)
+                for s in splits:
+                    (out_root / s).mkdir(parents=True, exist_ok=True)
 
-                    if self.output_format == "tar" and not hasattr(self, "prefix_shard_indices"):
-                        self.prefix_shard_indices = defaultdict(
-                            lambda: {"trn": 0, "val": 0, "tst": 0}
-                        )
-                        self.prefix_shard_sizes = defaultdict(
-                            lambda: {"trn": 0, "val": 0, "tst": 0}
-                        )
-                        self.prefix_writers = {}
-                        self.prefix_patch_counts = defaultdict(
-                            lambda: {"trn": 0, "val": 0, "tst": 0}
-                        )
-                    elif self.output_format == "csv" and not hasattr(self, "_csv_writers"):
-                        self._csv_writers = {}
+                logger.info(
+                    "Tiling %d x %d x %d  patch=%s stride=%s",
+                    h, w, n_bands, self.patch_size, self.stride,
+                )
+                nodata = src_image.nodata
+                for k, v in analysis.get("targets_paths", {}).items():
+                    p = Path(v)
+                    if p.exists():
+                        try:
+                            target_srcs[k] = rasterio.open(v)
+                        except Exception as e:
+                            logger.warning("could not open target %s at %s: %s", k, v, e)
+                    else:
+                        logger.warning("target file missing: %s → %s", k, v)
 
-                    MAX_SHARD_SIZE_BYTES = 2 * 1024 * 1024 * 1024  # 2GB
-                    discarded_count = 0
-                    patch_count = 0
-                    trn_patch_count = 0
-                    val_patch_count = 0
-                    tst_patch_count = 0
-                    start_time = time.time()
-                    image_nodata = src_image.nodata
-                    target_srcs = {}
-                    for k, v in image_analysis.get("targets_paths", {}).items():
-                        p = Path(v)
-                        if p.exists():
-                            try:
-                                target_srcs[k] = rasterio.open(v)
-                            except Exception as e:
-                                logger.warning(
-                                    f"[tiling] could not open target {k} at {v}: {e}"
+                discarded = kept = trn_n = val_n = tst_n = 0
+                with tqdm(total=total, desc="Tiling patches") as pbar:
+                    for y in range(0, h, self.stride):
+                        for x in range(0, w, self.stride):
+                            if self.manifest.is_patch_completed(image_name, x, y):
+                                kept += 1
+                                pbar.update(1)
+                                continue
+                            window = Window(
+                                col_off=x,
+                                row_off=y,
+                                width=self.patch_size[1],
+                                height=self.patch_size[0],
+                            )
+                            if create_val_set:
+                                split = classify_patch(
+                                    window_bounds(window, src_image.transform),
+                                    plan_rects,
+                                    plan_tol,
+                                    img_bounds=img_bnds,
                                 )
-                        else:
-                            logger.warning(f"[tiling] target file missing: {k} → {v}")
-                    with tqdm(total=total_patches, desc="Tiling patches") as pbar:
-                        for y in range(0, image_height, self.stride):
-                            for x in range(0, image_width, self.stride):
-                                if self.manifest.is_patch_completed(image_name, x, y):
-                                    patch_count += 1
+                                if split is None:
+                                    discarded += 1
                                     pbar.update(1)
                                     continue
+                            else:
+                                split = "tst"
 
-                                # Always request full patch_size; boundless=True fills
-                                # out-of-bounds pixels with fill_value instead of
-                                # returning a smaller array at image borders.
-                                window = Window(
-                                    col_off=x,
-                                    row_off=y,
-                                    width=self.patch_size[1],
-                                    height=self.patch_size[0],
+                            label_patch = src_label.read(
+                                window=window, boundless=True, fill_value=0
+                            )
+                            if not self._keep_patch(label_patch):
+                                discarded += 1
+                                continue
+
+                            fill = nodata if nodata is not None else 0
+                            image_patch = src_image.read(
+                                window=window, boundless=True, fill_value=fill
+                            )
+                            targets_patches = {
+                                k: src.read(
+                                    1, window=window, boundless=True, fill_value=0
                                 )
+                                for k, src in target_srcs.items()
+                            }
+                            if nodata is not None:
+                                label_patch[0, np.all(image_patch == nodata, axis=0)] = 255
 
-                                if create_val_set:
-                                    pb = window_bounds(window, src_image.transform)
-                                    split = classify_patch(
-                                        pb, plan_rects, plan_tol, img_bounds=img_bnds
+                            if split == "val":
+                                val_n += 1
+                            elif split == "trn":
+                                trn_n += 1
+                            else:
+                                tst_n += 1
+
+                            patch_key = f"{self.prefix}_{image_name}_{x}_{y}"
+                            all_metadata = {
+                                "patch_metadata": {
+                                    "patch_id": patch_key,
+                                    "pixel_coordinates": [x, y],
+                                    "patch_size": self.patch_size,
+                                    "stride": self.stride,
+                                    "split": split,
+                                    "image_dtype": src_image.dtypes[0],
+                                    "label_dtype": src_label.dtypes[0],
+                                    "image_name": image_name,
+                                    "sensor_type": metadata.get("collection", "unknown"),
+                                },
+                                "metadata": metadata,
+                            }
+                            if split == "trn":
+                                try:
+                                    self.manifest.update_running_statistics(
+                                        self.prefix, image_patch
                                     )
-                                    if split is None:
-                                        discarded_count += 1
-                                        pbar.update(1)
-                                        continue
-                                else:
-                                    split = "tst"
+                                except Exception as e:
+                                    logger.error("Error updating running statistics: %s", e)
 
-                                # fill_value=0 keeps _filter_patches correct:
-                                # out-of-bounds pixels become background (0), not a
-                                # fake class value that inflates non-zero counts.
-                                label_patch = src_label.read(
-                                    window=window, boundless=True, fill_value=0
+                            geojson_str = None
+                            if label_gdf is not None and not label_gdf.empty:
+                                try:
+                                    patch_gdf = clip_gdf_to_window(
+                                        label_gdf, window, src_image.transform
+                                    )
+                                    geojson_str = gdf_to_geojson(
+                                        patch_gdf, window, src_image.transform
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        "GeoJSON generation failed for %s: %s",
+                                        patch_key,
+                                        e,
+                                    )
+
+                            if self.output_format == "tar":
+                                self._write_tar(
+                                    split,
+                                    patch_key,
+                                    image_patch,
+                                    label_patch,
+                                    targets_patches,
+                                    all_metadata,
+                                    geojson_str,
+                                    image_name,
+                                    out_root / split,
                                 )
-                                if not self._filter_patches(label_patch):
-                                    discarded_count += 1
-                                    continue
-
-                                # Use the raster's nodata as fill so we can identify
-                                # out-of-bounds pixels precisely.  Fall back to 0 only
-                                # when nodata is not defined (avoids masking valid dark
-                                # pixels when nodata is unset).
-                                nodata_fill = (
-                                    image_nodata if image_nodata is not None else 0
+                            else:
+                                self._write_csv_row(
+                                    split,
+                                    patch_key,
+                                    image_patch,
+                                    label_patch,
+                                    targets_patches,
+                                    src_image,
+                                    src_label,
+                                    out_root,
+                                    window,
+                                    geojson_str,
                                 )
-                                image_patch = src_image.read(
-                                    window=window,
-                                    boundless=True,
-                                    fill_value=nodata_fill,
-                                )
-                                targets_patches = {
-                                    k: src.read(
-                                        1, window=window, boundless=True, fill_value=0
-                                    )
-                                    for k, src in target_srcs.items()
-                                }
+                            self.manifest.mark_patch_completed(image_name, x, y)
+                            self.prefix_patch_counts[self.prefix][split] += 1
+                            if kept % 100 == 0:
+                                self.manifest.save_manifest()
+                            kept += 1
+                            pbar.update(1)
 
-                                # Mark border fill and any in-image nodata pixels as
-                                # ignore (255) in the label so the model computes no
-                                # loss on them — matches the old pipeline's mask_nodata.
-                                if image_nodata is not None:
-                                    nodata_mask = np.all(
-                                        image_patch == image_nodata, axis=0
-                                    )
-                                    label_patch[0, nodata_mask] = 255
-
-                                if split == "val":
-                                    val_patch_count += 1
-                                elif split == "trn":
-                                    trn_patch_count += 1
-                                else:
-                                    tst_patch_count += 1
-
-                                patch_key = f"{self.prefix}_{image_name}_{x}_{y}"
-
-                                all_metadata = {
-                                    "patch_metadata": {
-                                        "patch_id": patch_key,
-                                        "pixel_coordinates": [x, y],
-                                        "patch_size": self.patch_size,
-                                        "stride": self.stride,
-                                        "split": split,
-                                        "image_dtype": src_image.dtypes[0],
-                                        "label_dtype": src_label.dtypes[0],
-                                        "image_name": image_name,
-                                        "sensor_type": metadata.get(
-                                            "collection", "unknown"
-                                        ),
-                                    },
-                                    "metadata": metadata,
-                                }
-                                if split == "trn":
-                                    try:
-                                        self.manifest.update_running_statistics(
-                                            self.prefix, image_patch
-                                        )
-                                    except Exception as e:
-                                        logger.error(
-                                            f"Error updating running statistics: {e}"
-                                        )
-
-                                # Geographic-CRS GeoJSON — generated once, consumed by
-                                # both tar and csv branches.
-                                if label_gdf is not None and not label_gdf.empty:
-                                    try:
-                                        patch_gdf = clip_gdf_to_window(
-                                            label_gdf, window, src_image.transform
-                                        )
-                                        geojson_str = gdf_to_geojson(
-                                            patch_gdf, window, src_image.transform
-                                        )
-                                    except Exception as e:
-                                        logger.warning(
-                                            f"GeoJSON generation failed for patch "
-                                            f"{patch_key}: {e}"
-                                        )
-                                        geojson_str = None
-                                else:
-                                    geojson_str = None
-
-                                if self.output_format == "tar":
-                                    current_shard_size = self._get_actual_shard_size(
-                                        self.prefix, split
-                                    )
-                                    estimated_patch_size = self._estimate_patch_size(
-                                        image_patch, label_patch, all_metadata
-                                    )
-                                    if (
-                                        current_shard_size + estimated_patch_size
-                                        > MAX_SHARD_SIZE_BYTES
-                                    ):
-                                        self._close_writer(self.prefix, split)
-                                        self.manifest.close_shard(
-                                            self.prefix,
-                                            split,
-                                            self.prefix_shard_indices[self.prefix][split],
-                                        )
-                                        self.prefix_shard_indices[self.prefix][split] += 1
-                                        self.manifest.update_shard_record(
-                                            self.prefix,
-                                            split,
-                                            self.prefix_shard_indices[self.prefix][split],
-                                            0,
-                                            0,
-                                            "OPEN",
-                                            [image_name],
-                                        )
-                                        logger.debug(
-                                            f"Rotating to new {split} shard index: "
-                                            f"{self.prefix_shard_indices[self.prefix][split]}"
-                                        )
-                                        self.prefix_shard_sizes[self.prefix][split] = 0
-
-                                    if split == "trn":
-                                        writer = self._get_or_create_writer(
-                                            self.prefix, split, output_train_dir
-                                        )
-                                    elif split == "val":
-                                        writer = self._get_or_create_writer(
-                                            self.prefix, split, output_val_dir
-                                        )
-                                    else:
-                                        writer = self._get_or_create_writer(
-                                            self.prefix, split, output_tst_dir
-                                        )
-                                    sample = {
-                                        "__key__": patch_key,
-                                        "image_patch.npy": image_patch,
-                                        "label_patch.npy": label_patch,
-                                        "metadata.json": all_metadata,
-                                    }
-                                    sample.update(
-                                        {
-                                            f"{k}.npy": v
-                                            for k, v in targets_patches.items()
-                                        }
-                                    )
-                                    if geojson_str is not None:
-                                        sample["vectors.geojson"] = geojson_str.encode("utf-8")
-                                    writer.write(sample)
-                                    actual_size = self._get_actual_shard_size(
-                                        self.prefix, split
-                                    )
-                                    self.prefix_shard_sizes[self.prefix][split] = actual_size
-                                    self.manifest.mark_patch_completed(image_name, x, y)
-                                    self.prefix_patch_counts[self.prefix][split] += 1
-                                    self.manifest.update_shard_info(
-                                        self.prefix,
-                                        split,
-                                        self.prefix_shard_indices[self.prefix][split],
-                                        self.prefix_shard_sizes[self.prefix][split],
-                                        self.prefix_patch_counts[self.prefix][split],
-                                    )
-                                    self.manifest.update_image_patch_info(
-                                        image_name,
-                                        split,
-                                        self.prefix_shard_indices[self.prefix][split],
-                                    )
-                                else:  # csv
-                                    output_root = Path(self.output_dir) / self.prefix
-                                    rel_img, rel_lbl, rel_targets, rel_vector = (
-                                        self._write_patch_as_geotiff(
-                                            image_patch,
-                                            label_patch,
-                                            targets_patches,
-                                            patch_key,
-                                            split,
-                                            src_image,
-                                            src_label,
-                                            output_root,
-                                            window=window,
-                                            geojson_str=geojson_str,
-                                        )
-                                    )
-                                    csv_writer = self._get_or_create_csv_writer(
-                                        split, output_root
-                                    )
-                                    target_cols = "".join(
-                                        f";{p}" for p in rel_targets.values()
-                                    )
-                                    vector_col = f";{rel_vector}" if rel_vector else ""
-                                    csv_writer.write(
-                                        f"{rel_img};{rel_lbl}{target_cols}{vector_col}\n"
-                                    )
-                                    self.manifest.mark_patch_completed(image_name, x, y)
-                                    self.prefix_patch_counts[self.prefix][split] += 1
-                                if patch_count % 100 == 0:
-                                    self.manifest.save_manifest()
-                                patch_count += 1
-                                pbar.update(1)
-                    logger.info(f"""
-                                Tiling Complete for {image_name}!
-                                Training patches: {trn_patch_count}
-                                Validation patches: {val_patch_count}
-                                Test patches: {tst_patch_count}
-                                ------------------------------
-                                Extracted patches: {patch_count}
-                                Discarded patches: {discarded_count}
-                                Total patches: {total_patches}
-                                """)
-        except Exception as e:
-            self.manifest.save_manifest()
-            logger.error(f"Tiling failed: {e}")
+                logger.info(
+                    "%s done  trn=%d val=%d tst=%d kept=%d discarded=%d total=%d (%.1fs)",
+                    image_name, trn_n, val_n, tst_n, kept, discarded, total,
+                    time.time() - t0,
+                )
         finally:
             for src in target_srcs.values():
                 try:
                     src.close()
                 except Exception:
                     pass
-            target_srcs.clear()
-            image_name = image_analysis["image_name"]
-            image_tmp_dir = Path(self.output_dir) / self.prefix / "tmp" / image_name
-            if image_tmp_dir.exists() and image_tmp_dir.is_dir():
-                logger.info(f"Removing temporary directory: {image_tmp_dir}")
-                shutil.rmtree(image_tmp_dir)
-            end_time = time.time()
-            logger.info(f"Tiling time: {end_time - start_time:.2f} seconds")
+            image_tmp = Path(self.output_dir) / self.prefix / "tmp" / image_name
+            if image_tmp.is_dir():
+                shutil.rmtree(image_tmp)
 
-    def _filter_patches(self, label: np.ndarray) -> bool:
-        """Filters patches based on the discard_empty flag and label_threshold."""
+    def _write_tar(
+        self,
+        split,
+        patch_key,
+        image_patch,
+        label_patch,
+        targets_patches,
+        all_metadata,
+        geojson_str,
+        image_name,
+        split_dir: Path,
+    ) -> None:
+        est = (
+            image_patch.nbytes
+            + label_patch.nbytes
+            + len(json.dumps(all_metadata).encode())
+        )
+        if self._shard_size(split) + est > _MAX_SHARD:
+            self._close_writer(self.prefix, split)
+            idx = self.prefix_shard_indices[self.prefix][split]
+            self.manifest.close_shard(self.prefix, split, idx)
+            self.prefix_shard_indices[self.prefix][split] = idx + 1
+            self.manifest.update_shard_record(
+                self.prefix, split, idx + 1, 0, 0, "OPEN", [image_name]
+            )
+            self.prefix_shard_sizes[self.prefix][split] = 0
+
+        writer = self._get_writer(split, split_dir)
+        sample = {
+            "__key__": patch_key,
+            "image_patch.npy": image_patch,
+            "label_patch.npy": label_patch,
+            "metadata.json": all_metadata,
+        }
+        sample.update({f"{k}.npy": v for k, v in targets_patches.items()})
+        if geojson_str is not None:
+            sample["vectors.geojson"] = geojson_str.encode("utf-8")
+        writer.write(sample)
+        size = self._shard_size(split)
+        self.prefix_shard_sizes[self.prefix][split] = size
+        idx = self.prefix_shard_indices[self.prefix][split]
+        self.manifest.update_shard_info(
+            self.prefix,
+            split,
+            idx,
+            size,
+            self.prefix_patch_counts[self.prefix][split] + 1,
+        )
+        self.manifest.update_image_patch_info(image_name, split, idx)
+
+    def _write_csv_row(
+        self,
+        split,
+        patch_key,
+        image_patch,
+        label_patch,
+        targets_patches,
+        src_image,
+        src_label,
+        output_root: Path,
+        window,
+        geojson_str,
+    ) -> None:
+        rel_img, rel_lbl, rel_targets, rel_vector = self._write_geotiff(
+            image_patch,
+            label_patch,
+            targets_patches,
+            patch_key,
+            split,
+            src_image,
+            src_label,
+            output_root,
+            window,
+            geojson_str,
+        )
+        extra = "".join(f";{p}" for p in rel_targets.values())
+        vec = f";{rel_vector}" if rel_vector else ""
+        self._get_csv_writer(split, output_root).write(
+            f"{rel_img};{rel_lbl}{extra}{vec}\n"
+        )
+
+    def _keep_patch(self, label: np.ndarray) -> bool:
         if label.size == 0:
-            logger.debug("Patch discarded: invalid shape or empty")
             return False
-        nonzero_count = np.count_nonzero(label)
-        if self.discard_empty and nonzero_count == 0:
-            logger.debug("Patch discarded: all label values are 0")
+        nz = np.count_nonzero(label)
+        if self.discard_empty and nz == 0:
             return False
-        if self.label_threshold is not None:
-            label_coverage = nonzero_count / label.size
-            if label_coverage < self.label_threshold:
-                logger.debug(
-                    f"Patch discarded: label coverage {label_coverage:.2f} < {self.label_threshold}"
-                )
-                return False
+        if self.label_threshold is not None and nz / label.size < self.label_threshold:
+            return False
         return True
 
-    def _get_shard_path(self, base_path, prefix, split, idx):
-        return os.path.join(base_path, f"{prefix}-{split}-{idx:06d}.tar")
+    def _shard_path(self, base, prefix, split, idx):
+        return os.path.join(base, f"{prefix}-{split}-{idx:06d}.tar")
 
-    def _estimate_patch_size(self, image_patch, label_patch, metadata):
-        size = image_patch.nbytes + label_patch.nbytes
-        size += len(json.dumps(metadata).encode("utf-8"))
-        return size
+    def _get_writer(self, split, output_dir):
+        prefix = self.prefix
+        if prefix not in self.prefix_writers:
+            self.prefix_writers[prefix] = {}
+        if split not in self.prefix_writers[prefix]:
+            idx = self.prefix_shard_indices[prefix][split]
+            path = self._shard_path(output_dir, prefix, split, idx)
+            fh = open(path, "wb")
+            self.prefix_writers[prefix][split] = {
+                "writer": wds.TarWriter(fh),
+                "file_obj": fh,
+                "path": path,
+            }
+        return self.prefix_writers[prefix][split]["writer"]
 
-    def _get_actual_shard_size(self, prefix, split):
-        """Get the actual current size of a shard file."""
-        if (
-            prefix not in self.prefix_writers
-            or split not in self.prefix_writers[prefix]
-        ):
+    def _close_writer(self, prefix, split, flush_only=False):
+        if prefix not in self.prefix_writers or split not in self.prefix_writers[prefix]:
+            return
+        info = self.prefix_writers[prefix][split]
+        writer, fh = info["writer"], info["file_obj"]
+        if flush_only:
+            if hasattr(writer, "tarfile") and hasattr(writer.tarfile, "fileobj"):
+                writer.tarfile.fileobj.flush()
+                os.fsync(writer.tarfile.fileobj.fileno())
+            return
+        writer.close()
+        fh.close()
+        del self.prefix_writers[prefix][split]
+
+    def _close_all_writers(self, flush_only=False):
+        for prefix in list(self.prefix_writers):
+            for split in list(self.prefix_writers[prefix]):
+                self._close_writer(prefix, split, flush_only)
+        if not flush_only:
+            self.prefix_writers.clear()
+
+    def _shard_size(self, split) -> int:
+        prefix = self.prefix
+        if prefix not in self.prefix_writers or split not in self.prefix_writers[prefix]:
             return 0
-        writer_info = self.prefix_writers[prefix][split]
-        writer = writer_info["writer"]
+        info = self.prefix_writers[prefix][split]
+        writer = info["writer"]
         if hasattr(writer, "tarfile") and hasattr(writer.tarfile, "fileobj"):
-            current_pos = writer.tarfile.fileobj.tell()
-            return current_pos
-        if os.path.exists(writer_info["path"]):
-            return os.path.getsize(writer_info["path"])
-
+            return writer.tarfile.fileobj.tell()
+        if os.path.exists(info["path"]):
+            return os.path.getsize(info["path"])
         return 0
 
-    # ------------------------------------------------------------------
-    # CSV output helpers
-    # ------------------------------------------------------------------
-
-    def _get_or_create_csv_writer(self, split: str, output_dir: Path) -> "IO[str]":
-        """Return an open CSV file handle for *split*, creating it if needed."""
+    def _get_csv_writer(self, split: str, output_dir: Path) -> IO[str]:
         if split not in self._csv_writers:
-            csv_path = Path(output_dir) / f"{split}.csv"
-            self._csv_writers[split] = open(csv_path, "a", buffering=1)
+            self._csv_writers[split] = open(
+                Path(output_dir) / f"{split}.csv", "a", buffering=1
+            )
         return self._csv_writers[split]
 
     def _close_all_csv_writers(self) -> None:
-        """Flush and close all open CSV file handles."""
         for fh in self._csv_writers.values():
             try:
                 fh.flush()
@@ -1136,37 +757,30 @@ class Tiler:
                 pass
         self._csv_writers.clear()
 
-    def _write_patch_as_geotiff(
+    def _write_geotiff(
         self,
-        image_patch: np.ndarray,
-        label_patch: np.ndarray,
-        targets_patches: Dict[str, np.ndarray],
-        patch_key: str,
-        split: str,
-        src_image: rasterio.DatasetReader,
-        src_label: rasterio.DatasetReader,
+        image_patch,
+        label_patch,
+        targets_patches,
+        patch_key,
+        split,
+        src_image,
+        src_label,
         output_root: Path,
-        window: "Window | None" = None,
-        geojson_str: str | None = None,
-    ) -> Tuple[Path, Path, Dict[str, Path], Path | None]:
-        """Write image, label, targets, and optional GeoJSON under *output_root/{split}/*.
-
-        Returns ``(rel_image, rel_label, rel_targets, rel_vector)`` where all paths
-        are relative to *output_root*. ``rel_vector`` is ``None`` when no GeoJSON
-        was written.
-        """
+        window,
+        geojson_str,
+    ):
         img_dir = output_root / split / "image"
         lbl_dir = output_root / split / "label"
         img_dir.mkdir(parents=True, exist_ok=True)
         lbl_dir.mkdir(parents=True, exist_ok=True)
-
         img_path = img_dir / f"{patch_key}.tif"
         lbl_path = lbl_dir / f"{patch_key}_lbl.tif"
-
-        patch_transform = (
-            src_image.window_transform(window) if window is not None else src_image.transform
+        transform = (
+            src_image.window_transform(window)
+            if window is not None
+            else src_image.transform
         )
-
         img_profile = src_image.profile.copy()
         img_profile.update(
             width=self.patch_size[1],
@@ -1174,11 +788,10 @@ class Tiler:
             count=image_patch.shape[0],
             driver="GTiff",
             compress="lzw",
-            transform=patch_transform,
+            transform=transform,
         )
         with rasterio.open(img_path, "w", **img_profile) as dst:
             dst.write(image_patch)
-
         lbl_profile = src_label.profile.copy()
         lbl_profile.update(
             width=self.patch_size[1],
@@ -1186,47 +799,87 @@ class Tiler:
             count=label_patch.shape[0],
             driver="GTiff",
             compress="lzw",
-            transform=patch_transform,
+            transform=transform,
         )
         with rasterio.open(lbl_path, "w", **lbl_profile) as dst:
             dst.write(label_patch)
 
-        rel_targets: Dict[str, Path] = {}
-        for target_key, target_arr in targets_patches.items():
-            tgt_dir = output_root / split / target_key
+        rel_targets = {}
+        for key, arr in targets_patches.items():
+            tgt_dir = output_root / split / key
             tgt_dir.mkdir(parents=True, exist_ok=True)
-            tgt_path = tgt_dir / f"{patch_key}_{target_key}.tif"
-            tgt_profile = lbl_profile.copy()
-            tgt_profile.update(count=1)
-            with rasterio.open(tgt_path, "w", **tgt_profile) as dst:
-                dst.write(target_arr[np.newaxis])
-            rel_targets[target_key] = tgt_path.relative_to(output_root)
+            tgt_path = tgt_dir / f"{patch_key}_{key}.tif"
+            profile = lbl_profile.copy()
+            profile.update(count=1)
+            with rasterio.open(tgt_path, "w", **profile) as dst:
+                dst.write(arr[np.newaxis])
+            rel_targets[key] = tgt_path.relative_to(output_root)
 
-        rel_vector: Path | None = None
+        rel_vector = None
         if geojson_str is not None:
             vec_dir = output_root / split / "vector"
             vec_dir.mkdir(parents=True, exist_ok=True)
             vec_path = vec_dir / f"{patch_key}.geojson"
             vec_path.write_text(geojson_str, encoding="utf-8")
             rel_vector = vec_path.relative_to(output_root)
+        return (
+            img_path.relative_to(output_root),
+            lbl_path.relative_to(output_root),
+            rel_targets,
+            rel_vector,
+        )
 
-        rel_img = img_path.relative_to(output_root)
-        rel_lbl = lbl_path.relative_to(output_root)
-        return rel_img, rel_lbl, rel_targets, rel_vector
-
-    @staticmethod
-    def pad_patch(patch: np.ndarray, patch_size: Tuple[int, int], mode="edge"):
-        """Pads the patch to the patch size."""
-        height, width = patch.shape[-2:]
-        pad_height = patch_size[0] - height
-        pad_width = patch_size[1] - width
-        if patch.ndim == 2:
-            padded_patch = np.pad(patch, ((0, pad_height), (0, pad_width)), mode=mode)
-            return padded_patch
-        elif patch.ndim == 3:
-            padded_patch = np.pad(
-                patch, ((0, 0), (0, pad_height), (0, pad_width)), mode=mode
+    def _export_norm_stats(self) -> None:
+        path = (
+            Path(self.output_dir) / self.prefix / f"{self.prefix}_normalization_stats.json"
+        )
+        try:
+            stats = self.manifest.get_all_dataset_statistics()
+            path.write_text(
+                json.dumps(
+                    {
+                        "created_at": datetime.now().isoformat(),
+                        "dataset_prefix": self.prefix,
+                        "statistics": stats,
+                    },
+                    indent=2,
+                )
             )
-            return padded_patch
+            logger.info("Normalization statistics saved to %s", path)
+        except Exception as e:
+            logger.error("Failed to export normalization statistics: %s", e)
+
+    def _log_finish(self, summary: dict) -> None:
+        logger.info("Processing complete: %s", summary)
+        counts = self.prefix_patch_counts[self.prefix]
+        sizes = (
+            self.manifest.get_total_sizes_by_split()
+            if self.output_format == "tar"
+            else None
+        )
+        extra = ""
+        if sizes:
+            extra = "  sizes_mb trn=%.1f val=%.1f tst=%.1f" % (
+                sizes["trn"] / 1024**2,
+                sizes["val"] / 1024**2,
+                sizes["tst"] / 1024**2,
+            )
+        logger.info(
+            "patches trn=%d val=%d tst=%d total=%d%s",
+            counts["trn"],
+            counts["val"],
+            counts["tst"],
+            sum(counts.values()),
+            extra,
+        )
+        result = self.manifest.validate_manifest_consistency()
+        if result["is_consistent"]:
+            logger.info("Manifest validation: PASSED")
         else:
-            raise ValueError(f"Invalid patch shape: {patch.shape}")
+            logger.info(
+                "Manifest validation: FAILED (%s)", ", ".join(result["issues"])
+            )
+
+    # kept for callers that still use the old names
+    process_single_pair = _prepare_pair
+    tiling = _tile_image
