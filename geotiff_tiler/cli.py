@@ -94,7 +94,6 @@ def _cmd_tile(args: argparse.Namespace) -> int:
         class_ids=parse_class_ids(args.class_ids),
         discard_empty=not args.keep_empty,
         label_threshold=args.label_threshold,
-        split=args.split,
         prefix=args.prefix,
         output_dir=args.output_dir,
         output_format=args.output_format,
@@ -141,7 +140,7 @@ def _parser() -> argparse.ArgumentParser:
         "--input_files",
         nargs="+",
         required=True,
-        help="CSV (image/image_url, label/label_path, collection) or JSON pairs",
+        help="CSV (image/image_url, label/label_path, split, collection) or JSON pairs",
     )
     val_plan.add_argument("--plan_file", required=True)
     _add_patch_args(val_plan)
@@ -162,7 +161,6 @@ def _parser() -> argparse.ArgumentParser:
     tile.add_argument("--band_indices", type=int, nargs="+", default=None)
     _add_label_args(tile)
     tile.add_argument("--keep_empty", action="store_true")
-    tile.add_argument("--split", choices=("trn", "tst"), default="trn")
     tile.add_argument("--prefix", default="satellite")
     tile.add_argument("--output_format", choices=("tar", "csv"), default="tar")
     tile.add_argument("--retry", type=int, default=3)
