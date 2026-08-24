@@ -38,6 +38,7 @@ from geotiff_tiler.lib.io import (
     validate_pair,
 )
 from geotiff_tiler.lib.manifest import TilingManifest
+from geotiff_tiler.lib.pairs import resolve_split
 from geotiff_tiler.lib.viz import create_dataset_summary_visualization
 from geotiff_tiler.split_planner import classify_patch, load_plan, val_rects_for_image
 
@@ -92,7 +93,6 @@ class Tiler:
         class_ids: dict[str, int] | None = None,
         discard_empty: bool = True,
         label_threshold: float = 0.01,
-        split: str = "trn",
         prefix: str = "sample",
         output_dir: str | None = None,
         output_format: str = "tar",
@@ -122,7 +122,6 @@ class Tiler:
         self.class_ids = class_ids or {}
         self.discard_empty = discard_empty
         self.label_threshold = label_threshold
-        self.split = split if split in ("trn", "tst") else "trn"
         self.prefix = prefix
         self.output_dir = output_dir
         self.output_format = output_format
@@ -157,6 +156,7 @@ class Tiler:
         for item in tqdm(self.input_dict, desc="Processing input pairs"):
             image_path, label_path = item["image"], item["label"]
             metadata = dict(item.get("metadata") or {})
+            metadata["split"] = resolve_split(metadata)
             image_name = Path(str(image_path)).stem
             image_tmp = tmp_root / image_name
             if image_tmp.exists():
@@ -200,9 +200,10 @@ class Tiler:
             summary["successful"] += 1
 
         self._init_writers()
-        create_val_set = self.split == "trn"
-        if create_val_set and self.split_plan is None:
-            logger.warning("no split_plan; all patches -> trn")
+        if self.split_plan is None and any(
+            a["metadata"]["split"] == "trn" for a in analyses
+        ):
+            logger.warning("no split_plan; all trn patches -> trn")
 
         logger.info("Phase 2: tile")
         for analysis in tqdm(analyses, desc="Tiling"):
@@ -212,7 +213,7 @@ class Tiler:
                 continue
             self.manifest.mark_image_in_progress(name)
             try:
-                self._tile_image(analysis, create_val_set)
+                self._tile_image(analysis)
                 self.manifest.mark_image_completed(name)
             except Exception as e:
                 logger.error("Error tiling image %s: %s", name, e)
@@ -391,10 +392,11 @@ class Tiler:
             self._csv_writers = {}
 
     @log_stage(stage_name="tiling", log_memory=True)
-    def _tile_image(self, analysis: dict[str, Any], create_val_set: bool) -> None:
+    def _tile_image(self, analysis: dict[str, Any]) -> None:
         image_path, label_path = analysis["image_path"], analysis["label_path"]
         image_name = analysis["image_name"]
         metadata = analysis["metadata"]
+        create_val_set = metadata["split"] == "trn"
         label_gdf = analysis.get("label_gdf")
         target_srcs: dict = {}
         t0 = time.time()
