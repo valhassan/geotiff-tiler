@@ -13,7 +13,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-import geopandas as gpd
 import numpy as np
 import rasterio
 import rasterio.features
@@ -21,12 +20,22 @@ import rasterio.warp
 from rasterio.transform import from_bounds as transform_from_bounds
 from rasterio.windows import from_bounds as window_from_bounds
 
-from geotiff_tiler.lib.io import load_vector_mask
+from geotiff_tiler.lib.geo import check_label_type
+from geotiff_tiler.lib.io import load_vector_mask, resolve_attr_field
 
 logger = logging.getLogger(__name__)
 
 PLAN_VERSION = 1
-RASTER_EXTS = (".tif", ".tiff")
+
+
+def require_split(metadata: dict, image) -> str:
+    split = str(metadata.get("split") or "").strip().lower()
+    if split not in ("trn", "tst"):
+        raise ValueError(
+            f"{image}: metadata['split'] must be trn or tst, "
+            f"got {metadata.get('split')!r}"
+        )
+    return split
 
 
 def _now() -> str:
@@ -59,14 +68,6 @@ def save_plan(plan: dict, plan_file: str | Path) -> None:
     tmp.replace(plan_file)
 
 
-def _as_list(value: str | Sequence[str] | None) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    return list(value)
-
-
 def analyze_image(
     image_path: str,
     label_path: str,
@@ -90,7 +91,7 @@ def analyze_image(
         native_res = abs(img_transform.a)
 
     label_bounds, geoms = _read_label(
-        label_path, img_crs, _as_list(attr_fields), attr_values or []
+        label_path, img_crs, attr_fields, attr_values or []
     )
     if geoms is not None and len(geoms) == 0:
         logger.warning("%s: no label features after attribute filter", image_path)
@@ -182,22 +183,21 @@ def analyze_image(
 
 
 def _read_label(
-    label_path, img_crs, attr_fields: list[str], attr_values: Sequence[int]
+    label_path,
+    img_crs,
+    attr_fields: str | Sequence[str] | None,
+    attr_values: Sequence[int],
 ):
     """Return ``(bounds, geom_value_pairs)`` or ``(bounds, None)`` for rasters."""
-    if str(label_path).lower().endswith(RASTER_EXTS):
+    if check_label_type(label_path) == "raster":
         with rasterio.open(label_path) as lsrc:
             b = lsrc.bounds
             if lsrc.crs != img_crs:
                 b = rasterio.warp.transform_bounds(lsrc.crs, img_crs, *b)
         return b, None
 
-    gdf = (
-        load_vector_mask(label_path)
-        if Path(label_path).suffix.lower() == ".gpkg"
-        else gpd.read_file(label_path)
-    )
-    field = next((f for f in attr_fields if f in gdf.columns), None)
+    gdf = load_vector_mask(label_path)
+    field = resolve_attr_field(gdf.columns, attr_fields)
     if field is None:
         raise ValueError(f"{label_path}: none of {attr_fields} present")
     gdf = gdf[gdf[field].astype(float).astype(int).isin(list(attr_values))]
@@ -302,12 +302,7 @@ def run_planner(
     pairs = []
     for p in input_dict:
         meta = p.get("metadata") or {}
-        split = str(meta.get("split") or "").strip().lower()
-        if split not in ("trn", "tst"):
-            raise ValueError(
-                f"{p.get('image')}: metadata['split'] must be trn or tst, "
-                f"got {meta.get('split')!r}"
-            )
+        split = require_split(meta, p.get("image"))
         if split == "trn" and p.get("label"):
             pairs.append(p)
     logger.info("Planning split for %d trn images", len(pairs))
