@@ -39,7 +39,7 @@ def gdal_translate_copy(src, dst):
         raise RuntimeError(f"GDAL failed: {result.stderr}")
 
 
-def log_stage(stage_name=None, log_memory=False, force_gc=True):
+def log_stage(stage_name=None, log_memory=False, force_gc=False):
     """Decorator to log time and memory usage of a function."""
 
     def decorator(func):
@@ -74,10 +74,46 @@ def log_stage(stage_name=None, log_memory=False, force_gc=True):
     return decorator
 
 
+def resolve_attr_field(
+    columns: Sequence[str], attr_field: str | Sequence[str] | None
+) -> str | None:
+    """First requested field that exists in *columns*."""
+    if attr_field is None:
+        return None
+    fields = [attr_field] if isinstance(attr_field, str) else list(attr_field)
+    for name in fields:
+        if name in columns:
+            return name
+    return None
+
+
+def _repair_geoms(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """make_valid, then drop leftovers that are still invalid or empty."""
+    if gdf.empty or gdf.geometry.is_valid.all():
+        return gdf
+    logger.info("Found invalid geometries, fixing with make_valid()")
+    gdf = gdf.copy()
+    gdf["geometry"] = gdf.geometry.make_valid()
+    if not gdf.geometry.is_valid.all():
+        invalid_count = int((~gdf.geometry.is_valid).sum())
+        logger.warning(
+            "Filtering out %s geometries that remain invalid after make_valid()",
+            invalid_count,
+        )
+        gdf = gdf[gdf.geometry.is_valid].copy()
+    if gdf.geometry.isna().any() or gdf.geometry.is_empty.any():
+        empty_count = int((gdf.geometry.isna() | gdf.geometry.is_empty).sum())
+        logger.warning("Filtering out %s empty/null geometries", empty_count)
+        gdf = gdf[~(gdf.geometry.isna() | gdf.geometry.is_empty)].copy()
+    return gdf
+
+
 def load_vector_mask(
     mask_path: str, skip_layer: str | None = "extent"
 ) -> gpd.GeoDataFrame:
-    """Loads a vector mask from a path."""
+    """Load a vector mask. GeoPackage uses the non-extent layer; other formats via GeoPandas."""
+    if Path(mask_path).suffix.lower() != ".gpkg":
+        return _repair_geoms(gpd.read_file(mask_path))
     layers = fiona.listlayers(mask_path)
     extent_layer = next((layer for layer in layers if "extent" in layer.lower()), None)
     main_layer = next(
@@ -85,24 +121,7 @@ def load_vector_mask(
     )
     if main_layer is None:
         raise ValueError(f"No suitable layer found in {mask_path}")
-    result = gpd.read_file(mask_path, layer=main_layer)
-
-    if not result.geometry.is_valid.all():
-        logger.info("Found invalid geometries, fixing with make_valid()")
-        result["geometry"] = result.geometry.make_valid()
-
-        # Filter out any geometries that are still invalid after make_valid()
-        if not result.geometry.is_valid.all():
-            invalid_count = (~result.geometry.is_valid).sum()
-            logger.warning(
-                f"Filtering out {invalid_count} geometries that remain invalid after make_valid()"
-            )
-            result = result[result.geometry.is_valid].copy()
-
-        if result.geometry.isna().any() or result.geometry.is_empty.any():
-            empty_count = (result.geometry.isna() | result.geometry.is_empty).sum()
-            logger.warning(f"Filtering out {empty_count} empty/null geometries")
-            result = result[~(result.geometry.isna() | result.geometry.is_empty)].copy()
+    result = _repair_geoms(gpd.read_file(mask_path, layer=main_layer))
 
     if extent_layer:
         extent_gdf = gpd.read_file(mask_path, layer=extent_layer)
@@ -137,33 +156,32 @@ def save_vector_mask(
     del gdf
 
 
+def _looks_like_stac(image_path: str) -> bool:
+    s = str(image_path).lower()
+    return s.startswith(("http://", "https://")) or s.endswith((".json", ".jsonl"))
+
+
 @with_connection_retry
-@log_stage(stage_name="validate_image", force_gc=False)
+@log_stage(stage_name="validate_image")
 def validate_image(
     image_path: str,
     bands_requested: Sequence = ["red", "green", "blue"],
     band_indices: Sequence | None = None,
 ):
     """Validates an image from a path or stac item"""
-    image_asset = None
+    local = Path(image_path).exists()
+    if local and not _looks_like_stac(image_path):
+        return select_bands(image_path, band_indices) if band_indices else image_path
 
     try:
         stac_item = pystac.Item.from_file(image_path)
         item = SingleBandItemEO(item=stac_item, bands_requested=bands_requested)
         stac_bands = [value["meta"].href for value in item.bands_requested.values()]
-        image_asset = stack_bands(stac_bands)
-        return image_asset
+        return stack_bands(stac_bands)
     except Exception:
-        pass
-
-    if Path(image_path).exists():
-        if band_indices:
-            image_asset = select_bands(image_path, band_indices)
-        else:
-            image_asset = image_path
-        return image_asset
-    else:
-        raise FileNotFoundError(f"File not found: {image_path}")
+        if local:
+            return select_bands(image_path, band_indices) if band_indices else image_path
+        raise FileNotFoundError(f"File not found: {image_path}") from None
 
 
 def validate_mask(mask_path: str):
@@ -175,7 +193,7 @@ def validate_mask(mask_path: str):
         raise FileNotFoundError(f"File not found: {mask_path}")
 
 
-@log_stage(stage_name="validate_pair", force_gc=False)
+@log_stage(stage_name="validate_pair")
 def validate_pair(image_path, label_path, label_type):
     """Validates an image-label pair based on georeferencing and data integrity."""
 
@@ -310,75 +328,39 @@ def ensure_crs_match(
             return image_path, aligned_label_path
 
 
+def _pair_geoms(image_path: str, label_path: str, label_type: str):
+    """Image and label extents as shapely geometries."""
+    with rasterio.open(image_path) as image:
+        image_bounds = box(*image.bounds)
+    if label_type == "raster":
+        with rasterio.open(label_path) as label:
+            return image_bounds, box(*label.bounds)
+    label = load_vector_mask(label_path)
+    if hasattr(label, "attrs") and "extent_geometry" in label.attrs:
+        return image_bounds, label.attrs["extent_geometry"]
+    return image_bounds, box(*label.total_bounds)
+
+
 @log_stage(stage_name="calculate_overlap", log_memory=True)
 def calculate_overlap(
     image_path: str, label_path: str, label_type: str
 ) -> Tuple[float, str]:
-    """
-    Calculate the overlap between image and label data.
-
-    Args:
-        image: Opened rasterio dataset
-        label: Either a rasterio dataset or GeoDataFrame
-
-    Returns:
-        Tuple of (overlap_percentage, message)
-    """
-    # try:
-    # Get image bounds as a box
-    with rasterio.open(image_path) as image:
-        image_bounds = box(*image.bounds)
-    if label_type == "raster":
-        with rasterio.open(label_path) as label:
-            label_bounds = box(*label.bounds)
-    elif label_type == "vector":
-        label = load_vector_mask(label_path)
-        if hasattr(label, "attrs") and "extent_geometry" in label.attrs:
-            label_bounds = label.attrs["extent_geometry"]
-        else:
-            label_bounds = box(*label.total_bounds)
-
-    # Calculate intersection and union areas
+    """Calculate the overlap between image and label data."""
+    image_bounds, label_bounds = _pair_geoms(image_path, label_path, label_type)
     intersection_area = image_bounds.intersection(label_bounds).area
     union_area = image_bounds.union(label_bounds).area
-
     if union_area == 0:
         return 0.0, "No valid area found"
-
     overlap_percentage = (intersection_area / union_area) * 100
-
     if overlap_percentage == 0:
         return 0.0, "No overlap between image and label"
-    del image, label
     return overlap_percentage, f"Overlap percentage: {overlap_percentage:.2f}%"
-
-    # except Exception as e:
-    #     return 0.0, f"Error calculating overlap: {str(e)}"
 
 
 @log_stage(stage_name="get_intersection", log_memory=True)
 def get_intersection(image_path: str, label_path: str, label_type: str) -> box:
-    """
-    Find the intersection area between an image and label (raster or vector).
-
-    Args:
-        image: Opened rasterio dataset for the image
-        label: Either a rasterio dataset or GeoDataFrame for the label
-
-    Returns:
-        shapely.geometry.box representing the intersection area
-    """
-    with rasterio.open(image_path) as image:
-        image_bounds = box(*image.bounds)
-    if label_type == "raster":
-        with rasterio.open(label_path) as label:
-            label_bounds = box(*label.bounds)
-    elif label_type == "vector":
-        label = load_vector_mask(label_path)
-        if hasattr(label, "attrs") and "extent_geometry" in label.attrs:
-            label_bounds = label.attrs["extent_geometry"]
-        else:
-            label_bounds = box(*label.total_bounds)
+    """Find the intersection area between an image and label (raster or vector)."""
+    image_bounds, label_bounds = _pair_geoms(image_path, label_path, label_type)
     intersection = label_bounds.intersection(image_bounds)
     if intersection.is_empty:
         return None
@@ -424,13 +406,23 @@ def clip_raster_to_geometry(image_path: str, geometry: box, prefix: str, tmp_dir
             "-cutline",
             str(temp_geom_path),
             "-crop_to_cutline",
-            "-of",
-            "GTiff",
-            str(source_path),
-            str(clipped_image_path),
         ]
         if nodata is not None:
-            cmd[4:4] = ["-dstnodata", str(nodata)]
+            cmd.extend(["-dstnodata", str(nodata)])
+        cmd.extend(
+            [
+                "-of",
+                "GTiff",
+                "-co",
+                "TILED=YES",
+                "-co",
+                "BLOCKXSIZE=256",
+                "-co",
+                "BLOCKYSIZE=256",
+                str(source_path),
+                str(clipped_image_path),
+            ]
+        )
         subprocess.run(cmd, capture_output=True, text=True, check=True)
         return clipped_image_path
     finally:
@@ -608,18 +600,13 @@ def rasterize_vector(
         ].copy()
 
         if attr_field and attr_values:
-            candidates = list(set(attr_field).intersection(vector_clean.columns))
-            if not candidates:
+            resolved = resolve_attr_field(vector_clean.columns, attr_field)
+            if resolved is None:
                 raise ValueError(
                     f"None of the requested attr_field(s) {attr_field} found in "
                     f"vector columns {list(vector_clean.columns)}"
                 )
-            if len(candidates) > 1:
-                raise ValueError(
-                    f"Multiple attr_field candidates found: {candidates}. "
-                    "Pass a single unambiguous field name."
-                )
-            attr_field = candidates[0]
+            attr_field = resolved
             cont_vals_dict = {
                 src: (dst + 1 if continuous else src)
                 for dst, src in enumerate(attr_values)
@@ -719,6 +706,12 @@ def rasterize_vector(
             "GTiff",
             "-init",
             "0",
+            "-co",
+            "TILED=YES",
+            "-co",
+            "BLOCKXSIZE=256",
+            "-co",
+            "BLOCKYSIZE=256",
             str(temp_vector_path),
             str(rasterized_label_path),
         ]
@@ -746,7 +739,6 @@ def prepare_vector_labels(
     min_erosion_area_m2: float = 5.0,
     building_class_val: int | None = None,
     road_class_val: int | None = None,
-    compute_targets: bool = True,
     max_gsd_for_road_targets: float = 1.0,
 ):
     """Prepares vector labels for tiling."""
@@ -766,28 +758,21 @@ def prepare_vector_labels(
         min_erosion_area_m2=min_erosion_area_m2,
     )
     targets_paths = {}
+    field = (
+        resolve_attr_field(label_gdf.columns, attr_field)
+        if attr_field and attr_values
+        else None
+    )
 
-    def _resolve_field(gdf: gpd.GeoDataFrame) -> str | None:
-        if not (attr_field and attr_values):
-            return None
-        candidates = list(
-            set(attr_field if isinstance(attr_field, list) else [attr_field])
-            .intersection(gdf.columns)
-        )
-        return candidates[0] if candidates else None
-
-    # --- buildings targets -----------------------------------------------
-    if compute_targets and building_class_val is not None:
+    if building_class_val is not None:
         if not eroded_building_gdf.empty:
             build_gdf = eroded_building_gdf
+        elif field:
+            build_gdf = label_gdf[
+                label_gdf[field].astype(str) == str(building_class_val)
+            ]
         else:
-            field = _resolve_field(label_gdf)
-            if field:
-                build_gdf = label_gdf[
-                    label_gdf[field].astype(str) == str(building_class_val)
-                ]
-            else:
-                build_gdf = gpd.GeoDataFrame()
+            build_gdf = gpd.GeoDataFrame()
 
         if not build_gdf.empty:
             targets_paths.update(
@@ -796,9 +781,7 @@ def prepare_vector_labels(
                 )
             )
 
-    # --- roads targets ---------------------------------------------------
-    if compute_targets and road_class_val is not None:
-        field = _resolve_field(label_gdf)
+    if road_class_val is not None:
         if field:
             road_gdf = label_gdf[
                 label_gdf[field].astype(str) == str(road_class_val)
