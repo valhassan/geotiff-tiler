@@ -38,72 +38,16 @@ def numpy_decoder(dct):
     return dct
 
 class TilingManifest:
-    """
-    Dataset manifest manager for tiling operations and continuous dataset growth.
-    
-    Tracks processed images, patches, and shard information to enable resuming tiling
-    operations and growing datasets over time. Extends the functionality of TilingCheckpoint
-    by adding comprehensive dataset tracking capabilities.
-    """
-    
+    """Tracks processed images, patches, and shards so tiling can resume."""
+
     def __init__(self, output_dir: str, prefix: str):
-        """
-        Initialize the manifest manager.
-        
-        Args:
-            output_dir (str): Directory for output files and manifest
-            prefix (str): Dataset prefix
-        """
         self.output_dir = Path(output_dir)
         self.prefix = prefix
         self.manifest_path = self.output_dir / prefix / f"{self.prefix}_manifest.json"
-        
-        # Track completed images and patches (from original TilingCheckpoint)
-        self.completed_images: Set[str] = set()
-        self.failed_images: Dict[str, str] = {}  # image_name -> reason
-        self.in_progress_image: Optional[str] = None
-        self.completed_patches: Dict[str, Set[str]] = {}  # image_name -> set of "x_y" strings
-        
-        # Track shard information (from original TilingCheckpoint)
-        self.shard_indices: Dict[str, Dict[str, int]] = {}  # prefix -> {split -> index}
-        self.shard_sizes: Dict[str, Dict[str, int]] = {}    # prefix -> {split -> size}
-        self.patch_counts: Dict[str, Dict[str, int]] = {}   # prefix -> {split -> count}
-        
-        # New dataset information
-        self.dataset_info = {
-            "name": prefix,
-            "created_at": datetime.now().isoformat(),
-            "last_updated": datetime.now().isoformat(),
-            "description": f"Geospatial patches for {prefix}"
-        }
-        
-        # Enhanced shard tracking with status and additional metadata
-        self.shards = {
-            "trn": [],  # List of shard info dicts
-            "val": [],
-            "tst": []
-        }
-        
-        # Image metadata and processing records
-        self.image_metadata = {}  # image_name -> metadata dict
-        
-        # Dataset statistics
-        self.dataset_statistics = {
-            "class_distribution": {},
-            "patch_counts": {"trn": 0, "val": 0, "tst": 0},
-            "image_counts": {"total": 0, "completed": 0, "failed": 0, "in_progress": 0},
-            "actual_split_ratio": {"trn": 0, "val": 0, "tst": 0}
-        }
-        self.running_statistics = {} # prefix -> band statistics
-        self.stats_update_counter = 0 # Track updates for save frequency
-        self.stats_save_frequency = 100 # Save every N patches
-        
-        # Load manifest if resuming
+        self._reset_state()
         if self.manifest_path.exists():
             self._load_manifest()
             logger.info(f"Resumed from manifest: {self.manifest_path}")
-        
-        # Register signal handlers
         self._setup_signal_handlers()
     
     def _setup_signal_handlers(self):
@@ -116,7 +60,36 @@ class TilingManifest:
         
         signal.signal(signal.SIGINT, handle_interrupt)
         signal.signal(signal.SIGTERM, handle_interrupt)
-        
+
+    def _reset_state(self) -> None:
+        self.completed_images: Set[str] = set()
+        self.failed_images: Dict[str, str] = {}
+        self.in_progress_image: Optional[str] = None
+        self.completed_patches: Dict[str, Set[str]] = {}
+        self.shard_indices: Dict[str, Dict[str, int]] = {}
+        self.shard_sizes: Dict[str, Dict[str, int]] = {}
+        self.patch_counts: Dict[str, Dict[str, int]] = {}
+        self.dataset_info = {
+            "name": self.prefix,
+            "created_at": datetime.now().isoformat(),
+            "last_updated": datetime.now().isoformat(),
+            "description": f"Geospatial patches for {self.prefix}",
+        }
+        self.shards = {"trn": [], "val": [], "tst": []}
+        self.image_metadata = {}
+        self.dataset_statistics = {
+            "class_distribution": {},
+            "patch_counts": {"trn": 0, "val": 0, "tst": 0},
+            "image_counts": {
+                "total": 0,
+                "completed": 0,
+                "failed": 0,
+                "in_progress": 0,
+            },
+            "actual_split_ratio": {"trn": 0, "val": 0, "tst": 0},
+        }
+        self.running_statistics = {}
+
     def _initialize_band_statistics(self, prefix: str, patch: np.ndarray):
         """Initialize statistics tracking for a new prefix/sensor configuration."""
         band_count = patch.shape[0]
@@ -133,9 +106,7 @@ class TilingManifest:
         }
         
         logger.info(f"Initialized statistics for prefix '{prefix}' with {band_count} bands")
-    
-    # --- Image and Patch Tracking Methods (from original TilingCheckpoint) ---
-    
+
     def is_image_completed(self, image_name: str) -> bool:
         """Check if an image has been fully processed"""
         return image_name in self.completed_images
@@ -205,11 +176,9 @@ class TilingManifest:
         if image_name not in self.completed_patches:
             self.completed_patches[image_name] = set()
         self.completed_patches[image_name].add(f"{x}_{y}")
-    
-    # --- Shard Tracking Methods ---
-    
+
     def update_shard_info(self, prefix: str, split: str, index: int, size: int, count: int) -> None:
-        """Update basic shard tracking information (compatible with original TilingCheckpoint)"""
+        """Update shard index/size/count and the detailed shard record."""
         if prefix not in self.shard_indices:
             self.shard_indices[prefix] = {"trn": 0, "val": 0, "tst": 0}
             self.shard_sizes[prefix] = {"trn": 0, "val": 0, "tst": 0}
@@ -280,7 +249,6 @@ class TilingManifest:
         self.shards[split] = sorted(self.shards[split], key=lambda s: s["id"])
     
     def get_shard_info(self, prefix: str, split: str) -> tuple:
-        """Get current shard information (compatible with original TilingCheckpoint)"""
         if prefix not in self.shard_indices:
             return 0, 0, 0
         
@@ -289,39 +257,15 @@ class TilingManifest:
         count = self.patch_counts[prefix].get(split, 0)
         
         return index, size, count
-    
-    def close_shard(self, prefix: str, split: str, shard_index: int):
+
+    def close_shard(self, split: str, shard_index: int):
         """Mark a shard as closed (no more data can be added)"""
         for shard in self.shards[split]:
             if shard["id"] == shard_index:
                 shard["status"] = "CLOSED"
                 shard["closed_at"] = datetime.now().isoformat()
                 break
-    
-    def find_open_shard(self, prefix: str, split: str, max_size_bytes: int = 2 * 1024 * 1024 * 1024):
-        """Find an open shard for the given split with space available"""
-        open_shards = []
-        for shard in self.shards.get(split, []):
-            if shard["status"] == "OPEN" and shard["size_bytes"] < max_size_bytes:
-                open_shards.append(shard)
-        
-        if not open_shards:
-            # No suitable shard found, create a new one
-            next_index = self.get_next_shard_index(split)
-            self.update_shard_record(prefix, split, next_index, 0, 0, "OPEN")
-            return next_index
-        
-        # Return the shard with the most space available
-        return min(open_shards, key=lambda s: s["size_bytes"])["id"]
-    
-    def get_next_shard_index(self, split: str) -> int:
-        """Get the next available shard index for a split"""
-        if not self.shards.get(split, []):
-            return 0
-        return max([s["id"] for s in self.shards.get(split, [])]) + 1
-    
-    # --- Image Metadata Methods ---
-    
+
     def update_image_metadata(self, image_name: str, metadata: Dict[str, Any]):
         """Update or add metadata for an image"""
         if image_name not in self.image_metadata:
@@ -440,49 +384,23 @@ class TilingManifest:
             self._class_update_count += 1
     
     def update_running_statistics(self, prefix: str, patch: np.ndarray):
-        """
-        Update running statistics with a new training patch.
-        
-        Args:
-            prefix (str): Dataset prefix (determines sensor type)
-            patch (np.ndarray): Image patch with shape (bands, height, width)
-        """
-        # Initialize on first patch
+        """Update running mean/std accumulators with a training patch."""
         if prefix not in self.running_statistics:
             self._initialize_band_statistics(prefix, patch)
-        
+
         stats = self.running_statistics[prefix]
-        
-        # Validate band consistency
         if patch.shape[0] != stats["band_count"]:
             raise ValueError(
                 f"Band count mismatch for prefix '{prefix}': "
                 f"expected {stats['band_count']}, got {patch.shape[0]}"
             )
-        
-        # Convert to float64 for precision
-        patch_float = patch.astype(np.float64)
-        
-        # Update statistics for each band
-        for band_idx in range(stats["band_count"]):
-            band_data = patch_float[band_idx].ravel()
-            stats["band_sums"][band_idx] += np.sum(band_data)
-            stats["band_sums_squared"][band_idx] += np.sum(band_data ** 2)
-        
-        # Update counts
-        pixels_per_patch = patch.shape[1] * patch.shape[2]
-        stats["pixel_count"] += pixels_per_patch
+
+        flat = patch.reshape(stats["band_count"], -1).astype(np.float64, copy=False)
+        stats["band_sums"] += flat.sum(axis=1)
+        stats["band_sums_squared"] += np.square(flat).sum(axis=1)
+        stats["pixel_count"] += patch.shape[1] * patch.shape[2]
         stats["patch_count"] += 1
         stats["last_updated"] = datetime.now().isoformat()
-        
-        # Increment counter for save frequency
-        self.stats_update_counter += 1
-        
-        # Save periodically
-        if self.stats_update_counter >= self.stats_save_frequency:
-            self.save_manifest()
-            self.stats_update_counter = 0
-            logger.debug(f"Saved manifest after {self.stats_save_frequency} patches")
     
     def get_dataset_statistics(self, prefix: str) -> Dict[str, Any]:
         """
@@ -539,34 +457,7 @@ class TilingManifest:
             except ValueError as e:
                 logger.warning(f"Could not get statistics for {prefix}: {e}")
         return all_stats
-    
-    def is_split_ratio_drifting(self, threshold=0.03):
-        """Check if the split ratio is drifting from target"""
-        if "actual_split_ratio" not in self.dataset_statistics:
-            return False
-        
-        actual = self.dataset_statistics["actual_split_ratio"]
-        # Default target - could be made configurable
-        target = {"trn": 0.8, "val": 0.2}
-        
-        # Check if drift exceeds threshold
-        return abs(actual.get("trn", 0) - target["trn"]) > threshold
-    
-    def get_adjusted_val_ratio(self, default_ratio=0.2):
-        """Get adjusted validation ratio to correct drift"""
-        if not self.is_split_ratio_drifting():
-            return default_ratio
-        
-        # Calculate adjustment
-        actual = self.dataset_statistics["actual_split_ratio"]
-        target = {"trn": 0.8, "val": 0.2}
-        
-        # If we have too many validation samples, reduce validation ratio
-        if actual.get("val", 0) > target["val"]:
-            return max(0.1, default_ratio - 0.05)  # Reduce by 5%
-        else:
-            return min(0.3, default_ratio + 0.05)  # Increase by 5%
-    
+
     def get_total_sizes_by_split(self) -> Dict[str, int]:
         """Calculate total size across all shards for each split"""
         total_sizes = {"trn": 0, "val": 0, "tst": 0}
@@ -632,7 +523,6 @@ class TilingManifest:
             
             # Load running statistics
             self.running_statistics = manifest_data.get("running_statistics", {})
-            self.stats_update_counter = 0 # Reset counter
             
             # Load image metadata
             self.image_metadata = manifest_data.get("processed_images", {})
@@ -659,77 +549,8 @@ class TilingManifest:
             
         except Exception as e:
             logger.error(f"Error loading manifest: {e}")
-            # Initialize empty state if loading fails
-            self._initialize_empty_state()
-    
-    def _initialize_empty_state(self):
-        """Initialize empty state for all data structures"""
-        self.completed_images = set()
-        self.failed_images = {}
-        self.in_progress_image = None
-        self.completed_patches = {}
-        self.shard_indices = {}
-        self.shard_sizes = {}
-        self.patch_counts = {}
-        self.dataset_info = {
-            "name": self.prefix,
-            "created_at": datetime.now().isoformat(),
-            "last_updated": datetime.now().isoformat(),
-            "description": "Geospatial dataset for land cover classification"
-        }
-        self.shards = {"trn": [], "val": [], "tst": []}
-        self.image_metadata = {}
-        self.dataset_statistics = {
-            "class_distribution": {},
-            "patch_counts": {"trn": 0, "val": 0, "tst": 0},
-            "image_counts": {"total": 0, "completed": 0, "failed": 0, "in_progress": 0},
-            "actual_split_ratio": {"trn": 0, "val": 0, "tst": 0}
-        }
-        self.running_statistics = {}
-        self.stats_update_counter = 0
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get manifest statistics"""
-        return {
-            "completed_images": len(self.completed_images),
-            "failed_images": len(self.failed_images),
-            "in_progress_image": self.in_progress_image,
-            "patches_by_image": {
-                img: len(patches) for img, patches in self.completed_patches.items()
-            },
-            "dataset_statistics": self.dataset_statistics
-        }
-    
-    # --- Helper methods for continuous dataset growth ---
-    
-    def get_validation_ratio(self, default_ratio=0.2):
-        """Get the appropriate validation ratio for new data"""
-        if self.is_split_ratio_drifting():
-            return self.get_adjusted_val_ratio(default_ratio)
-        return default_ratio
-    
-    def get_full_manifest(self) -> Dict[str, Any]:
-        """Get the complete manifest data structure"""
-        self.update_dataset_statistics()
-        
-        return {
-            "dataset_info": self.dataset_info,
-            "shards": self.shards,
-            "statistics": self.dataset_statistics,
-            "processed_images": self.image_metadata,
-            "progress": {
-                "completed_images": list(self.completed_images),
-                "failed_images": self.failed_images,
-                "in_progress_image": self.in_progress_image,
-                "completed_patches": {
-                    img: list(patches) for img, patches in self.completed_patches.items()
-                },
-                "shard_indices": self.shard_indices,
-                "shard_sizes": self.shard_sizes,
-                "patch_counts": self.patch_counts
-            }
-        }
-    
+            self._reset_state()
+
     def validate_manifest_consistency(self) -> Dict[str, Any]:
         """Validate consistency between different tracking systems (read-only)"""
         issues = []
