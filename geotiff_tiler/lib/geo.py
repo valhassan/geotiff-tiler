@@ -19,43 +19,28 @@ from affine import Affine
 from pystac.extensions.eo import Band, ItemEOExtension
 from rasterio import MemoryFile
 from rasterio.shutil import copy as riocopy
-from rasterio.windows import Window
+from rasterio.windows import Window, bounds as window_bounds
 from requests.exceptions import ConnectionError, RequestException, Timeout
 from shapely.geometry import box
 
 logger = logging.getLogger(__name__)
 
-def check_stac(image_path: str) -> bool:
-    """Checks if an input string or object is a valid stac item"""
-    if isinstance(image_path, pystac.Item):
-        return True
-    else:
-        try:
-            pystac.Item.from_file(str(image_path))
-            return True
-        except Exception:
-            return False
-
-
-def check_label_type(label_path: str) -> bool:
-    """Checks if labels are raster or vector based on file extension"""
-    if label_path.endswith((".tif", ".tiff")):
+def check_label_type(label_path: str) -> str:
+    """Return ``raster`` or ``vector`` from the label file extension."""
+    lower = str(label_path).lower()
+    if lower.endswith((".tif", ".tiff")):
         return "raster"
-    elif label_path.endswith((".geojson", ".gpkg")):
+    if lower.endswith((".geojson", ".gpkg", ".shp")):
         return "vector"
-    else:
-        raise ValueError(
-            f"Invalid label type: {label_path}, "
-            "must be a raster (.tif, .tiff) or vector (.geojson, .gpkg) file"
-        )
+    raise ValueError(
+        f"Invalid label type: {label_path}, "
+        "must be raster (.tif/.tiff) or vector (.geojson/.gpkg/.shp)"
+    )
 
 
 def is_image_georeferenced(image: rasterio.DatasetReader) -> bool:
     """Checks if the image is georeferenced"""
-    if image.crs is not None and image.transform is not None:
-        return True
-    else:
-        return False
+    return image.crs is not None and image.transform is not None
 
 
 def is_label_georeferenced(
@@ -80,23 +65,10 @@ def check_alignment(
 
 
 def check_image_validity(image: rasterio.DatasetReader) -> Tuple[bool, str]:
-    """
-    Check if the image data is valid.
-
-    Args:
-        image: Opened rasterio dataset
-
-    Returns:
-        Tuple of (is_valid, message)
-    """
-    try:
-        # Check if the image has data
-        if image.width <= 0 or image.height <= 0:
-            return False, "Invalid dimensions"
-        return True, "Image is valid"
-
-    except Exception as e:
-        return False, f"Error reading image: {str(e)}"
+    """Check if the image has positive dimensions."""
+    if image.width <= 0 or image.height <= 0:
+        return False, "Invalid dimensions"
+    return True, "Image is valid"
 
 
 def check_label_validity(
@@ -142,9 +114,9 @@ def with_connection_retry(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         # Extract retry parameters from kwargs if provided, with enhanced defaults for STAC
-        max_retries = kwargs.pop('max_retries', 3) if 'max_retries' in kwargs else 3
-        retry_delay = kwargs.pop('retry_delay', 2.0) if 'retry_delay' in kwargs else 2.0  # Increased from 1.0
-        kwargs.pop('timeout', 45.0)
+        max_retries = kwargs.pop("max_retries", 3)
+        retry_delay = kwargs.pop("retry_delay", 2.0)
+        kwargs.pop("timeout", None)
         
         retry_count = 0
         last_error = None
@@ -346,25 +318,6 @@ class SingleBandItemEO(ItemEOExtension):
         """Checks if a band name is a valid common name according to STAC spec"""
         return True if Band.band_range(common_name) else False
 
-    @staticmethod
-    def band_to_cname(input_band: str):
-        """
-        Naive conversion of a band to a valid common name
-        See: https://github.com/stac-extensions/eo/issues/13
-        """
-        bands_ref = (("red", "R"), ("green", "G"), ("blue", "B"), ('nir', "N"))
-        if isinstance(input_band, int) and 1 <= input_band <= 4:
-            return bands_ref[input_band-1][0]
-        elif isinstance(input_band, str) and len(input_band) == 1:
-            for cname, short_name in bands_ref:
-                if input_band == short_name:
-                    return cname
-        elif isinstance(input_band, str) and len(input_band) > 1:
-            for cname, short_name in bands_ref:
-                if input_band == cname:
-                    return input_band
-        else:
-            raise ValueError(f"Cannot convert given band to valid stac common name. Got: {input_band}")
 
 try:
     import orjson
@@ -398,10 +351,7 @@ def clip_gdf_to_window(
     if label_gdf is None or label_gdf.empty:
         return label_gdf
 
-    win_transform = src_transform * Affine.translation(window.col_off, window.row_off)
-    bounds = rasterio.transform.array_bounds(window.height, window.width, win_transform)
-    patch_box = box(*bounds)
-
+    patch_box = box(*window_bounds(window, src_transform))
     hits = label_gdf.sindex.query(patch_box, predicate="intersects")
     return label_gdf.iloc[hits].reset_index(drop=True)
 
@@ -437,29 +387,18 @@ def gdf_to_geojson(
     if label_gdf is None or label_gdf.empty:
         return _dumps({"type": "FeatureCollection", "features": []})
 
-    # Geographic bounding box of this patch window
-    win_transform = src_transform * Affine.translation(window.col_off, window.row_off)
-    bounds = rasterio.transform.array_bounds(window.height, window.width, win_transform)
-    patch_box_geo = box(*bounds)
-
+    patch_box_geo = box(*window_bounds(window, src_transform))
     prop_cols = [c for c in label_gdf.columns if c not in drop_cols]
 
     features = []
     for idx in range(len(label_gdf)):
         geom = label_gdf.geometry.iloc[idx]
-
         if not geom.is_valid:
             geom = geom.make_valid()
-
-        # Clip geometry to patch extent (handles straddling features)
         geom = geom.intersection(patch_box_geo)
         if geom.is_empty:
             continue
-
-        # Truncation: original polygon extended beyond the patch boundary
         is_truncated = not patch_box_geo.contains(geom)
-
-        # Reduce coordinate precision — suppresses float64 bloat
         geom = shapely.set_precision(geom, grid_size=coord_precision)
 
         props: dict = {"is_truncated": bool(is_truncated)}
