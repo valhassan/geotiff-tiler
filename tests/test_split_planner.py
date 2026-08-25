@@ -89,7 +89,11 @@ def _make_scene(out: Path, name, sensor, size_px, gsd, origin, seed):
     gdf = gpd.GeoDataFrame({"class": vals}, geometry=feats, crs="EPSG:32618")
     lbl_path = out / f"{name}.gpkg"
     gdf.to_file(lbl_path, driver="GPKG")
-    return {"image": str(img_path), "label": str(lbl_path), "sensor": sensor}
+    return {
+        "image": str(img_path),
+        "label": str(lbl_path),
+        "metadata": {"split": "trn", "collection": sensor},
+    }
 
 
 def test_classify_and_merge():
