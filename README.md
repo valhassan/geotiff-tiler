@@ -1,43 +1,48 @@
 # GeoTIFF Tiler
 
-Cut training patches from image/label pairs. Run from the repo root — no install.
+Cut training patches from image/label pairs. You pass a list of dicts — no input files.
 
-```bash
-python -m geotiff_tiler verify pairs.csv -o report.csv
-python -m geotiff_tiler val_plan --input_files a.csv b.csv \
-    --plan_file split_plan.json --class_ids "{'background': 0, 'fore': 1}"
-python -m geotiff_tiler tile --input_file a.csv -o ./out --split_plan split_plan.json
+```python
+pairs = [{
+    "image": "./path/to/image.tif",
+    "label": "./path/to/label.gpkg",
+    "metadata": {
+        "split": "trn",            # trn or tst
+        "collection": "worldview-3",
+        "gsd": 0.46,               # any extra keys you want
+    },
+}]
 ```
 
 ## Pipeline
 
-1. **verify** — pre-flight checks on image/label pairs
-2. **val_plan** — build `split_plan.json` across sensors, before any tiling
-3. **tile** — cut patches (`patch` is an alias)
-
-CSV inputs require `image`/`image_url`, `label`/`label_path`, and `split` (`trn` or `tst`); extra columns become metadata. JSON is a list of `{image, label, metadata}` dicts with `split` in metadata.
-
-## Library
+**val_plan** runs once on *all sensors* (trn labeled pairs only). **verify** and **tile** run per sensor.
 
 ```python
+from geotiff_tiler.split_planner import run_planner
+from geotiff_tiler.verify import verify_dataset
 from geotiff_tiler.tiler import Tiler
 
-tiler = Tiler(
-    input_dict=[{
-        "image": "./path/to/image.tif",
-        "label": "./path/to/label.tif",
-        "metadata": {"split": "trn", "collection": "satellite-name", "gsd": 0.5},
-    }],
-    patch_size=(256, 256),
-    bands_requested=["red", "green", "blue", "nir"],
-    stride=128,
-    output_dir="./output/patches",
-    prefix="dataset_v1",
+run_planner(
+    all_pairs,                    # every sensor, trn+tst ok (tst ignored)
+    "split_plan.json",
+    class_ids={"background": 0, "fore": 1},
+    attr_fields=["class"],
+    attr_values=[1],
 )
-tiler.create_tiles()
+
+verify_dataset(wv3_pairs, output_report_path="report.csv")
+Tiler(
+    input_dict=wv3_pairs,
+    patch_size=(256, 256),
+    stride=128,
+    output_dir="./out",
+    split_plan="split_plan.json",
+    prefix="worldview-3",
+).create_tiles()
 ```
 
-See `python -m geotiff_tiler <cmd> --help` for flags. Dependencies are in `requirements.txt`.
+`python -m geotiff_tiler` prints this usage. Dependencies are in `requirements.txt`.
 
 ## License
 
