@@ -61,7 +61,6 @@ def compute_building_targets(
     image_path: str,
     tmp_dir: str,
     label_name: str,
-    building_class_val: int = 4,
     sigma: float = 3.0,
     max_dist_meters: float = 10.0,
     vertex_sigma: float = 1.5,
@@ -74,7 +73,6 @@ def compute_building_targets(
         image_path:         Path to the source image (for transform/shape).
         tmp_dir:            Temp directory for output tifs.
         label_name:         Stem used for output filenames.
-        building_class_val: Integer class id for buildings in the label raster.
         sigma:              EDT decay sigma for dual-distance weight map (metres).
         max_dist_meters:    Maximum inter-instance distance to consider (metres).
         vertex_sigma:       Gaussian sigma for vertex heatmap (pixels).
@@ -98,7 +96,6 @@ def compute_building_targets(
         ~building_gdf.geometry.is_empty & building_gdf.geometry.notnull()
     ].geometry.tolist())
 
-    # Compute all four targets in a single pass over geometries
     t = time.time()
     edt_map = _compute_dual_distance_edt(
         valid_geoms, h, w, transform, max_dist_px, sigma
@@ -135,17 +132,15 @@ def compute_building_targets(
             dtype=dtype_str,
             crs=crs,
             transform=transform,
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
         ) as dst:
             dst.write(arr.astype(dtype_np), 1)
         paths[key] = str(out_path)
         logger.info(f"[building_targets] wrote {key} → {out_path}")
 
     return paths
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Target 1: Dual-distance EDT weight map
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _compute_dual_distance_edt(
@@ -204,11 +199,6 @@ def _compute_dual_distance_edt(
     return np.clip(weight * 255, 0, 255).astype(np.uint8)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Target 2: Vector boundary map
-# ─────────────────────────────────────────────────────────────────────────────
-
-
 def _compute_vector_boundary(
     geoms, h: int, w: int, transform: Affine,
 ) -> np.ndarray:
@@ -226,9 +216,7 @@ def _compute_vector_boundary(
     r = 2
 
     for geom in geoms:
-        coords = np.array(geom.exterior.coords)
-        px = (coords[:, 0] - transform.c) / transform.a
-        py = (coords[:, 1] - transform.f) / transform.e
+        px, py = _pixel_coords(geom, transform)
 
         # Collect all sample points across all edges at once
         all_xs, all_ys = [], []
@@ -265,10 +253,6 @@ def _compute_vector_boundary(
 
     return np.clip(boundary, 0, 1)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Target 3: Vertex heatmap
-# ─────────────────────────────────────────────────────────────────────────────
-
 
 def _compute_vertex_heatmap(
     geoms, h: int, w: int, transform: Affine,
@@ -290,9 +274,9 @@ def _compute_vertex_heatmap(
     # Collect ALL vertices across all geometries at once
     all_vx, all_vy = [], []
     for geom in geoms:
-        coords = np.array(geom.exterior.coords[:-1])
-        all_vx.append((coords[:, 0] - transform.c) / transform.a)
-        all_vy.append((coords[:, 1] - transform.f) / transform.e)
+        px, py = _pixel_coords(geom, transform)
+        all_vx.append(px[:-1])
+        all_vy.append(py[:-1])
 
     if not all_vx:
         return heatmap
@@ -316,11 +300,6 @@ def _compute_vertex_heatmap(
     np.add.at(heatmap, (ni.ravel(), nj.ravel()), weights.ravel())
 
     return np.clip(heatmap, 0, 1)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Target 4: Signed Distance Field
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _compute_sdf(
@@ -428,6 +407,9 @@ def compute_road_targets(
         dtype="uint8",
         crs=crs,
         transform=transform,
+        tiled=True,
+        blockxsize=256,
+        blockysize=256,
     ) as dst:
         dst.write(centerline_weight, 1)
 
