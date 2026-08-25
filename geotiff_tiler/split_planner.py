@@ -22,7 +22,6 @@ from rasterio.transform import from_bounds as transform_from_bounds
 from rasterio.windows import from_bounds as window_from_bounds
 
 from geotiff_tiler.lib.io import load_vector_mask
-from geotiff_tiler.lib.pairs import load_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -283,7 +282,7 @@ def select_cells(
 
 
 def run_planner(
-    pairs: list[dict],
+    input_dict: list[dict],
     plan_file: str | Path,
     class_ids: dict[str, int],
     attr_fields: str | Sequence[str] | None,
@@ -295,7 +294,23 @@ def run_planner(
     coarse_factor: int = 4,
     label_threshold: float = 0.01,
 ) -> dict:
-    """Plan val cells for ``pairs`` of ``{image, label, sensor}`` (trn only)."""
+    """Plan val cells across all sensors. tst pairs are ignored.
+
+    Each item is ``{image, label, metadata}`` with ``split`` and
+    ``collection`` (or ``sensor``) in metadata.
+    """
+    pairs = []
+    for p in input_dict:
+        meta = p.get("metadata") or {}
+        split = str(meta.get("split") or "").strip().lower()
+        if split not in ("trn", "tst"):
+            raise ValueError(
+                f"{p.get('image')}: metadata['split'] must be trn or tst, "
+                f"got {meta.get('split')!r}"
+            )
+        if split == "trn" and p.get("label"):
+            pairs.append(p)
+    logger.info("Planning split for %d trn images", len(pairs))
     plan = load_plan(plan_file)
     plan["params"] = {
         "patch_size": patch_size,
@@ -311,6 +326,13 @@ def run_planner(
     analyses: dict[str, dict] = {}
     for p in pairs:
         name = Path(p["image"]).stem
+        meta = p.get("metadata") or {}
+        sensor = meta.get("collection") or meta.get("sensor")
+        if not sensor:
+            raise ValueError(
+                f"{p['image']}: metadata needs 'collection' or 'sensor'"
+            )
+        sensor = str(sensor)
         rec = plan["images"].get(name)
         if rec and rec.get("status") == "assigned":
             continue
@@ -330,15 +352,15 @@ def run_planner(
         except Exception as e:
             logger.error("%s: analysis failed: %s", name, e)
             plan["images"][name] = {
-                "sensor": p["sensor"],
+                "sensor": sensor,
                 "status": "error",
                 "reason": str(e),
             }
             continue
         if a is None:
-            plan["images"][name] = {"sensor": p["sensor"], "status": "skipped"}
+            plan["images"][name] = {"sensor": sensor, "status": "skipped"}
             continue
-        a["sensor"] = p["sensor"]
+        a["sensor"] = sensor
         analyses[name] = a
 
     if not analyses:
@@ -546,21 +568,3 @@ def classify_patch(
     if inside:
         return "val"
     return None if intersects else "trn"
-
-
-def _planner_pairs(paths: Sequence[str]) -> list[dict]:
-    pairs = []
-    for item in load_pairs(*paths, trn_only=True):
-        if not item.get("label"):
-            continue
-        meta = item.get("metadata") or {}
-        pairs.append(
-            {
-                "image": item["image"],
-                "label": item["label"],
-                "sensor": str(
-                    meta.get("collection") or meta.get("sensor") or "unknown"
-                ),
-            }
-        )
-    return pairs
