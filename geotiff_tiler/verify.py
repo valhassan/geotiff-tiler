@@ -16,8 +16,8 @@ from rasterio.enums import Resampling
 from shapely.geometry import box
 from tqdm import tqdm
 
-from geotiff_tiler.lib.geo import check_label_validity
-from geotiff_tiler.lib.io import load_vector_mask, validate_image
+from geotiff_tiler.lib.geo import check_label_type, check_label_validity
+from geotiff_tiler.lib.io import load_vector_mask, resolve_attr_field, validate_image
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +43,6 @@ LABEL_CHECKS = (
 )
 
 SAMPLE_MAX_DIM = 256
-VECTOR_EXTS = (".geojson", ".gpkg", ".shp")
-RASTER_EXTS = (".tif", ".tiff")
 
 
 @dataclass
@@ -80,30 +78,6 @@ def _skip_remaining(checks: dict[str, dict], names: Sequence[str], reason: str) 
     for name in names:
         if name not in checks:
             checks[name] = _skipped(reason)
-
-
-def _label_type(label_path: str) -> str:
-    lower = label_path.lower()
-    if lower.endswith(RASTER_EXTS):
-        return "raster"
-    if lower.endswith(VECTOR_EXTS):
-        return "vector"
-    raise ValueError(
-        f"Invalid label type: {label_path}, "
-        "must be raster (.tif/.tiff) or vector (.geojson/.gpkg/.shp)"
-    )
-
-
-def _resolve_attr_field(
-    columns: Sequence[str], attr_field: str | Sequence[str] | None
-) -> str | None:
-    if attr_field is None:
-        return None
-    fields = [attr_field] if isinstance(attr_field, str) else list(attr_field)
-    for name in fields:
-        if name in columns:
-            return name
-    return None
 
 
 def _overlap_fractions(poly_a, poly_b) -> dict[str, float]:
@@ -286,13 +260,9 @@ def verify_pair(
     raster_nodata = None
 
     try:
-        label_type = _label_type(label)
+        label_type = check_label_type(label)
         if label_type == "vector":
-            label_gdf = (
-                load_vector_mask(label)
-                if Path(label).suffix.lower() == ".gpkg"
-                else gpd.read_file(label)
-            )
+            label_gdf = load_vector_mask(label)
             valid, msg = check_label_validity(label_gdf)
             detail: dict[str, Any] = {
                 "type": "vector",
@@ -331,22 +301,18 @@ def verify_pair(
         _skip_remaining(checks, LABEL_CHECKS, "label unreadable")
         return _finish(result_id, image, label, checks, errors)
 
-    try:
-        if image_bounds is None:
-            checks["crs_match"] = _skipped("image unreadable")
-        elif image_crs is None or label_crs is None:
-            checks["crs_match"] = _check(
-                False,
-                {"image_crs": str(image_crs), "label_crs": str(label_crs)},
-            )
-        else:
-            checks["crs_match"] = _check(
-                image_crs == label_crs,
-                {"image_crs": str(image_crs), "label_crs": str(label_crs)},
-            )
-    except Exception as e:
-        errors.append(f"crs_match: {e}")
-        checks["crs_match"] = _check(False, str(e))
+    if image_bounds is None:
+        checks["crs_match"] = _skipped("image unreadable")
+    elif image_crs is None or label_crs is None:
+        checks["crs_match"] = _check(
+            False,
+            {"image_crs": str(image_crs), "label_crs": str(label_crs)},
+        )
+    else:
+        checks["crs_match"] = _check(
+            image_crs == label_crs,
+            {"image_crs": str(image_crs), "label_crs": str(label_crs)},
+        )
 
     try:
         if image_bounds is None:
@@ -399,7 +365,7 @@ def _run_attr_checks(
     else:
         try:
             assert label_gdf is not None
-            resolved = _resolve_attr_field(label_gdf.columns, attr_field)
+            resolved = resolve_attr_field(label_gdf.columns, attr_field)
             checks["attr_field_exists"] = _check(
                 resolved is not None,
                 {
