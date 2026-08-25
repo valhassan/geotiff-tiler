@@ -38,7 +38,6 @@ from geotiff_tiler.lib.io import (
     validate_pair,
 )
 from geotiff_tiler.lib.manifest import TilingManifest
-from geotiff_tiler.lib.pairs import resolve_split
 from geotiff_tiler.lib.viz import create_dataset_summary_visualization
 from geotiff_tiler.split_planner import classify_patch, load_plan, val_rects_for_image
 
@@ -156,7 +155,13 @@ class Tiler:
         for item in tqdm(self.input_dict, desc="Processing input pairs"):
             image_path, label_path = item["image"], item["label"]
             metadata = dict(item.get("metadata") or {})
-            metadata["split"] = resolve_split(metadata)
+            split = str(metadata.get("split") or "").strip().lower()
+            if split not in ("trn", "tst"):
+                raise ValueError(
+                    f"{image_path}: metadata['split'] must be trn or tst, "
+                    f"got {metadata.get('split')!r}"
+                )
+            metadata["split"] = split
             image_name = Path(str(image_path)).stem
             image_tmp = tmp_root / image_name
             if image_tmp.exists():
@@ -881,7 +886,3 @@ class Tiler:
             logger.info(
                 "Manifest validation: FAILED (%s)", ", ".join(result["issues"])
             )
-
-    # kept for callers that still use the old names
-    process_single_pair = _prepare_pair
-    tiling = _tile_image
