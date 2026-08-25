@@ -2,20 +2,17 @@
 
 from __future__ import annotations
 
-import gc
 import json
 import logging
 import os
 import shutil
 import time
-from collections import defaultdict
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Any
 
 import numpy as np
-import psutil
 import rasterio
 import webdataset as wds
 from rasterio.windows import Window, bounds as window_bounds
@@ -28,7 +25,6 @@ from geotiff_tiler.lib.dra import (
 )
 from geotiff_tiler.lib.geo import clip_gdf_to_window, gdf_to_geojson
 from geotiff_tiler.lib.io import (
-    calculate_overlap,
     clip_to_intersection,
     ensure_crs_match,
     log_stage,
@@ -39,17 +35,17 @@ from geotiff_tiler.lib.io import (
 )
 from geotiff_tiler.lib.manifest import TilingManifest
 from geotiff_tiler.lib.viz import create_dataset_summary_visualization
-from geotiff_tiler.split_planner import classify_patch, load_plan, val_rects_for_image
+from geotiff_tiler.split_planner import (
+    classify_patch,
+    load_plan,
+    require_split,
+    val_rects_for_image,
+)
 
 logger = logging.getLogger(__name__)
 
 _MAX_SHARD = 2 * 1024 * 1024 * 1024
 _SPLITS = ("trn", "val", "tst")
-
-
-def _rss_mb() -> float:
-    gc.collect()
-    return psutil.Process().memory_info().rss / 1024 / 1024
 
 
 def _class_distribution(
@@ -134,10 +130,9 @@ class Tiler:
                 raise ValueError("apply_dra=True requires dra_cal path")
             self.dra_cals = load_calibration(dra_cal)
         self.manifest = TilingManifest(output_dir, self.prefix)
-        self.prefix_patch_counts = defaultdict(lambda: {s: 0 for s in _SPLITS})
-        self.prefix_shard_indices = defaultdict(lambda: {s: 0 for s in _SPLITS})
-        self.prefix_shard_sizes = defaultdict(lambda: {s: 0 for s in _SPLITS})
-        self.prefix_writers: dict = {}
+        self._patch_counts = {s: 0 for s in _SPLITS}
+        self._shard_indices = {s: 0 for s in _SPLITS}
+        self._writers: dict = {}
         self._csv_writers: dict[str, IO[str]] = {}
 
     def create_tiles(self) -> dict[str, int]:
@@ -155,12 +150,7 @@ class Tiler:
         for item in tqdm(self.input_dict, desc="Processing input pairs"):
             image_path, label_path = item["image"], item["label"]
             metadata = dict(item.get("metadata") or {})
-            split = str(metadata.get("split") or "").strip().lower()
-            if split not in ("trn", "tst"):
-                raise ValueError(
-                    f"{image_path}: metadata['split'] must be trn or tst, "
-                    f"got {metadata.get('split')!r}"
-                )
+            split = require_split(metadata, image_path)
             metadata["split"] = split
             image_name = Path(str(image_path)).stem
             image_tmp = tmp_root / image_name
@@ -213,10 +203,6 @@ class Tiler:
         logger.info("Phase 2: tile")
         for analysis in tqdm(analyses, desc="Tiling"):
             name = analysis["image_name"]
-            if self.manifest.is_image_completed(name):
-                summary["skipped"] += 1
-                continue
-            self.manifest.mark_image_in_progress(name)
             try:
                 self._tile_image(analysis)
                 self.manifest.mark_image_completed(name)
@@ -225,6 +211,7 @@ class Tiler:
                 self.manifest.mark_image_failed(name, str(e))
                 summary["failed"] += 1
             finally:
+                analysis.pop("label_gdf", None)
                 if self.output_format == "tar":
                     self._close_all_writers(flush_only=True)
                 self.manifest.save_manifest()
@@ -309,14 +296,7 @@ class Tiler:
             image_path, label_path = ensure_crs_match(
                 image_path, label_path, label_type, tmp_dir
             )
-            overlap_pct, overlap_msg = calculate_overlap(
-                image_path, label_path, label_type
-            )
-            if overlap_pct == 0:
-                return {"status": "skipped", "reason": f"No overlap: {overlap_msg}"}
-            logger.info(
-                "Image: %s with %s (rss=%.0fMB)", image_name, overlap_msg, _rss_mb()
-            )
+            logger.info("Image: %s", image_name)
             clipped_image, clipped_label = clip_to_intersection(
                 image_path, label_path, label_type, tmp_dir
             )
@@ -383,16 +363,13 @@ class Tiler:
         return new_path, asdict(decision)
 
     def _init_writers(self) -> None:
-        self.prefix_patch_counts = defaultdict(lambda: {s: 0 for s in _SPLITS})
+        self._patch_counts = {s: 0 for s in _SPLITS}
         if self.output_format == "tar":
-            self.prefix_shard_indices = defaultdict(lambda: {s: 0 for s in _SPLITS})
-            self.prefix_shard_sizes = defaultdict(lambda: {s: 0 for s in _SPLITS})
             for split in _SPLITS:
-                idx, size, count = self.manifest.get_shard_info(self.prefix, split)
-                self.prefix_shard_indices[self.prefix][split] = idx
-                self.prefix_shard_sizes[self.prefix][split] = size
-                self.prefix_patch_counts[self.prefix][split] = count
-            self.prefix_writers = {}
+                idx, _, count = self.manifest.get_shard_info(self.prefix, split)
+                self._shard_indices[split] = idx
+                self._patch_counts[split] = count
+            self._writers = {}
         else:
             self._csv_writers = {}
 
@@ -449,6 +426,10 @@ class Tiler:
                 splits = ("trn", "val") if create_val_set else ("tst",)
                 for s in splits:
                     (out_root / s).mkdir(parents=True, exist_ok=True)
+                    if self.output_format == "csv":
+                        (out_root / s / "image").mkdir(parents=True, exist_ok=True)
+                        (out_root / s / "label").mkdir(parents=True, exist_ok=True)
+                        (out_root / s / "vector").mkdir(parents=True, exist_ok=True)
 
                 logger.info(
                     "Tiling %d x %d x %d  patch=%s stride=%s",
@@ -585,10 +566,10 @@ class Tiler:
                                     geojson_str,
                                 )
                             self.manifest.mark_patch_completed(image_name, x, y)
-                            self.prefix_patch_counts[self.prefix][split] += 1
-                            if kept % 100 == 0:
-                                self.manifest.save_manifest()
+                            self._patch_counts[split] += 1
                             kept += 1
+                            if kept % 100 == 0:
+                                self._checkpoint()
                             pbar.update(1)
 
                 logger.info(
@@ -624,14 +605,13 @@ class Tiler:
             + len(json.dumps(all_metadata).encode())
         )
         if self._shard_size(split) + est > _MAX_SHARD:
-            self._close_writer(self.prefix, split)
-            idx = self.prefix_shard_indices[self.prefix][split]
-            self.manifest.close_shard(self.prefix, split, idx)
-            self.prefix_shard_indices[self.prefix][split] = idx + 1
+            self._close_writer(split)
+            idx = self._shard_indices[split]
+            self.manifest.close_shard(split, idx)
+            self._shard_indices[split] = idx + 1
             self.manifest.update_shard_record(
                 self.prefix, split, idx + 1, 0, 0, "OPEN", [image_name]
             )
-            self.prefix_shard_sizes[self.prefix][split] = 0
 
         writer = self._get_writer(split, split_dir)
         sample = {
@@ -644,15 +624,13 @@ class Tiler:
         if geojson_str is not None:
             sample["vectors.geojson"] = geojson_str.encode("utf-8")
         writer.write(sample)
-        size = self._shard_size(split)
-        self.prefix_shard_sizes[self.prefix][split] = size
-        idx = self.prefix_shard_indices[self.prefix][split]
+        idx = self._shard_indices[split]
         self.manifest.update_shard_info(
             self.prefix,
             split,
             idx,
-            size,
-            self.prefix_patch_counts[self.prefix][split] + 1,
+            self._shard_size(split),
+            self._patch_counts[split] + 1,
         )
         self.manifest.update_image_patch_info(image_name, split, idx)
 
@@ -693,7 +671,7 @@ class Tiler:
         nz = np.count_nonzero(label)
         if self.discard_empty and nz == 0:
             return False
-        if self.label_threshold is not None and nz / label.size < self.label_threshold:
+        if nz / label.size < self.label_threshold:
             return False
         return True
 
@@ -701,24 +679,21 @@ class Tiler:
         return os.path.join(base, f"{prefix}-{split}-{idx:06d}.tar")
 
     def _get_writer(self, split, output_dir):
-        prefix = self.prefix
-        if prefix not in self.prefix_writers:
-            self.prefix_writers[prefix] = {}
-        if split not in self.prefix_writers[prefix]:
-            idx = self.prefix_shard_indices[prefix][split]
-            path = self._shard_path(output_dir, prefix, split, idx)
+        if split not in self._writers:
+            idx = self._shard_indices[split]
+            path = self._shard_path(output_dir, self.prefix, split, idx)
             fh = open(path, "wb")
-            self.prefix_writers[prefix][split] = {
+            self._writers[split] = {
                 "writer": wds.TarWriter(fh),
                 "file_obj": fh,
                 "path": path,
             }
-        return self.prefix_writers[prefix][split]["writer"]
+        return self._writers[split]["writer"]
 
-    def _close_writer(self, prefix, split, flush_only=False):
-        if prefix not in self.prefix_writers or split not in self.prefix_writers[prefix]:
+    def _close_writer(self, split, flush_only=False):
+        info = self._writers.get(split)
+        if not info:
             return
-        info = self.prefix_writers[prefix][split]
         writer, fh = info["writer"], info["file_obj"]
         if flush_only:
             if hasattr(writer, "tarfile") and hasattr(writer.tarfile, "fileobj"):
@@ -727,20 +702,18 @@ class Tiler:
             return
         writer.close()
         fh.close()
-        del self.prefix_writers[prefix][split]
+        del self._writers[split]
 
     def _close_all_writers(self, flush_only=False):
-        for prefix in list(self.prefix_writers):
-            for split in list(self.prefix_writers[prefix]):
-                self._close_writer(prefix, split, flush_only)
+        for split in list(self._writers):
+            self._close_writer(split, flush_only)
         if not flush_only:
-            self.prefix_writers.clear()
+            self._writers.clear()
 
     def _shard_size(self, split) -> int:
-        prefix = self.prefix
-        if prefix not in self.prefix_writers or split not in self.prefix_writers[prefix]:
+        info = self._writers.get(split)
+        if not info:
             return 0
-        info = self.prefix_writers[prefix][split]
         writer = info["writer"]
         if hasattr(writer, "tarfile") and hasattr(writer.tarfile, "fileobj"):
             return writer.tarfile.fileobj.tell()
@@ -748,19 +721,28 @@ class Tiler:
             return os.path.getsize(info["path"])
         return 0
 
+    def _checkpoint(self) -> None:
+        """Flush outputs + persist manifest. Same cadence for tar and csv."""
+        if self.output_format == "tar":
+            self._close_all_writers(flush_only=True)
+        else:
+            for fh in self._csv_writers.values():
+                fh.flush()
+                os.fsync(fh.fileno())
+        self.manifest.save_manifest()
+
     def _get_csv_writer(self, split: str, output_dir: Path) -> IO[str]:
         if split not in self._csv_writers:
-            self._csv_writers[split] = open(
-                Path(output_dir) / f"{split}.csv", "a", buffering=1
-            )
+            self._csv_writers[split] = open(Path(output_dir) / f"{split}.csv", "a")
         return self._csv_writers[split]
 
     def _close_all_csv_writers(self) -> None:
         for fh in self._csv_writers.values():
             try:
                 fh.flush()
+                os.fsync(fh.fileno())
                 fh.close()
-            except Exception:
+            except OSError:
                 pass
         self._csv_writers.clear()
 
@@ -779,15 +761,9 @@ class Tiler:
     ):
         img_dir = output_root / split / "image"
         lbl_dir = output_root / split / "label"
-        img_dir.mkdir(parents=True, exist_ok=True)
-        lbl_dir.mkdir(parents=True, exist_ok=True)
         img_path = img_dir / f"{patch_key}.tif"
         lbl_path = lbl_dir / f"{patch_key}_lbl.tif"
-        transform = (
-            src_image.window_transform(window)
-            if window is not None
-            else src_image.transform
-        )
+        transform = src_image.window_transform(window)
         img_profile = src_image.profile.copy()
         img_profile.update(
             width=self.patch_size[1],
@@ -795,6 +771,9 @@ class Tiler:
             count=image_patch.shape[0],
             driver="GTiff",
             compress="lzw",
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
             transform=transform,
         )
         with rasterio.open(img_path, "w", **img_profile) as dst:
@@ -806,6 +785,9 @@ class Tiler:
             count=label_patch.shape[0],
             driver="GTiff",
             compress="lzw",
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
             transform=transform,
         )
         with rasterio.open(lbl_path, "w", **lbl_profile) as dst:
@@ -825,7 +807,6 @@ class Tiler:
         rel_vector = None
         if geojson_str is not None:
             vec_dir = output_root / split / "vector"
-            vec_dir.mkdir(parents=True, exist_ok=True)
             vec_path = vec_dir / f"{patch_key}.geojson"
             vec_path.write_text(geojson_str, encoding="utf-8")
             rel_vector = vec_path.relative_to(output_root)
@@ -858,7 +839,7 @@ class Tiler:
 
     def _log_finish(self, summary: dict) -> None:
         logger.info("Processing complete: %s", summary)
-        counts = self.prefix_patch_counts[self.prefix]
+        counts = self._patch_counts
         sizes = (
             self.manifest.get_total_sizes_by_split()
             if self.output_format == "tar"
