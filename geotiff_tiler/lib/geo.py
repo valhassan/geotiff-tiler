@@ -278,12 +278,13 @@ class SingleBandItemEO(ItemEOExtension):
 
         bands = []
         for band in self.bands_requested.keys():
+            eo_band = self.bands_requested[band]["meta"].extra_fields["eo:bands"][0]
             band = Band.create(
                 name=self.bands_requested[band]['name'],
                 common_name=band,
                 description=self.bands_requested[band]['meta'].description,
-                center_wavelength=self.bands_requested[band]['meta'].extra_fields['eo:bands'][0]['center_wavelength'],
-                full_width_half_max=self.bands_requested[band]['meta'].extra_fields['eo:bands'][0]['full_width_half_max'])
+                center_wavelength=eo_band.get("center_wavelength"),
+                full_width_half_max=eo_band.get("full_width_half_max"))
             bands.append(band)
         self.bands = bands
 
