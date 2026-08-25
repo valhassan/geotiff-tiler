@@ -27,12 +27,11 @@ HARD_CHECKS = frozenset(
         "band_count",
         "not_degenerate",
         "label_valid",
-        "crs_match",
         "spatial_overlap",
         "attr_field_exists",
     }
 )
-SOFT_CHECKS = frozenset({"attr_values_match", "nonempty_after_filter"})
+SOFT_CHECKS = frozenset({"crs_match", "attr_values_match", "nonempty_after_filter"})
 LABEL_CHECKS = (
     "label_valid",
     "crs_match",
