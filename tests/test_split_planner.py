@@ -152,9 +152,11 @@ def test_planner_e2e():
         for c in ["fore", "hydro", "road", "building"]:
             assert v[c] > 0, f"class {c} absent from val"
 
-        rec = plan["images"]["wv3_a"]
+        rec = plan["images"][pairs[0]["metadata"]["pair_id"]]
         rects = val_rects_for_image(
-            plan, "wv3_a", rasterio.crs.CRS.from_string(rec["crs"])
+            plan,
+            pairs[0]["metadata"]["pair_id"],
+            rasterio.crs.CRS.from_string(rec["crs"]),
         )
         assert rects, "no val rects for wv3_a"
         gsd = 0.31
@@ -197,7 +199,8 @@ def test_planner_e2e():
             assert json.dumps(plan2["images"][k], sort_keys=True) == v, (
                 f"assignment for {k} changed on rerun"
             )
-        assert plan2["images"]["ps2_b"]["status"] == "assigned"
+        pid_new = pairs2[-1]["metadata"]["pair_id"]
+        assert plan2["images"][pid_new]["status"] == "assigned"
         r2 = (
             plan2["sensors"]["planetscope-2"]["est_val_patches"]
             / plan2["sensors"]["planetscope-2"]["total_patches"]
