@@ -625,14 +625,14 @@ def rasterize_vector(
                 src: (dst + 1 if continuous else src)
                 for dst, src in enumerate(attr_values)
             }
-
-            if all(
-                isinstance(val, str)
-                for val in vector_clean[attr_field].unique().tolist()
-            ):
-                cont_vals_dict = {str(src): dst for src, dst in cont_vals_dict.items()}
+            cont_vals_dict.update(
+                {str(k): v for k, v in list(cont_vals_dict.items())}
+            )
 
             vector_clean["burn_val"] = vector_clean[attr_field].map(cont_vals_dict)
+            vector_clean = vector_clean.dropna(subset=["burn_val"])
+            if vector_clean.empty:
+                return None, gpd.GeoDataFrame()
             vector_clean = vector_clean.sort_values("burn_val")
             burn_attribute = "burn_val"
             erosion_burn_vals = {
