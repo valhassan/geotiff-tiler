@@ -229,16 +229,21 @@ def verify_pair(
                 image_bounds = box(*src.bounds)
                 band_count = src.count
                 degenerate, deg_detail = _sample_is_degenerate(src)
-        checks["image_readable"] = _check(
-            True,
-            {"opened_via": "stac_vrt" if str(resolved) != str(image) else "path"},
-        )
+        if str(resolved) == str(image):
+            via = "path"
+        elif Path(resolved).name.endswith("_bands.vrt"):
+            via = "band_vrt"
+        else:
+            via = "stac_vrt"
+        checks["image_readable"] = _check(True, {"opened_via": via})
     except Exception as e:
         errors.append(f"image_readable: {e}")
         checks["image_readable"] = _check(False, str(e))
         checks["band_count"] = _skipped("image unreadable")
         checks["not_degenerate"] = _skipped("image unreadable")
 
+    if bands_expected is None and band_indices:
+        bands_expected = len(band_indices)
     if "band_count" not in checks:
         if bands_expected is None:
             checks["band_count"] = _check(
