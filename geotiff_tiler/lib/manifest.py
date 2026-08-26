@@ -499,6 +499,7 @@ class TilingManifest:
         }
         
         # Write to temporary file first (atomic write pattern)
+        self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = self.manifest_path.with_suffix('.tmp')
         with open(temp_path, 'w') as f:
             json.dump(manifest_data, f, indent=2, cls=NumpyEncoder)
