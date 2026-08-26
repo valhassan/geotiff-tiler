@@ -260,7 +260,7 @@ class TilingManifest:
 
     def close_shard(self, split: str, shard_index: int):
         """Mark a shard as closed (no more data can be added)"""
-        for shard in self.shards[split]:
+        for shard in self.shards.get(split, []):
             if shard["id"] == shard_index:
                 shard["status"] = "CLOSED"
                 shard["closed_at"] = datetime.now().isoformat()
