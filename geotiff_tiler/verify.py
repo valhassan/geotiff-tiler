@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -185,6 +186,7 @@ def verify_pair(
     class_ids: dict | None = None,
     bands_expected: int | None = None,
     bands_requested: Sequence[str] | None = None,
+    band_indices: Sequence[int] | None = None,
     pair_id: str | None = None,
 ) -> VerificationResult:
     """Run all verification checks on one image/label pair.
@@ -197,6 +199,7 @@ def verify_pair(
         class_ids: Name-to-id mapping for raster labels.
         bands_expected: Required image band count, if known.
         bands_requested: STAC common-name bands for ``validate_image``.
+        band_indices: 1-based source band order for local TIFFs.
         pair_id: Report id; defaults to the image stem.
 
     Returns:
@@ -213,16 +216,17 @@ def verify_pair(
     deg_detail: dict | None = None
 
     try:
-        resolved = (
-            validate_image(image, bands_requested=bands_requested)
-            if bands_requested is not None
-            else validate_image(image)
-        )
-        with rasterio.open(resolved) as src:
-            image_crs = src.crs
-            image_bounds = box(*src.bounds)
-            band_count = src.count
-            degenerate, deg_detail = _sample_is_degenerate(src)
+        vkw: dict[str, Any] = {"band_indices": band_indices}
+        if bands_requested is not None:
+            vkw["bands_requested"] = bands_requested
+        with tempfile.TemporaryDirectory() as td:
+            vkw["tmp_dir"] = td
+            resolved = validate_image(image, **vkw)
+            with rasterio.open(resolved) as src:
+                image_crs = src.crs
+                image_bounds = box(*src.bounds)
+                band_count = src.count
+                degenerate, deg_detail = _sample_is_degenerate(src)
         checks["image_readable"] = _check(
             True,
             {"opened_via": "stac_vrt" if str(resolved) != str(image) else "path"},
@@ -485,6 +489,7 @@ def verify_dataset(
     class_ids: dict | None = None,
     bands_expected: int | None = None,
     bands_requested: Sequence[str] | None = None,
+    band_indices: Sequence[int] | None = None,
 ) -> pd.DataFrame:
     """Verify all pairs in a Tiler-style ``input_dict``.
 
@@ -497,6 +502,7 @@ def verify_dataset(
         class_ids: Name-to-id mapping for raster labels.
         bands_expected: Required image band count, if known.
         bands_requested: STAC common-name bands for ``validate_image``.
+        band_indices: 1-based source band order for local TIFFs.
 
     Returns:
         DataFrame with one row per pair and a rollup logged to INFO.
@@ -515,6 +521,7 @@ def verify_dataset(
                 class_ids=class_ids,
                 bands_expected=bands_expected,
                 bands_requested=bands_requested,
+                band_indices=band_indices,
             )
         )
 
