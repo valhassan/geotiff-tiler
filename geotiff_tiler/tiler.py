@@ -36,6 +36,7 @@ from geotiff_tiler.lib.io import (
 from geotiff_tiler.lib.manifest import TilingManifest
 from geotiff_tiler.lib.viz import create_dataset_summary_visualization
 from geotiff_tiler.split_planner import (
+    assign_pair_ids,
     classify_patch,
     load_plan,
     require_split,
@@ -146,24 +147,28 @@ class Tiler:
         tmp_root.mkdir(parents=True, exist_ok=True)
         analyses = []
 
+        assign_pair_ids(self.input_dict)
         logger.info("Phase 1: prepare pairs")
         for item in tqdm(self.input_dict, desc="Processing input pairs"):
             image_path, label_path = item["image"], item["label"]
             metadata = dict(item.get("metadata") or {})
             split = require_split(metadata, image_path)
             metadata["split"] = split
-            image_name = Path(str(image_path)).stem
+            image_name = metadata["pair_id"]
+            source_stem = Path(str(image_path)).stem
+
+            if self.manifest.is_image_completed(image_name):
+                logger.info("Skipping already completed pair: %s", image_name)
+                summary["skipped"] += 1
+                continue
+
             image_tmp = tmp_root / image_name
             if image_tmp.exists():
                 shutil.rmtree(image_tmp)
             image_tmp.mkdir(parents=True, exist_ok=True)
-
-            if self.manifest.is_image_completed(image_name):
-                logger.info("Skipping already completed image: %s", image_name)
-                summary["skipped"] += 1
-                continue
             self.manifest.mark_image_in_progress(image_name)
             metadata["image_name"] = image_name
+            metadata["source_image"] = metadata.get("source_image") or source_stem
             metadata["patch_size"] = self.patch_size
             metadata["stride"] = self.stride
 
@@ -238,7 +243,7 @@ class Tiler:
         retry = [
             item
             for item in self.input_dict
-            if Path(str(item["image"])).stem in failed
+            if item.get("metadata", {}).get("pair_id") in failed
         ]
         if not retry:
             logger.warning("Failed images not found in input_dict")
@@ -262,7 +267,9 @@ class Tiler:
                 still = [
                     item
                     for item in self.input_dict
-                    if self.manifest.is_image_failed(Path(str(item["image"])).stem)
+                    if self.manifest.is_image_failed(
+                        item.get("metadata", {}).get("pair_id")
+                    )
                 ]
                 self.input_dict = still
                 if not still:
