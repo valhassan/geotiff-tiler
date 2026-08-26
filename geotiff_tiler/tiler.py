@@ -279,7 +279,10 @@ class Tiler:
         image_name = Path(str(image_path)).stem
         try:
             image_path = validate_image(
-                image_path, self.bands_requested, self.band_indices
+                image_path,
+                self.bands_requested,
+                self.band_indices,
+                tmp_dir,
             )
             label_path, label_type = validate_mask(label_path)
             check = validate_pair(image_path, label_path, label_type)
