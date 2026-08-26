@@ -161,17 +161,31 @@ def _looks_like_stac(image_path: str) -> bool:
     return s.startswith(("http://", "https://")) or s.endswith((".json", ".jsonl"))
 
 
+def _local_image(
+    image_path: str,
+    band_indices: Sequence | None,
+    tmp_dir: str | Path | None,
+) -> str:
+    if not band_indices:
+        return image_path
+    if tmp_dir is None:
+        raise ValueError("band_indices requires tmp_dir")
+    out = Path(tmp_dir) / f"{Path(image_path).stem}_bands.vrt"
+    return select_bands(image_path, band_indices, out)
+
+
 @with_connection_retry
 @log_stage(stage_name="validate_image")
 def validate_image(
     image_path: str,
     bands_requested: Sequence = ["red", "green", "blue"],
     band_indices: Sequence | None = None,
+    tmp_dir: str | Path | None = None,
 ):
     """Validates an image from a path or stac item"""
     local = Path(image_path).exists()
     if local and not _looks_like_stac(image_path):
-        return select_bands(image_path, band_indices) if band_indices else image_path
+        return _local_image(image_path, band_indices, tmp_dir)
 
     try:
         stac_item = pystac.Item.from_file(image_path)
@@ -180,7 +194,7 @@ def validate_image(
         return stack_bands(stac_bands)
     except Exception:
         if local:
-            return select_bands(image_path, band_indices) if band_indices else image_path
+            return _local_image(image_path, band_indices, tmp_dir)
         raise FileNotFoundError(f"File not found: {image_path}") from None
 
 
