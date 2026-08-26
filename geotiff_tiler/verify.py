@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -19,6 +20,7 @@ from tqdm import tqdm
 
 from geotiff_tiler.lib.geo import check_label_type, check_label_validity
 from geotiff_tiler.lib.io import load_vector_mask, resolve_attr_field, validate_image
+from geotiff_tiler.split_planner import assign_pair_ids
 
 logger = logging.getLogger(__name__)
 
@@ -480,6 +482,35 @@ def _flatten_result(result: VerificationResult) -> dict:
     return row
 
 
+def _warn_duplicates(pairs: list[dict]) -> None:
+    """Log colliding names/paths. Does not change status or skip rows."""
+    by_url: dict[str, list[str]] = defaultdict(list)
+    by_stem: dict[str, list[str]] = defaultdict(list)
+    by_pair: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for item in pairs:
+        pid = str(item["metadata"]["pair_id"])
+        img = str(item.get("image") or "")
+        lbl = str(item.get("label") or "")
+        meta = item.get("metadata") or {}
+        stem = str(meta.get("id") or Path(img).stem)
+        by_url[img].append(pid)
+        by_stem[stem].append(pid)
+        by_pair[(img, lbl)].append(pid)
+
+    def _log(kind: str, groups: dict) -> None:
+        hits = {k: v for k, v in groups.items() if len(v) > 1}
+        if not hits:
+            return
+        logger.warning("sanity: %d %s", len(hits), kind)
+        for key, pids in hits.items():
+            label = key[0] if isinstance(key, tuple) else key
+            logger.warning("  %s  rows=%s", label, ", ".join(pids))
+
+    _log("duplicate image+label group(s)", by_pair)
+    _log("duplicate image URL(s)", by_url)
+    _log("duplicate image name(s)", by_stem)
+
+
 def verify_dataset(
     input_dict: list[dict],
     output_report_path: str | None = None,
@@ -507,15 +538,15 @@ def verify_dataset(
     Returns:
         DataFrame with one row per pair and a rollup logged to INFO.
     """
+    assign_pair_ids(input_dict)
+    _warn_duplicates(input_dict)
     results: list[VerificationResult] = []
     for item in tqdm(input_dict, desc="Verifying pairs"):
-        meta = item.get("metadata") or {}
-        pair_id = meta.get("id") or meta.get("aoi_id") or Path(str(item["image"])).stem
         results.append(
             verify_pair(
                 image=item["image"],
                 label=item.get("label"),
-                pair_id=str(pair_id),
+                pair_id=item["metadata"]["pair_id"],
                 attr_field=attr_field,
                 attr_values=attr_values,
                 class_ids=class_ids,
