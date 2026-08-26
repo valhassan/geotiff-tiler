@@ -14,7 +14,7 @@ from typing import Any, Sequence
 
 import pandas as pd
 
-from geotiff_tiler.split_planner import run_planner
+from geotiff_tiler.split_planner import assign_pair_ids, run_planner
 from geotiff_tiler.tiler import Tiler
 from geotiff_tiler.verify import verify_dataset
 
@@ -83,7 +83,7 @@ def prepare_dataset(df: pd.DataFrame) -> list[dict]:
             "label": None if label is None else str(label),
             "metadata": meta,
         })
-    return dataset
+    return assign_pair_ids(dataset)
 
 
 def csv_paths(inputs: Sequence[str]) -> list[Path]:
