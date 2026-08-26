@@ -605,13 +605,7 @@ class Tiler:
             + len(json.dumps(all_metadata).encode())
         )
         if self._shard_size(split) + est > _MAX_SHARD:
-            self._close_writer(split)
-            idx = self._shard_indices[split]
-            self.manifest.close_shard(split, idx)
-            self._shard_indices[split] = idx + 1
-            self.manifest.update_shard_record(
-                self.prefix, split, idx + 1, 0, 0, "OPEN", [image_name]
-            )
+            self._rotate_shard(split, image_name)
 
         writer = self._get_writer(split, split_dir)
         sample = {
@@ -678,10 +672,25 @@ class Tiler:
     def _shard_path(self, base, prefix, split, idx):
         return os.path.join(base, f"{prefix}-{split}-{idx:06d}.tar")
 
+    def _rotate_shard(self, split: str, image_name: str | None = None) -> None:
+        self._close_writer(split)
+        idx = self._shard_indices[split]
+        self.manifest.close_shard(split, idx)
+        self._shard_indices[split] = idx + 1
+        images = [image_name] if image_name else []
+        self.manifest.update_shard_record(
+            self.prefix, split, idx + 1, 0, 0, "OPEN", images
+        )
+
     def _get_writer(self, split, output_dir):
         if split not in self._writers:
             idx = self._shard_indices[split]
             path = self._shard_path(output_dir, self.prefix, split, idx)
+            while os.path.exists(path) and os.path.getsize(path) > 0:
+                logger.info("shard exists, skipping to next: %s", path)
+                self._rotate_shard(split)
+                idx = self._shard_indices[split]
+                path = self._shard_path(output_dir, self.prefix, split, idx)
             fh = open(path, "wb")
             self._writers[split] = {
                 "writer": wds.TarWriter(fh),
