@@ -153,6 +153,12 @@ def _parser() -> argparse.ArgumentParser:
         nargs="+",
         default=["red", "green", "blue", "nir"],
     )
+    p.add_argument(
+        "--band-indices",
+        nargs="+",
+        type=int,
+        help="1-based source band order, e.g. 2 3 4 1 for NRGB→RGBN",
+    )
     p.add_argument("--output-format", choices=("tar", "csv"), default="tar")
     p.add_argument("--apply-dra", action="store_true")
     p.add_argument("--dra-cal", type=Path)
@@ -205,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
                 attr_values=args.attr_values,
                 class_ids=args.class_ids,
                 bands_requested=args.bands,
+                band_indices=args.band_indices,
             )
 
     if args.split_planner:
@@ -227,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
                 patch_size=(args.patch_size, args.patch_size),
                 stride=stride,
                 bands_requested=args.bands,
+                band_indices=args.band_indices,
                 attr_field=args.attr_field,
                 attr_values=args.attr_values,
                 class_ids=args.class_ids,
