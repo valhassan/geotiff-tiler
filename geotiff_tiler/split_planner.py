@@ -38,6 +38,17 @@ def require_split(metadata: dict, image) -> str:
     return split
 
 
+def assign_pair_ids(pairs: list) -> list:
+    """``{row}_{image_name}`` on each pair. Existing ids are kept."""
+    for i, item in enumerate(pairs):
+        meta = item.setdefault("metadata", {})
+        if meta.get("pair_id"):
+            continue
+        name = meta.get("id") or Path(str(item.get("image") or "")).stem or "image"
+        meta["pair_id"] = f"{i}_{name}"
+    return pairs
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -299,6 +310,7 @@ def run_planner(
     Each item is ``{image, label, metadata}`` with ``split`` and
     ``collection`` (or ``sensor``) in metadata.
     """
+    assign_pair_ids(input_dict)
     pairs = []
     for p in input_dict:
         meta = p.get("metadata") or {}
@@ -320,7 +332,7 @@ def run_planner(
 
     analyses: dict[str, dict] = {}
     for p in pairs:
-        name = Path(p["image"]).stem
+        name = p["metadata"]["pair_id"]
         meta = p.get("metadata") or {}
         sensor = meta.get("collection") or meta.get("sensor")
         if not sensor:
