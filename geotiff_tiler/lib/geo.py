@@ -8,6 +8,8 @@ import logging
 import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
+from copy import deepcopy
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import geopandas as gpd
@@ -210,33 +212,34 @@ def stack_bands(srcs: List, band: int = 1):
 
     return ET.tostring(vrt_dataset).decode('UTF-8')
 
-def select_bands(src: str, band_indices: Optional[Sequence]):
-    """Creates a multiband virtual raster containing a subset of all available bands in a source multiband raster.
-
-    Args:
-        src (str): Path or URL to a multiband raster.
-        band_indices (Sequence, optional): Indices of bands from the source raster to include in the subset
-            (indices start at 1 per GDAL convention). Order matters; for example, if the source raster is BGR,
-            [3, 2, 1] will create a VRT with bands as RGB.
-
-    Returns:
-        str: VRT as a string.
-    """
-    
-    with rasterio.open(src) as ras, MemoryFile() as mem:
-        riocopy(ras, mem.name, driver='VRT')
-        vrt_xml = mem.read().decode('utf-8')
-        vrt_dataset = ET.fromstring(vrt_xml)
-        vrt_dataset_dict = {int(band.get('band')): band for band in vrt_dataset.iter("VRTRasterBand")}
-        for band in vrt_dataset_dict.values():
+def select_bands(src: str, band_indices: Sequence, out_path: str | Path) -> str:
+    """Write a VRT with a subset/reorder of bands. Indices are 1-based."""
+    src_abs = str(Path(src).resolve()) if Path(src).exists() else str(src)
+    with rasterio.open(src_abs) as ras, MemoryFile() as mem:
+        riocopy(ras, mem.name, driver="VRT")
+        vrt_dataset = ET.fromstring(mem.read().decode("utf-8"))
+        by_idx = {
+            int(band.get("band")): band
+            for band in vrt_dataset.iter("VRTRasterBand")
+        }
+        for band in list(by_idx.values()):
             vrt_dataset.remove(band)
-
-        for dest_band_idx, src_band_idx in enumerate(band_indices, start=1):
-            vrt_band = vrt_dataset_dict[src_band_idx]
-            vrt_band.set('band', str(dest_band_idx))
+        nsrc = max(by_idx, default=0)
+        for dest_idx, src_idx in enumerate(band_indices, start=1):
+            if src_idx not in by_idx:
+                raise ValueError(
+                    f"band index {src_idx} not in 1..{nsrc} for {src}"
+                )
+            vrt_band = deepcopy(by_idx[src_idx])
+            vrt_band.set("band", str(dest_idx))
             vrt_dataset.append(vrt_band)
+        for fn in vrt_dataset.iter("SourceFilename"):
+            fn.set("relativeToVRT", "0")
+            fn.text = src_abs
 
-    return ET.tostring(vrt_dataset).decode('UTF-8')
+    out = Path(out_path)
+    out.write_text(ET.tostring(vrt_dataset, encoding="unicode"), encoding="utf-8")
+    return str(out)
 
 
 class SingleBandItemEO(ItemEOExtension):
