@@ -35,7 +35,12 @@ class BandDiagnostics:
     valid_frac: float
 
 
-def valid_mask(arr: np.ndarray, nodata: float | None) -> np.ndarray:
+def valid_mask(
+    arr: np.ndarray, nodata: float | None = None, mask: np.ndarray | None = None
+) -> np.ndarray:
+    if mask is not None:
+        m = mask if mask.dtype == bool else mask > 0
+        return np.isfinite(arr) & m
     if nodata is None:
         return np.isfinite(arr)
     return np.isfinite(arr) & (arr != nodata)
@@ -57,12 +62,16 @@ def _is_bimodal(vals: np.ndarray, max_dn: int) -> bool:
 
 
 def _band_diagnostics(
-    band: np.ndarray, band_idx: int, max_dn: int, nodata: float | None
+    band: np.ndarray,
+    band_idx: int,
+    max_dn: int,
+    nodata: float | None,
+    mask: np.ndarray | None = None,
 ) -> BandDiagnostics:
-    mask = valid_mask(band, nodata)
-    if not mask.any():
+    m = valid_mask(band, nodata, mask)
+    if not m.any():
         return BandDiagnostics(band_idx, 0.0, 0.0, 1.0, 1.0, False, 0.0)
-    vals = band[mask].astype(np.float64)
+    vals = band[m].astype(np.float64)
     p_lo, p25, p75, p_hi = np.percentile(vals, [_PCTL_LO, 25, 75, _PCTL_HI])
     interior = vals[(vals > _CLIP_PCTL) & (vals < max_dn - _CLIP_PCTL)]
     return BandDiagnostics(
@@ -72,7 +81,7 @@ def _band_diagnostics(
         crushed_frac=float(np.mean(vals <= _CLIP_PCTL)),
         saturated_frac=float(np.mean(vals >= max_dn - _CLIP_PCTL)),
         bimodal=_is_bimodal(interior, max_dn),
-        valid_frac=float(mask.mean()),
+        valid_frac=float(m.mean()),
     )
 
 
@@ -80,12 +89,20 @@ def detect_low_contrast(
     bands: np.ndarray,
     max_dn: int = _MAX_DN,
     nodata: float | None = 0,
+    masks: np.ndarray | None = None,
 ) -> dict:
     """Per-band EDR diagnostics and a production low-contrast gate."""
     if bands.ndim == 2:
         bands = bands[np.newaxis, ...]
     diags = [
-        _band_diagnostics(bands[i], i, max_dn, nodata) for i in range(bands.shape[0])
+        _band_diagnostics(
+            bands[i],
+            i,
+            max_dn,
+            nodata,
+            None if masks is None else (masks[i] if masks.ndim == 3 else masks),
+        )
+        for i in range(bands.shape[0])
     ]
     edr_min = float(min(b.edr for b in diags))
     thin = any(b.valid_frac < _MIN_VALID for b in diags)
@@ -116,13 +133,13 @@ def detect_low_contrast(
     return rec
 
 
-def _read_sampled(src: rasterio.DatasetReader, max_side: int = _MAX_SIDE) -> np.ndarray:
+def _read_sampled(src: rasterio.DatasetReader, max_side: int = _MAX_SIDE):
     h, w = src.height, src.width
     if not max_side or max(h, w) <= max_side:
-        return src.read()
+        return src.read(), src.read_masks()
     scale = max(h, w) / max_side
     shape = (src.count, max(1, int(round(h / scale))), max(1, int(round(w / scale))))
-    return src.read(out_shape=shape)
+    return src.read(out_shape=shape), src.read_masks(out_shape=shape)
 
 
 _ACTIONS = {
@@ -218,9 +235,10 @@ def apply_dra_transform(
     pctl_lo: float = 1.0,
     pctl_hi: float = 99.0,
     clip_pctl: float = 1.0,
+    mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Normalize by scene q1/q99, apply shared curve, rescale to fixed DRAON anchors."""
-    mask = valid_mask(band_data, nodata)
+    mask = valid_mask(band_data, nodata, mask)
     out_dtype = np.uint8 if max_dn <= 255 else np.uint16
     fill = nodata if nodata is not None else 0
     out = np.full(band_data.shape, fill, dtype=out_dtype)
@@ -286,10 +304,12 @@ def _apply_bands(
     scene_id: str | None,
     max_dn: float,
     clip_pctl: float,
+    masks: np.ndarray | None = None,
 ) -> np.ndarray:
     out_bands = []
     missing = []
     for b in range(bands.shape[0]):
+        band_mask = None if masks is None else (masks[b] if masks.ndim == 3 else masks)
         if b in calibration.curve and b in calibration.anchors:
             out_bands.append(
                 apply_dra_transform(
@@ -299,6 +319,7 @@ def _apply_bands(
                     calibration.anchors[b],
                     max_dn=max_dn,
                     clip_pctl=clip_pctl,
+                    mask=band_mask,
                 )
             )
         else:
@@ -351,10 +372,12 @@ def apply_dra_to_file(
     """Gate on a downsampled read; apply and write only when status is draoff."""
     path = Path(path)
     with rasterio.open(path) as src:
-        sampled = _read_sampled(src)
+        sampled, sampled_masks = _read_sampled(src)
         nodata = src.nodata
         n_bands = src.count
-    rec = detect_low_contrast(sampled, max_dn=int(max_dn), nodata=nodata)
+    rec = detect_low_contrast(
+        sampled, max_dn=int(max_dn), nodata=nodata, masks=sampled_masks
+    )
     action = _ACTIONS[rec["contrast_status"]]
     have = set(calibration.curve) & set(calibration.anchors)
     needed = set(range(n_bands))
@@ -384,9 +407,12 @@ def apply_dra_to_file(
 
     with rasterio.open(path) as src:
         data = src.read()
+        masks = src.read_masks()
         profile = src.profile
         nodata = src.nodata
-    out = _apply_bands(data, nodata, calibration, scene_id, max_dn, clip_pctl)
+    out = _apply_bands(
+        data, nodata, calibration, scene_id, max_dn, clip_pctl, masks=masks
+    )
     dest_dir = Path(tmp_dir) if tmp_dir is not None else path.parent
     dest = dest_dir / f"{path.stem}_dra.tif"
     profile.update(dtype=out.dtype, count=out.shape[0])
