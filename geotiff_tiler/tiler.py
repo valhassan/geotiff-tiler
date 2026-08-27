@@ -25,9 +25,14 @@ from geotiff_tiler.lib.dra import (
 )
 from geotiff_tiler.lib.geo import clip_gdf_to_window, gdf_to_geojson
 from geotiff_tiler.lib.io import (
+    IGNORE_INDEX,
+    apply_image_mask_to_label,
     clip_to_intersection,
+    image_nodata_meta,
     log_stage,
+    nodata_spec,
     prepare_vector_labels,
+    require_class_ids,
     validate_image,
     validate_mask,
     validate_pair,
@@ -56,6 +61,7 @@ def _class_distribution(
         return {}
     with rasterio.open(label_path) as src:
         arr = src.read(1).ravel()
+    arr = arr[arr != IGNORE_INDEX]
     max_id = max(class_ids.values())
     counts = np.bincount(arr, minlength=max_id + 1)
     totals = {
@@ -103,6 +109,7 @@ class Tiler:
             )
         if output_dir is None:
             raise ValueError("output_dir is required")
+        require_class_ids(class_ids)
         self.input_dict = input_dict
         self.patch_size = patch_size
         self.bands_requested = bands_requested or ["red", "green", "blue", "nir"]
@@ -185,6 +192,13 @@ class Tiler:
             if result.get("dra"):
                 metadata["dra"] = result["dra"]
                 self.manifest.update_image_metadata(image_name, {"dra": result["dra"]})
+            self.manifest.update_image_metadata(
+                image_name,
+                {
+                    "nodata_source": result.get("nodata_source"),
+                    "valid_fraction": result.get("valid_fraction"),
+                },
+            )
 
             dist = _class_distribution(result["label_path"], self.class_ids)
             analyses.append(
@@ -297,12 +311,20 @@ class Tiler:
             check = validate_pair(image_path, label_path, label_type)
             if not check["valid"]:
                 return {"status": "skipped", "reason": check["reason"]}
+            with rasterio.open(image_path) as src:
+                nd_src = nodata_spec(src)[1]
             if check.get("special_case"):
+                masked = apply_image_mask_to_label(
+                    image_path, label_path, tmp_dir
+                )
+                _, valid_frac = image_nodata_meta(image_path)
                 return {
                     "image_path": str(image_path),
-                    "label_path": str(label_path),
+                    "label_path": str(masked),
                     "status": "successful",
                     "reason": check["reason"],
+                    "nodata_source": nd_src,
+                    "valid_fraction": valid_frac,
                 }
 
             logger.info("Image: %s", image_name)
@@ -331,12 +353,18 @@ class Tiler:
                     building_class_val=self.building_class_val,
                     road_class_val=self.road_class_val,
                 )
+                if clipped_label is None:
+                    return {
+                        "status": "skipped",
+                        "reason": "No valid label pixels after mask",
+                    }
 
             dra = None
             if self.apply_dra:
                 clipped_image, dra = self._apply_dra(
                     clipped_image, tmp_dir, image_name, collection
                 )
+            _, valid_frac = image_nodata_meta(clipped_image)
             out = {
                 "image_path": str(clipped_image),
                 "label_path": str(clipped_label),
@@ -344,6 +372,8 @@ class Tiler:
                 "label_gdf": label_gdf,
                 "status": "successful",
                 "reason": "Processed successfully",
+                "nodata_source": nd_src,
+                "valid_fraction": valid_frac,
             }
             if dra is not None:
                 out["dra"] = dra
@@ -444,7 +474,6 @@ class Tiler:
                     "Tiling %d x %d x %d  patch=%s stride=%s",
                     h, w, n_bands, self.patch_size, self.stride,
                 )
-                nodata = src_image.nodata
                 for k, v in analysis.get("targets_paths", {}).items():
                     p = Path(v)
                     if p.exists():
@@ -485,10 +514,6 @@ class Tiler:
 
                             label_patch = src_label.read(window=window)
                             image_patch = src_image.read(window=window)
-                            if nodata is not None:
-                                label_patch[
-                                    0, np.all(image_patch == nodata, axis=0)
-                                ] = 255
                             if not self._keep_patch(label_patch):
                                 discarded += 1
                                 pbar.update(1)
@@ -523,7 +548,9 @@ class Tiler:
                             if split == "trn":
                                 try:
                                     self.manifest.update_running_statistics(
-                                        self.prefix, image_patch
+                                        self.prefix,
+                                        image_patch,
+                                        valid=label_patch[0] != IGNORE_INDEX,
                                     )
                                 except Exception as e:
                                     logger.error("Error updating running statistics: %s", e)
@@ -665,7 +692,7 @@ class Tiler:
 
     def _keep_patch(self, label: np.ndarray) -> bool:
         plane = label[0] if label.ndim == 3 else label
-        valid = plane != 255
+        valid = plane != IGNORE_INDEX
         n_valid = int(np.count_nonzero(valid))
         if n_valid == 0 or n_valid / plane.size < self.min_valid_frac:
             return False
