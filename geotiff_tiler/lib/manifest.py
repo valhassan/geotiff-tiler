@@ -74,6 +74,7 @@ class TilingManifest:
             "created_at": datetime.now().isoformat(),
             "last_updated": datetime.now().isoformat(),
             "description": f"Geospatial patches for {self.prefix}",
+            "ignore_index": 255,
         }
         self.shards = {"trn": [], "val": [], "tst": []}
         self.image_metadata = {}
@@ -383,7 +384,9 @@ class TilingManifest:
             self.dataset_statistics["class_distribution"] = new_distribution
             self._class_update_count += 1
     
-    def update_running_statistics(self, prefix: str, patch: np.ndarray):
+    def update_running_statistics(
+        self, prefix: str, patch: np.ndarray, valid: np.ndarray | None = None
+    ):
         """Update running mean/std accumulators with a training patch."""
         if prefix not in self.running_statistics:
             self._initialize_band_statistics(prefix, patch)
@@ -395,10 +398,25 @@ class TilingManifest:
                 f"expected {stats['band_count']}, got {patch.shape[0]}"
             )
 
-        flat = patch.reshape(stats["band_count"], -1).astype(np.float64, copy=False)
+        if valid is not None:
+            valid = np.asarray(valid, dtype=bool)
+            if valid.shape != patch.shape[-2:]:
+                raise ValueError(
+                    f"valid mask shape {valid.shape} != patch {patch.shape[-2:]}"
+                )
+            if not valid.any():
+                return
+            flat = patch[:, valid].astype(np.float64, copy=False)
+            n_pix = int(valid.sum())
+        else:
+            flat = patch.reshape(stats["band_count"], -1).astype(
+                np.float64, copy=False
+            )
+            n_pix = patch.shape[1] * patch.shape[2]
+
         stats["band_sums"] += flat.sum(axis=1)
         stats["band_sums_squared"] += np.square(flat).sum(axis=1)
-        stats["pixel_count"] += patch.shape[1] * patch.shape[2]
+        stats["pixel_count"] += n_pix
         stats["patch_count"] += 1
         stats["last_updated"] = datetime.now().isoformat()
     
@@ -515,6 +533,7 @@ class TilingManifest:
             
             # Load dataset info
             self.dataset_info = manifest_data.get("dataset_info", {})
+            self.dataset_info.setdefault("ignore_index", 255)
             
             # Load shards data
             self.shards = manifest_data.get("shards", {"trn": [], "val": [], "tst": []})
