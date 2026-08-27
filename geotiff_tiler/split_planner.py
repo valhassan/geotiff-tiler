@@ -21,7 +21,7 @@ from rasterio.transform import from_bounds as transform_from_bounds
 from rasterio.windows import from_bounds as window_from_bounds
 
 from geotiff_tiler.lib.geo import check_label_type
-from geotiff_tiler.lib.io import load_vector_mask, resolve_attr_field
+from geotiff_tiler.lib.io import load_vector_mask, require_class_ids, resolve_attr_field
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +323,7 @@ def run_planner(
     Each item is ``{image, label, metadata}`` with ``split`` and
     ``collection`` (or ``sensor``) in metadata.
     """
+    require_class_ids(class_ids)
     assign_pair_ids(input_dict)
     pairs = []
     for p in input_dict:
