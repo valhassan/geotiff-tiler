@@ -26,7 +26,6 @@ from geotiff_tiler.lib.dra import (
 from geotiff_tiler.lib.geo import clip_gdf_to_window, gdf_to_geojson
 from geotiff_tiler.lib.io import (
     clip_to_intersection,
-    ensure_crs_match,
     log_stage,
     prepare_vector_labels,
     validate_image,
@@ -41,6 +40,7 @@ from geotiff_tiler.split_planner import (
     load_plan,
     require_split,
     val_rects_for_image,
+    window_origins,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,6 +89,7 @@ class Tiler:
         class_ids: dict[str, int] | None = None,
         discard_empty: bool = True,
         label_threshold: float = 0.01,
+        min_valid_frac: float = 0.5,
         prefix: str = "sample",
         output_dir: str | None = None,
         output_format: str = "tar",
@@ -118,6 +119,7 @@ class Tiler:
         self.class_ids = class_ids or {}
         self.discard_empty = discard_empty
         self.label_threshold = label_threshold
+        self.min_valid_frac = min_valid_frac
         self.prefix = prefix
         self.output_dir = output_dir
         self.output_format = output_format
@@ -303,9 +305,6 @@ class Tiler:
                     "reason": check["reason"],
                 }
 
-            image_path, label_path = ensure_crs_match(
-                image_path, label_path, label_type, tmp_dir
-            )
             logger.info("Image: %s", image_name)
             clipped_image, clipped_label = clip_to_intersection(
                 image_path, label_path, label_type, tmp_dir
@@ -404,9 +403,9 @@ class Tiler:
 
                 metadata["image_channels"] = n_bands
                 metadata["label_channels"] = src_label.count
-                n_x = (w + self.stride - 1) // self.stride
-                n_y = (h + self.stride - 1) // self.stride
-                total = n_x * n_y
+                xs = window_origins(w, self.patch_size[1], self.stride)
+                ys = window_origins(h, self.patch_size[0], self.stride)
+                total = len(xs) * len(ys)
 
                 plan_rects: list = []
                 plan_tol = abs(src_image.transform.a)
@@ -458,8 +457,8 @@ class Tiler:
 
                 discarded = kept = trn_n = val_n = tst_n = 0
                 with tqdm(total=total, desc="Tiling patches") as pbar:
-                    for y in range(0, h, self.stride):
-                        for x in range(0, w, self.stride):
+                    for y in ys:
+                        for x in xs:
                             if self.manifest.is_patch_completed(image_name, x, y):
                                 kept += 1
                                 pbar.update(1)
@@ -484,25 +483,20 @@ class Tiler:
                             else:
                                 split = "tst"
 
-                            label_patch = src_label.read(
-                                window=window, boundless=True, fill_value=0
-                            )
+                            label_patch = src_label.read(window=window)
+                            image_patch = src_image.read(window=window)
+                            if nodata is not None:
+                                label_patch[
+                                    0, np.all(image_patch == nodata, axis=0)
+                                ] = 255
                             if not self._keep_patch(label_patch):
                                 discarded += 1
+                                pbar.update(1)
                                 continue
-
-                            fill = nodata if nodata is not None else 0
-                            image_patch = src_image.read(
-                                window=window, boundless=True, fill_value=fill
-                            )
                             targets_patches = {
-                                k: src.read(
-                                    1, window=window, boundless=True, fill_value=0
-                                )
+                                k: src.read(1, window=window)
                                 for k, src in target_srcs.items()
                             }
-                            if nodata is not None:
-                                label_patch[0, np.all(image_patch == nodata, axis=0)] = 255
 
                             if split == "val":
                                 val_n += 1
@@ -670,14 +664,15 @@ class Tiler:
         )
 
     def _keep_patch(self, label: np.ndarray) -> bool:
-        if label.size == 0:
+        plane = label[0] if label.ndim == 3 else label
+        valid = plane != 255
+        n_valid = int(np.count_nonzero(valid))
+        if n_valid == 0 or n_valid / plane.size < self.min_valid_frac:
             return False
-        nz = np.count_nonzero(label)
-        if self.discard_empty and nz == 0:
+        fg = int(np.count_nonzero(plane[valid]))
+        if self.discard_empty and fg == 0:
             return False
-        if nz / label.size < self.label_threshold:
-            return False
-        return True
+        return fg / n_valid >= self.label_threshold
 
     def _shard_path(self, base, prefix, split, idx):
         return os.path.join(base, f"{prefix}-{split}-{idx:06d}.tar")
