@@ -640,7 +640,7 @@ def rasterize_vector(
     continuous: bool = True,
     default_burn_value: int = 1,
     dtype: str = "uint8",
-    erosion_classes: List[str] = None,
+    erosion_classes: list | None = None,
     target_gap_m: float = None,
     max_gsd_for_erosion: float = 1.0,
     min_erosion_area_m2: float = 10.0,
@@ -649,18 +649,12 @@ def rasterize_vector(
     """Rasterize vector data to a raster.
 
     Args:
-        erosion_classes: Subset of attr_values whose geometries should be
-            eroded inward before rasterization (e.g. ["Building"]).  Only
-            meaningful when attr_field/attr_values are provided.  Pass None
-            to disable erosion entirely.
-        target_gap_m: Desired total physical gap (metres) to enforce between
-            adjacent eroded instances.  None uses the sensor-adaptive formula
-            (≥2-pixel gap, capped at 1.2 m total).
-        max_gsd_for_erosion: Sensors with GSD above this value (metres) skip
-            erosion — gaps are sub-pixel and erosion only shrinks footprints.
-        min_erosion_area_m2: Eroded geometries whose area falls below this
-            threshold are restored to their original shape to prevent small
-            structures (sheds, garages) from collapsing.
+        erosion_classes: Subset of attr_values to erode (e.g. [1]). None
+            disables erosion.
+        target_gap_m: Total gap in metres between eroded instances. None
+            uses a ≥2-pixel gap, capped at 1.2 m total.
+        max_gsd_for_erosion: Skip erosion when GSD exceeds this (metres).
+        min_erosion_area_m2: Restore original geom if eroded area falls below.
     """
     temp_vector_path = Path(tmp_dir) / f"{label_name}.shp"
     rasterized_label_path = Path(tmp_dir) / f"{label_name}_rasterized.tif"
@@ -696,7 +690,7 @@ def rasterize_vector(
                 vector_clean["burn_val"] = vector_clean[attr_field].map(cont_vals_dict)
                 vector_clean = vector_clean.dropna(subset=["burn_val"])
                 erosion_burn_vals = {
-                    cont_vals_dict.get(str(v) if isinstance(v, str) else v)
+                    cont_vals_dict.get(v)
                     for v in (erosion_classes or [])
                 } - {None}
             else:
@@ -836,7 +830,7 @@ def prepare_vector_labels(
     tmp_dir: str,
     attr_field: List[str] = None,
     attr_values: list = None,
-    erosion_classes: List[str] = None,
+    erosion_classes: list | None = None,
     target_gap_m: float = None,
     max_gsd_for_erosion: float = 1.0,
     min_erosion_area_m2: float = 5.0,
