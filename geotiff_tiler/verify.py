@@ -19,7 +19,13 @@ from shapely.geometry import box
 from tqdm import tqdm
 
 from geotiff_tiler.lib.geo import check_label_type, check_label_validity
-from geotiff_tiler.lib.io import load_vector_mask, resolve_attr_field, validate_image
+from geotiff_tiler.lib.io import (
+    load_vector_mask,
+    mask_is_declared,
+    nodata_spec,
+    resolve_attr_field,
+    validate_image,
+)
 from geotiff_tiler.split_planner import assign_pair_ids
 
 logger = logging.getLogger(__name__)
@@ -34,7 +40,9 @@ HARD_CHECKS = frozenset(
         "attr_field_exists",
     }
 )
-SOFT_CHECKS = frozenset({"crs_match", "attr_values_match", "nonempty_after_filter"})
+SOFT_CHECKS = frozenset(
+    {"crs_match", "attr_values_match", "nonempty_after_filter", "nodata_policy"}
+)
 LABEL_CHECKS = (
     "label_valid",
     "crs_match",
@@ -112,14 +120,25 @@ def _overview_hw(src: rasterio.DatasetReader) -> tuple[int, int]:
 def _sample_is_degenerate(src: rasterio.DatasetReader) -> tuple[bool, dict]:
     h, w = _overview_hw(src)
     data = src.read(out_shape=(src.count, h, w), resampling=Resampling.nearest)
-    nodata = src.nodata
+    _, source = nodata_spec(src)
+    if mask_is_declared(src):
+        m = src.read_masks(out_shape=(src.count, h, w))
+        valid = np.any(m > 0, axis=0) if m.ndim == 3 else m > 0
+    else:
+        valid = np.any(data != 0, axis=0)
+    zero_frac = float(np.mean(np.all(data == 0, axis=0)))
+    valid_frac = float(valid.mean())
     all_zero = bool(np.all(data == 0))
-    all_nodata = bool(nodata is not None and np.all(data == nodata))
+    all_nodata = bool(not valid.any())
     return all_zero or all_nodata, {
         "sample_shape": [src.count, h, w],
         "all_zero": all_zero,
         "all_nodata": all_nodata,
-        "nodata": nodata,
+        "nodata": src.nodata,
+        "nodata_declared": source == "declared",
+        "nodata_source": source,
+        "zero_frac": zero_frac,
+        "valid_frac": valid_frac,
     }
 
 
@@ -241,6 +260,7 @@ def verify_pair(
         checks["image_readable"] = _check(False, str(e))
         checks["band_count"] = _skipped("image unreadable")
         checks["not_degenerate"] = _skipped("image unreadable")
+        checks["nodata_policy"] = _skipped("image unreadable")
 
     if bands_expected is None and band_indices:
         bands_expected = len(band_indices)
@@ -257,6 +277,17 @@ def verify_pair(
 
     if "not_degenerate" not in checks:
         checks["not_degenerate"] = _check(not degenerate, deg_detail)
+        nd_detail = deg_detail or {}
+        undeclared = nd_detail.get("nodata_source") == "fallback_zero"
+        zero_frac = float(nd_detail.get("zero_frac") or 0.0)
+        warn = undeclared and zero_frac > 0.01
+        checks["nodata_policy"] = _check(not warn, nd_detail)
+        if warn:
+            logger.warning(
+                "%s: undeclared nodata and zero_frac=%.3f > 1%%",
+                result_id,
+                zero_frac,
+            )
 
     if label is None:
         _skip_remaining(checks, LABEL_CHECKS, "inference-only (label is None)")
