@@ -10,9 +10,12 @@ from typing import List, Optional, Sequence, Tuple, Union
 import fiona
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import psutil
 import pystac
 import rasterio
+import rasterio.features
+from rasterio.enums import MaskFlags
 from rasterio.warp import transform_bounds
 from rasterio.windows import Window, bounds as window_bounds, from_bounds
 from shapely.geometry import box, shape
@@ -32,6 +35,60 @@ from .geo import (
 from .targets import compute_building_targets, compute_road_targets
 
 logger = logging.getLogger(__name__)
+
+IGNORE_INDEX = 255
+
+
+def mask_is_declared(src: rasterio.DatasetReader) -> bool:
+    return any(
+        MaskFlags.all_valid not in flags for flags in src.mask_flag_enums
+    )
+
+
+def nodata_spec(src: rasterio.DatasetReader) -> tuple[float, str]:
+    if mask_is_declared(src):
+        nd = src.nodata
+        return (float(nd) if nd is not None else 0.0), "declared"
+    return 0.0, "fallback_zero"
+
+
+def window_valid(
+    src: rasterio.DatasetReader, window: Window | None = None
+) -> np.ndarray:
+    if mask_is_declared(src):
+        m = src.read_masks(window=window)
+        if m.ndim == 3:
+            return np.any(m > 0, axis=0)
+        return m > 0
+    data = src.read(window=window)
+    return np.any(np.isfinite(data) & (data != 0), axis=0)
+
+
+def image_nodata_meta(image_path: str) -> tuple[str, float]:
+    with rasterio.open(image_path) as src:
+        _, source = nodata_spec(src)
+        n_ok = n = 0
+        for _, win in src.block_windows(1):
+            valid = window_valid(src, win)
+            n_ok += int(valid.sum())
+            n += valid.size
+    return source, (n_ok / n if n else 0.0)
+
+
+def label_src_nodata(label_path: str) -> int | float | str:
+    with rasterio.open(label_path) as src:
+        nd = src.nodata
+    if nd is None or nd == 0:
+        return "None"
+    return nd
+
+
+def require_class_ids(class_ids: dict | None) -> None:
+    if not class_ids:
+        return
+    bad = {k: v for k, v in class_ids.items() if int(v) < 0 or int(v) >= IGNORE_INDEX}
+    if bad:
+        raise ValueError(f"class ids must be in 0–254, got {bad}")
 
 
 def gdal_translate_copy(src, dst):
@@ -364,6 +421,8 @@ def clip_raster_to_geometry(
     tmp_dir: str,
     extent: Tuple[float, float, float, float, float, float],
     t_srs: Optional[str] = None,
+    dst_nodata: Optional[Union[int, float]] = None,
+    src_nodata: Optional[Union[int, float, str]] = None,
 ):
     """Clip raster to geometry on the given pixel-aligned extent."""
     if Path(image_path).suffix.lower() == ".vrt":
@@ -380,11 +439,16 @@ def clip_raster_to_geometry(
 
     try:
         with rasterio.open(source_path) as src:
-            nodata = src.nodata
             crs = src.crs
-        if nodata is None:
-            nodata = 0
-            logger.warning("%s has no nodata; using 0 for clipped output", image_path)
+            spec_nd, spec_src = nodata_spec(src)
+        if dst_nodata is None:
+            dst_nodata = spec_nd
+            if spec_src == "fallback_zero":
+                logger.warning(
+                    "%s has no nodata; using 0 for clipped output", image_path
+                )
+        if src_nodata is None:
+            src_nodata = dst_nodata
 
         cutline_crs = t_srs or crs
         if hasattr(geometry, "geom_type"):
@@ -418,8 +482,10 @@ def clip_raster_to_geometry(
             cmd.extend(["-t_srs", t_srs])
         cmd.extend(
             [
+                "-srcnodata",
+                str(src_nodata),
                 "-dstnodata",
-                str(nodata),
+                str(dst_nodata),
                 "-of",
                 "GTiff",
                 "-co",
@@ -472,7 +538,17 @@ def clip_to_intersection(
     )
     if label_type == "raster":
         clipped_label = clip_raster_to_geometry(
-            label_path, intersection, "label", tmp_dir, extent, t_srs=t_srs
+            label_path,
+            intersection,
+            "label",
+            tmp_dir,
+            extent,
+            t_srs=t_srs,
+            dst_nodata=IGNORE_INDEX,
+            src_nodata=label_src_nodata(label_path),
+        )
+        clipped_label = apply_image_mask_to_label(
+            clipped_image, clipped_label, tmp_dir
         )
     else:
         snapped = box(extent[0], extent[1], extent[2], extent[3])
@@ -481,42 +557,40 @@ def clip_to_intersection(
 
 
 @log_stage(stage_name="create_nodata_mask", log_memory=True)
-def create_nodata_mask(
-    image_path: str, nodata_value: Optional[Union[int, float]] = None
-) -> Optional[gpd.GeoDataFrame]:
-    """
-    Create a vector mask from raster nodata values.
-    """
-    with rasterio.open(image_path) as src_image:
-        if nodata_value is None:
-            nodata_value = src_image.nodata
-            if not isinstance(nodata_value, (int, float)):
-                return None
-        data = src_image.read()
-        nodata_mask = data != nodata_value
-        nodata_mask_flat = np.any(nodata_mask, axis=0)
-        mask_array = nodata_mask_flat.astype("uint8")
-        transform = src_image.transform
-        crs = src_image.crs
-        shapes = rasterio.features.shapes(
-            mask_array, mask=mask_array > 0, transform=transform
-        )
-        geometries = [shape(geom) for geom, val in shapes]
-        if not geometries:
-            return None
-        gdf = gpd.GeoDataFrame(geometry=geometries, crs=crs)
-        gdf = gdf.dissolve()
-    del (
-        data,
-        nodata_mask,
-        nodata_mask_flat,
-        mask_array,
-        transform,
-        crs,
-        shapes,
-        geometries,
+def create_nodata_mask(image_path: str) -> Optional[gpd.GeoDataFrame]:
+    with rasterio.open(image_path) as src:
+        mask_array = np.zeros((src.height, src.width), dtype=np.uint8)
+        for _, win in src.block_windows(1):
+            row_slice, col_slice = win.toslices()
+            mask_array[row_slice, col_slice] = window_valid(src, win).astype("uint8")
+        transform = src.transform
+        crs = src.crs
+    shapes = rasterio.features.shapes(
+        mask_array, mask=mask_array > 0, transform=transform
     )
-    return gdf
+    geometries = [shape(geom) for geom, val in shapes]
+    if not geometries:
+        return None
+    return gpd.GeoDataFrame(geometry=geometries, crs=crs).dissolve()
+
+
+@log_stage(stage_name="apply_image_mask_to_label", log_memory=True)
+def apply_image_mask_to_label(
+    image_path: str, label_path: str, tmp_dir: str
+) -> Path:
+    out = Path(tmp_dir) / f"{Path(label_path).stem}_ign.tif"
+    with rasterio.open(image_path) as img, rasterio.open(label_path) as lbl:
+        if (img.width, img.height) != (lbl.width, lbl.height):
+            raise ValueError("Image and label dimensions must match")
+        profile = lbl.profile.copy()
+        profile.update(nodata=IGNORE_INDEX)
+        with rasterio.open(out, "w", **profile) as dst:
+            for _, window in img.block_windows(1):
+                valid = window_valid(img, window)
+                data = lbl.read(window=window)
+                data[:, ~valid] = IGNORE_INDEX
+                dst.write(data, window=window)
+    return out
 
 
 @log_stage(stage_name="apply_nodata_mask", log_memory=True)
@@ -570,6 +644,7 @@ def rasterize_vector(
     target_gap_m: float = None,
     max_gsd_for_erosion: float = 1.0,
     min_erosion_area_m2: float = 10.0,
+    valid_area: gpd.GeoDataFrame | None = None,
 ) -> str:
     """Rasterize vector data to a raster.
 
@@ -587,47 +662,48 @@ def rasterize_vector(
             threshold are restored to their original shape to prevent small
             structures (sheds, garages) from collapsing.
     """
-    if vector.empty:
-        return None, gpd.GeoDataFrame()
-
     temp_vector_path = Path(tmp_dir) / f"{label_name}.shp"
     rasterized_label_path = Path(tmp_dir) / f"{label_name}_rasterized.tif"
 
     try:
-        vector_clean = vector[
-            ~vector.geometry.is_empty & vector.geometry.notnull()
-        ].copy()
-
-        if attr_field and attr_values:
-            resolved = resolve_attr_field(vector_clean.columns, attr_field)
-            if resolved is None:
-                raise ValueError(
-                    f"None of the requested attr_field(s) {attr_field} found in "
-                    f"vector columns {list(vector_clean.columns)}"
-                )
-            attr_field = resolved
-            cont_vals_dict = {
-                src: (dst + 1 if continuous else src)
-                for dst, src in enumerate(attr_values)
-            }
-            cont_vals_dict.update(
-                {str(k): v for k, v in list(cont_vals_dict.items())}
+        if vector.empty:
+            vector_clean = gpd.GeoDataFrame(
+                {"burn_val": pd.Series(dtype=float)},
+                geometry=[],
+                crs=vector.crs,
             )
-
-            vector_clean["burn_val"] = vector_clean[attr_field].map(cont_vals_dict)
-            vector_clean = vector_clean.dropna(subset=["burn_val"])
-            if vector_clean.empty:
-                return None, gpd.GeoDataFrame()
-            vector_clean = vector_clean.sort_values("burn_val")
             burn_attribute = "burn_val"
-            erosion_burn_vals = {
-                cont_vals_dict.get(str(v) if isinstance(v, str) else v)
-                for v in (erosion_classes or [])
-            } - {None}
+            erosion_burn_vals: set = set()
         else:
-            vector_clean["burn_val"] = default_burn_value
+            vector_clean = vector[
+                ~vector.geometry.is_empty & vector.geometry.notnull()
+            ].copy()
+            if attr_field and attr_values and not vector_clean.empty:
+                resolved = resolve_attr_field(vector_clean.columns, attr_field)
+                if resolved is None:
+                    raise ValueError(
+                        f"None of the requested attr_field(s) {attr_field} found in "
+                        f"vector columns {list(vector_clean.columns)}"
+                    )
+                attr_field = resolved
+                cont_vals_dict = {
+                    src: (dst + 1 if continuous else src)
+                    for dst, src in enumerate(attr_values)
+                }
+                cont_vals_dict.update(
+                    {str(k): v for k, v in list(cont_vals_dict.items())}
+                )
+                vector_clean["burn_val"] = vector_clean[attr_field].map(cont_vals_dict)
+                vector_clean = vector_clean.dropna(subset=["burn_val"])
+                erosion_burn_vals = {
+                    cont_vals_dict.get(str(v) if isinstance(v, str) else v)
+                    for v in (erosion_classes or [])
+                } - {None}
+            else:
+                if not vector_clean.empty:
+                    vector_clean["burn_val"] = default_burn_value
+                erosion_burn_vals = set()
             burn_attribute = "burn_val"
-            erosion_burn_vals = set()
 
         with rasterio.open(image_path) as src:
             transform = src.transform
@@ -643,7 +719,12 @@ def rasterize_vector(
         )
         min_width_m = 1.5
 
-        if erosion_dist > 0 and erosion_burn_vals:
+        if (
+            erosion_dist > 0
+            and erosion_burn_vals
+            and not vector_clean.empty
+            and "burn_val" in vector_clean.columns
+        ):
             erode_mask = vector_clean["burn_val"].isin(erosion_burn_vals)
             if erode_mask.any():
                 orig = vector_clean.loc[erode_mask, "geometry"]
@@ -662,10 +743,33 @@ def rasterize_vector(
                 vector_clean.loc[erode_mask, "geometry"] = eroded.where(~restore, orig)
 
         vector_clean = vector_clean[~vector_clean.geometry.is_empty].copy()
-        eroded_building_gdf = vector_clean[
-            vector_clean["burn_val"].isin(erosion_burn_vals)
-        ].copy()
+        eroded_building_gdf = (
+            vector_clean[vector_clean["burn_val"].isin(erosion_burn_vals)].copy()
+            if not vector_clean.empty and erosion_burn_vals
+            else gpd.GeoDataFrame()
+        )
 
+        crs = vector_clean.crs
+        if valid_area is not None and not valid_area.empty:
+            geom = valid_area.geometry.unary_union
+            if geom is not None and not geom.is_empty:
+                if crs is None:
+                    crs = valid_area.crs
+                elif valid_area.crs is not None and valid_area.crs != crs:
+                    geom = (
+                        gpd.GeoSeries([geom], crs=valid_area.crs).to_crs(crs).iloc[0]
+                    )
+                valid_row = gpd.GeoDataFrame(
+                    {"burn_val": [0]}, geometry=[geom], crs=crs
+                )
+                vector_clean = gpd.GeoDataFrame(
+                    pd.concat([valid_row, vector_clean], ignore_index=True),
+                    geometry="geometry",
+                    crs=crs,
+                )
+        if vector_clean.empty:
+            return None, gpd.GeoDataFrame()
+        vector_clean = vector_clean.sort_values("burn_val")
         vector_clean.to_file(temp_vector_path, driver="ESRI Shapefile")
         del vector_clean
 
@@ -690,7 +794,7 @@ def rasterize_vector(
             "-a",
             burn_attribute,
             "-a_nodata",
-            "255",
+            str(IGNORE_INDEX),
             "-tr",
             xres,
             yres,
@@ -704,7 +808,7 @@ def rasterize_vector(
             "-of",
             "GTiff",
             "-init",
-            "0",
+            str(IGNORE_INDEX),
             "-co",
             "TILED=YES",
             "-co",
@@ -755,6 +859,7 @@ def prepare_vector_labels(
         target_gap_m=target_gap_m,
         max_gsd_for_erosion=max_gsd_for_erosion,
         min_erosion_area_m2=min_erosion_area_m2,
+        valid_area=nodata_mask_gdf,
     )
     targets_paths = {}
     field = (
