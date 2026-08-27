@@ -122,7 +122,11 @@ def _class_ids(s: str) -> dict[str, int]:
     raw = json.loads(s)
     if not isinstance(raw, dict):
         raise argparse.ArgumentTypeError("expected a JSON object")
-    return {str(k): int(v) for k, v in raw.items()}
+    out = {str(k): int(v) for k, v in raw.items()}
+    bad = {k: v for k, v in out.items() if v < 0 or v >= 255}
+    if bad:
+        raise argparse.ArgumentTypeError(f"class ids must be in 0–254, got {bad}")
+    return out
 
 
 def _parser() -> argparse.ArgumentParser:
