@@ -1,6 +1,7 @@
 import functools
 import gc
 import logging
+import math
 import subprocess
 import time
 from pathlib import Path
@@ -12,6 +13,8 @@ import numpy as np
 import psutil
 import pystac
 import rasterio
+from rasterio.warp import transform_bounds
+from rasterio.windows import Window, bounds as window_bounds, from_bounds
 from shapely.geometry import box, shape
 
 from .geo import (
@@ -268,90 +271,26 @@ def validate_pair(image_path, label_path, label_type):
     return {"valid": True, "reason": "Valid pair", "special_case": False}
 
 
-@log_stage(stage_name="ensure_crs_match", log_memory=True)
-def ensure_crs_match(
-    image_path: str, label_path: str, label_type: str, tmp_dir: str
-) -> Tuple[str, str]:
-    """
-    Ensure the CRS between image and label match by converting label to match the image.
-
-    Args:
-        image_path: Path to the image
-        label_path: Path to the label
-        label_type: Type of label (raster or vector)
-    Returns:
-        Tuple of (image_path, aligned_label_path)
-    """
-
-    with rasterio.open(image_path) as src_image:
-        image_crs = src_image.crs
-    if label_type == "raster":
-        with rasterio.open(label_path) as src_label:
-            if image_crs == src_label.crs:
-                logger.info("label crs matches image crs")
-                return image_path, label_path
-            else:
-                aligned_label_path = (
-                    Path(tmp_dir) / f"{Path(label_path).stem}_aligned.tif"
-                )
-                dst_transform, dst_width, dst_height = (
-                    rasterio.warp.calculate_default_transform(
-                        src_label.crs,
-                        image_crs,
-                        src_label.width,
-                        src_label.height,
-                        *src_label.bounds,
-                    )
-                )
-                dst_kwargs = src_label.meta.copy()
-                dst_kwargs.update(
-                    {
-                        "crs": image_crs,
-                        "transform": dst_transform,
-                        "width": dst_width,
-                        "height": dst_height,
-                        "driver": "GTiff",
-                    }
-                )
-                with rasterio.open(aligned_label_path, "w", **dst_kwargs) as dst_label:
-                    for i in range(1, src_label.count + 1):
-                        rasterio.warp.reproject(
-                            source=rasterio.band(src_label, i),
-                            destination=rasterio.band(dst_label, i),
-                            src_transform=src_label.transform,
-                            src_crs=src_label.crs,
-                            dst_transform=dst_transform,
-                            dst_crs=image_crs,
-                            resampling=rasterio.warp.Resampling.nearest,
-                        )
-                logger.info("label crs does not match image crs, reprojecting label")
-                return image_path, aligned_label_path
-    elif label_type == "vector":
-        label_gdf = load_vector_mask(label_path)
-        if image_crs == label_gdf.crs:
-            logger.info("label crs matches image crs")
-            del label_gdf
-            return image_path, label_path
-        else:
-            aligned_label_path = Path(tmp_dir) / f"{Path(label_path).stem}_aligned.gpkg"
-            label_gdf.to_crs(image_crs, inplace=True)
-            extent_geometry = label_gdf.attrs.get("extent_geometry")
-            save_vector_mask(label_gdf, aligned_label_path, extent_geometry)
-            logger.info("label crs does not match image crs, reprojecting label")
-            del label_gdf
-            return image_path, aligned_label_path
-
-
 def _pair_geoms(image_path: str, label_path: str, label_type: str):
-    """Image and label extents as shapely geometries."""
+    """Image and label extents as shapely geometries in the image CRS."""
     with rasterio.open(image_path) as image:
         image_bounds = box(*image.bounds)
+        image_crs = image.crs
     if label_type == "raster":
         with rasterio.open(label_path) as label:
+            if image_crs and label.crs and image_crs != label.crs:
+                return image_bounds, box(
+                    *transform_bounds(label.crs, image_crs, *label.bounds)
+                )
             return image_bounds, box(*label.bounds)
     label = load_vector_mask(label_path)
-    if hasattr(label, "attrs") and "extent_geometry" in label.attrs:
-        return image_bounds, label.attrs["extent_geometry"]
+    geom = label.attrs.get("extent_geometry") if hasattr(label, "attrs") else None
+    if geom is not None:
+        if image_crs and label.crs and label.crs != image_crs:
+            geom = gpd.GeoSeries([geom], crs=label.crs).to_crs(image_crs).iloc[0]
+        return image_bounds, geom
+    if image_crs and label.crs and label.crs != image_crs:
+        label = label.to_crs(image_crs)
     return image_bounds, box(*label.total_bounds)
 
 
@@ -371,60 +310,116 @@ def calculate_overlap(
     return overlap_percentage, f"Overlap percentage: {overlap_percentage:.2f}%"
 
 
-@log_stage(stage_name="get_intersection", log_memory=True)
-def get_intersection(image_path: str, label_path: str, label_type: str) -> box:
-    """Find the intersection area between an image and label (raster or vector)."""
-    image_bounds, label_bounds = _pair_geoms(image_path, label_path, label_type)
-    intersection = label_bounds.intersection(image_bounds)
-    if intersection.is_empty:
-        return None
-    return intersection
+def _pixel_aligned_extent(
+    src: rasterio.DatasetReader,
+    geometry,
+) -> Tuple[float, float, float, float, float, float]:
+    if src.transform.b != 0 or src.transform.d != 0:
+        raise ValueError("Rotated transforms are not supported")
+    if hasattr(geometry, "geom_type"):
+        bounds = geometry.bounds
+    else:
+        geoms = list(geometry)
+        bounds = (
+            min(g.bounds[0] for g in geoms),
+            min(g.bounds[1] for g in geoms),
+            max(g.bounds[2] for g in geoms),
+            max(g.bounds[3] for g in geoms),
+        )
+    win = from_bounds(*bounds, transform=src.transform)
+    col0 = max(int(math.floor(win.col_off + 1e-6)), 0)
+    row0 = max(int(math.floor(win.row_off + 1e-6)), 0)
+    col1 = min(int(math.ceil(win.col_off + win.width - 1e-6)), src.width)
+    row1 = min(int(math.ceil(win.row_off + win.height - 1e-6)), src.height)
+    if col1 <= col0 or row1 <= row0:
+        raise ValueError("Geometry does not overlap raster")
+    xmin, ymin, xmax, ymax = window_bounds(
+        Window(col0, row0, col1 - col0, row1 - row0), src.transform
+    )
+    return xmin, ymin, xmax, ymax, abs(src.transform.a), abs(src.transform.e)
+
+
+def _align_vector_crs(image_path: str, label_path: str, tmp_dir: str) -> str:
+    with rasterio.open(image_path) as src:
+        image_crs = src.crs
+    label_gdf = load_vector_mask(label_path)
+    if image_crs is None or label_gdf.crs == image_crs:
+        return label_path
+    src_crs = label_gdf.crs
+    extent = label_gdf.attrs.get("extent_geometry")
+    label_gdf.to_crs(image_crs, inplace=True)
+    if extent is not None and src_crs is not None:
+        extent = gpd.GeoSeries([extent], crs=src_crs).to_crs(image_crs).iloc[0]
+    out = Path(tmp_dir) / f"{Path(label_path).stem}_aligned.gpkg"
+    save_vector_mask(label_gdf, out, extent)
+    return str(out)
 
 
 @with_connection_retry
 @log_stage(stage_name="clip_raster_to_geometry", log_memory=True)
-def clip_raster_to_geometry(image_path: str, geometry: box, prefix: str, tmp_dir: str):
-    """
-    Clip raster to exact geometry.
-    """
+def clip_raster_to_geometry(
+    image_path: str,
+    geometry: box,
+    prefix: str,
+    tmp_dir: str,
+    extent: Tuple[float, float, float, float, float, float],
+    t_srs: Optional[str] = None,
+):
+    """Clip raster to geometry on the given pixel-aligned extent."""
     if Path(image_path).suffix.lower() == ".vrt":
         vrt_image_path = Path(tmp_dir) / f"{Path(image_path).stem}_vrt.tif"
         gdal_translate_copy(image_path, vrt_image_path)
-        with rasterio.open(vrt_image_path) as src:
-            nodata = src.nodata
-            crs = src.crs
         source_path = vrt_image_path
         cleanup_vrt = True
     else:
         source_path = image_path
         cleanup_vrt = False
-        with rasterio.open(image_path) as src:
-            nodata = src.nodata
-            crs = src.crs
     temp_geom_path = Path(tmp_dir) / f"{prefix}_clip_geom.shp"
     clipped_image_path = Path(tmp_dir) / f"{Path(image_path).stem}_clipped_{prefix}.tif"
+    xmin, ymin, xmax, ymax, xres, yres = extent
 
     try:
+        with rasterio.open(source_path) as src:
+            nodata = src.nodata
+            crs = src.crs
+        if nodata is None:
+            nodata = 0
+            logger.warning("%s has no nodata; using 0 for clipped output", image_path)
+
+        cutline_crs = t_srs or crs
         if hasattr(geometry, "geom_type"):
-            gdf = gpd.GeoDataFrame({"id": [1]}, geometry=[geometry], crs=crs)
+            gdf = gpd.GeoDataFrame({"id": [1]}, geometry=[geometry], crs=cutline_crs)
         else:
             gdf = gpd.GeoDataFrame(
-                {"id": list(range(len(geometry)))}, geometry=list(geometry), crs=crs
+                {"id": list(range(len(geometry)))},
+                geometry=list(geometry),
+                crs=cutline_crs,
             )
-
         gdf.to_file(temp_geom_path, driver="ESRI Shapefile")
         del gdf
 
         cmd = [
             "gdalwarp",
+            "-overwrite",
             "-cutline",
             str(temp_geom_path),
-            "-crop_to_cutline",
+            "-te",
+            str(xmin),
+            str(ymin),
+            str(xmax),
+            str(ymax),
+            "-tr",
+            str(xres),
+            str(yres),
+            "-r",
+            "near",
         ]
-        if nodata is not None:
-            cmd.extend(["-dstnodata", str(nodata)])
+        if t_srs:
+            cmd.extend(["-t_srs", t_srs])
         cmd.extend(
             [
+                "-dstnodata",
+                str(nodata),
                 "-of",
                 "GTiff",
                 "-co",
@@ -444,31 +439,17 @@ def clip_raster_to_geometry(image_path: str, geometry: box, prefix: str, tmp_dir
             shp_file = temp_geom_path.with_suffix(ext)
             if shp_file.exists():
                 shp_file.unlink()
-
         if cleanup_vrt and Path(source_path).exists():
             Path(source_path).unlink()
 
 
 @log_stage(stage_name="clip_vector_to_extent", log_memory=True)
-def clip_vector_to_extent(
-    label_path: str, geometry: box, tmp_dir: str
-) -> gpd.GeoDataFrame:
-    """
-    Clip a GeoDataFrame to the given extent.
-
-    Args:
-        gdf: Input GeoDataFrame
-        extent: shapely box of the target extent
-
-    Returns:
-        Clipped GeoDataFrame
-    """
+def clip_vector_to_extent(label_path: str, geometry: box, tmp_dir: str) -> Path:
     clipped_label_path = Path(tmp_dir) / f"{Path(label_path).stem}_clipped_label.gpkg"
     label = load_vector_mask(label_path)
     extent_gdf = gpd.GeoDataFrame(geometry=[geometry], crs=label.crs)
     clipped_gdf = gpd.clip(label, extent_gdf)
     save_vector_mask(clipped_gdf, clipped_label_path, extent_geometry=geometry)
-    # del label, extent_gdf, clipped_gdf, geometry
     return clipped_label_path
 
 
@@ -476,23 +457,27 @@ def clip_vector_to_extent(
 def clip_to_intersection(
     image_path: str, label_path: str, label_type: str, tmp_dir: str
 ):
-    """
-    Clip an image and label to the intersection of the two.
-    """
-    intersection = get_intersection(image_path, label_path, label_type)
-    if intersection is None:
+    """Clip image and label onto the image pixel grid at their intersection."""
+    if label_type == "vector":
+        label_path = _align_vector_crs(image_path, label_path, tmp_dir)
+    image_bounds, label_bounds = _pair_geoms(image_path, label_path, label_type)
+    intersection = label_bounds.intersection(image_bounds)
+    if intersection.is_empty:
         return None, None
-    clipped_image_path = clip_raster_to_geometry(
-        image_path, intersection, "image", tmp_dir
+    with rasterio.open(image_path) as src:
+        extent = _pixel_aligned_extent(src, intersection)
+        t_srs = src.crs.to_string() if src.crs else None
+    clipped_image = clip_raster_to_geometry(
+        image_path, intersection, "image", tmp_dir, extent
     )
     if label_type == "raster":
-        clipped_label_path = clip_raster_to_geometry(
-            label_path, intersection, "label", tmp_dir
+        clipped_label = clip_raster_to_geometry(
+            label_path, intersection, "label", tmp_dir, extent, t_srs=t_srs
         )
-    elif label_type == "vector":
-        clipped_label_path = clip_vector_to_extent(label_path, intersection, tmp_dir)
-    del intersection
-    return clipped_image_path, clipped_label_path
+    else:
+        snapped = box(extent[0], extent[1], extent[2], extent[3])
+        clipped_label = clip_vector_to_extent(label_path, snapped, tmp_dir)
+    return clipped_image, clipped_label
 
 
 @log_stage(stage_name="create_nodata_mask", log_memory=True)
