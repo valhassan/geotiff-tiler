@@ -145,6 +145,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--stride", type=int)
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument("--label-threshold", type=float, default=0.01)
+    p.add_argument("--min-valid-frac", type=float, default=0.5)
     p.add_argument("--class-ids", type=_class_ids)
     p.add_argument("--attr-field", nargs="+")
     p.add_argument("--attr-values", nargs="+", type=int)
@@ -225,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
             stride=stride,
             val_ratio=args.val_ratio,
             label_threshold=args.label_threshold,
+            min_valid_frac=args.min_valid_frac,
         )
 
     if args.tiler:
@@ -239,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
                 attr_values=args.attr_values,
                 class_ids=args.class_ids,
                 label_threshold=args.label_threshold,
+                min_valid_frac=args.min_valid_frac,
                 prefix=sensor,
                 output_dir=str(out),
                 output_format=args.output_format,
