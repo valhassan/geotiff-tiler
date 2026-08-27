@@ -14,10 +14,12 @@ from shapely.geometry import box
 from shapely.ops import unary_union
 
 from geotiff_tiler.split_planner import (
+    _val_yield,
     classify_patch,
     merge_adjacent_rects,
     run_planner,
     val_rects_for_image,
+    window_origins,
 )
 
 CLASS_IDS = {"background": 0, "fore": 1, "hydro": 2, "road": 3, "building": 4}
@@ -94,6 +96,16 @@ def _make_scene(out: Path, name, sensor, size_px, gsd, origin, seed):
         "label": str(lbl_path),
         "metadata": {"split": "trn", "collection": sensor},
     }
+
+
+def test_snapped_origins_and_yield():
+    assert window_origins(1000, 512, 256) == [0, 256, 488]
+    assert window_origins(3072, 512, 256)[-1] == 3072 - 512
+    y = _val_yield(0, 1000, 0, 1000, 1000, 1000, 512, 256)
+    assert y == 3 * 3
+    assert _val_yield(0, 400, 0, 400, 1000, 1000, 512, 256) == 0
+    # last snapped window [488, 1000) is not fully inside [0, 512)
+    assert _val_yield(0, 512, 0, 512, 1000, 1000, 512, 256) == 1
 
 
 def test_classify_and_merge():
@@ -225,6 +237,8 @@ def test_planner_e2e():
 
 
 def main() -> int:
+    test_snapped_origins_and_yield()
+    print("origins/yield ok")
     test_classify_and_merge()
     print("classify/merge ok")
     test_planner_e2e()
