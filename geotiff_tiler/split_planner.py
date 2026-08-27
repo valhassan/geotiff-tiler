@@ -28,6 +28,14 @@ logger = logging.getLogger(__name__)
 PLAN_VERSION = 1
 
 
+def window_origins(length: int, patch: int, stride: int) -> list[int]:
+    last = length - patch
+    origs = list(range(0, last + 1, stride))
+    if origs[-1] != last:
+        origs.append(last)
+    return origs
+
+
 def require_split(metadata: dict, image) -> str:
     split = str(metadata.get("split") or "").strip().lower()
     if split not in ("trn", "tst"):
@@ -90,6 +98,7 @@ def analyze_image(
     cell_strides: int = 4,
     coarse_factor: int = 4,
     label_threshold: float = 0.01,
+    min_valid_frac: float = 0.5,
 ) -> dict | None:
     """Coarse-grid analysis of one pair over the image ∩ label intersection.
 
@@ -162,7 +171,10 @@ def analyze_image(
                 px0 // coarse_factor : math.ceil(px1 / coarse_factor),
             ]
             counts = np.bincount(block.ravel(), minlength=n_classes)[:n_classes]
-            fg = 1.0 - (counts[0] / max(block.size, 1))
+            n_valid = int(np.count_nonzero(block != 255))
+            if n_valid == 0 or n_valid / block.size < min_valid_frac:
+                continue
+            fg = 1.0 - counts[0] / n_valid
             if fg < label_threshold:
                 continue
             y_est = _val_yield(
@@ -182,11 +194,12 @@ def analyze_image(
                 }
             )
 
-    n_px = math.ceil(width / stride)
-    n_py = math.ceil(height / stride)
     return {
         "crs": img_crs.to_string(),
-        "total_patches": n_px * n_py,
+        "total_patches": (
+            len(window_origins(width, patch_size, stride))
+            * len(window_origins(height, patch_size, stride))
+        ),
         "total_class_counts": total_counts.tolist(),
         "cells": cells,
         "grid": [ncx, ncy],
@@ -226,15 +239,14 @@ def _px_to_map(px, py, x_origin, y_origin_top, res):
 
 
 def _val_yield(px0, px1, py0, py1, width, height, patch, stride):
-    """Patch origins whose clipped extent fits fully inside the cell."""
+    """Patch origins whose full window fits inside the cell."""
 
     def count(a0, a1, extent):
-        n = 0
-        for o in range(0, extent, stride):
-            end = min(o + patch, extent)
-            if o >= a0 and end <= a1:
-                n += 1
-        return n
+        return sum(
+            1
+            for o in window_origins(extent, patch, stride)
+            if o >= a0 and o + patch <= a1
+        )
 
     return count(px0, px1, width) * count(py0, py1, height)
 
@@ -304,6 +316,7 @@ def run_planner(
     cell_strides: int = 4,
     coarse_factor: int = 4,
     label_threshold: float = 0.01,
+    min_valid_frac: float = 0.5,
 ) -> dict:
     """Plan val cells across all sensors. tst pairs are ignored.
 
@@ -325,6 +338,8 @@ def run_planner(
         "val_ratio": val_ratio,
         "cell_strides": cell_strides,
         "coarse_factor": coarse_factor,
+        "label_threshold": label_threshold,
+        "min_valid_frac": min_valid_frac,
         "class_ids": class_ids,
     }
     n_classes = max(class_ids.values()) + 1
@@ -355,6 +370,7 @@ def run_planner(
                 cell_strides,
                 coarse_factor,
                 label_threshold,
+                min_valid_frac,
             )
         except Exception as e:
             logger.error("%s: analysis failed: %s", name, e)
@@ -547,7 +563,7 @@ def classify_patch(
     """``val`` if inside a val rect, ``trn`` if disjoint, else None (buffer).
 
     ``bounds`` / rects are ``(minx, miny, maxx, maxy)``. ``tol`` is in map units
-    (~1 native pixel). ``img_bounds`` clips boundless edge patches to real data.
+    (~1 native pixel). ``img_bounds`` clips window bounds to the scene.
     """
     x0, y0, x1, y1 = bounds
     if img_bounds is not None:
