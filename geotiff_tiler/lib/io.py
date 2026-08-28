@@ -48,7 +48,9 @@ def mask_is_declared(src: rasterio.DatasetReader) -> bool:
 def nodata_spec(src: rasterio.DatasetReader) -> tuple[float, str]:
     if mask_is_declared(src):
         nd = src.nodata
-        return (float(nd) if nd is not None else 0.0), "declared"
+        if nd is not None:
+            return float(nd), "declared"
+        return 0.0, "mask"
     return 0.0, "fallback_zero"
 
 
@@ -433,21 +435,25 @@ def clip_raster_to_geometry(
     else:
         source_path = image_path
         cleanup_vrt = False
+    stem = Path(image_path).stem
     temp_geom_path = Path(tmp_dir) / f"{prefix}_clip_geom.shp"
-    clipped_image_path = Path(tmp_dir) / f"{Path(image_path).stem}_clipped_{prefix}.tif"
+    clipped_image_path = Path(tmp_dir) / f"{stem}_clipped_{prefix}.tif"
+    warp_alpha_path = Path(tmp_dir) / f"{stem}_warp_a_{prefix}.tif"
     xmin, ymin, xmax, ymax, xres, yres = extent
 
     try:
         with rasterio.open(source_path) as src:
             crs = src.crs
             spec_nd, spec_src = nodata_spec(src)
+            n_data = src.count
         if dst_nodata is None:
             dst_nodata = spec_nd
             if spec_src == "fallback_zero":
                 logger.warning(
                     "%s has no nodata; using 0 for clipped output", image_path
                 )
-        if src_nodata is None:
+        carry_mask = spec_src == "mask" and src_nodata is None
+        if src_nodata is None and not carry_mask:
             src_nodata = dst_nodata
 
         cutline_crs = t_srs or crs
@@ -461,6 +467,14 @@ def clip_raster_to_geometry(
             )
         gdf.to_file(temp_geom_path, driver="ESRI Shapefile")
         del gdf
+
+        nd_args = ["-dstnodata", str(dst_nodata)]
+        if carry_mask:
+            nd_args = ["-nosrcalpha", "-dstalpha", *nd_args]
+            warp_dst = warp_alpha_path
+        else:
+            nd_args = ["-srcnodata", str(src_nodata), *nd_args]
+            warp_dst = clipped_image_path
 
         cmd = [
             "gdalwarp",
@@ -482,10 +496,7 @@ def clip_raster_to_geometry(
             cmd.extend(["-t_srs", t_srs])
         cmd.extend(
             [
-                "-srcnodata",
-                str(src_nodata),
-                "-dstnodata",
-                str(dst_nodata),
+                *nd_args,
                 "-of",
                 "GTiff",
                 "-co",
@@ -495,10 +506,38 @@ def clip_raster_to_geometry(
                 "-co",
                 "BLOCKYSIZE=256",
                 str(source_path),
-                str(clipped_image_path),
+                str(warp_dst),
             ]
         )
         subprocess.run(cmd, capture_output=True, text=True, check=True)
+        if carry_mask:
+            tcmd = [
+                "gdal_translate",
+                "--config",
+                "GDAL_TIFF_INTERNAL_MASK",
+                "YES",
+            ]
+            for b in range(1, n_data + 1):
+                tcmd.extend(["-b", str(b)])
+            tcmd.extend(
+                [
+                    "-mask",
+                    str(n_data + 1),
+                    "-a_nodata",
+                    "none",
+                    "-of",
+                    "GTiff",
+                    "-co",
+                    "TILED=YES",
+                    "-co",
+                    "BLOCKXSIZE=256",
+                    "-co",
+                    "BLOCKYSIZE=256",
+                    str(warp_dst),
+                    str(clipped_image_path),
+                ]
+            )
+            subprocess.run(tcmd, capture_output=True, text=True, check=True)
         return clipped_image_path
     finally:
         for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
@@ -507,6 +546,8 @@ def clip_raster_to_geometry(
                 shp_file.unlink()
         if cleanup_vrt and Path(source_path).exists():
             Path(source_path).unlink()
+        if warp_alpha_path.exists():
+            warp_alpha_path.unlink()
 
 
 @log_stage(stage_name="clip_vector_to_extent", log_memory=True)
