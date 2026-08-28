@@ -17,14 +17,22 @@ from shapely.geometry import MultiPolygon, Polygon
 
 logger = logging.getLogger(__name__)
 
-def _pixel_coords(geom, transform: Affine):
-    """Convert a geometry from CRS space to pixel float coordinates."""
-    sx, sy = transform.a, transform.e  # pixel width, pixel height (negative)
-    ox, oy = transform.c, transform.f  # origin x, origin y
-    coords = np.array(geom.exterior.coords)  # (N, 2) float
+_SDF_CLIP_M = 32.0
+_ROAD_REF_M = 20.0
+
+
+def _pixel_coords(ring, transform: Affine):
+    sx, sy = transform.a, transform.e
+    ox, oy = transform.c, transform.f
+    coords = np.asarray(ring.coords)
     px = (coords[:, 0] - ox) / sx
     py = (coords[:, 1] - oy) / sy
-    return px, py  # float pixel coords
+    return px, py
+
+
+def _rings(geom: Polygon):
+    yield geom.exterior
+    yield from geom.interiors
 
 
 def _rasterize_geom(
@@ -80,8 +88,8 @@ def compute_building_targets(
     Returns:
         Dict mapping target name → tif path. Keys:
             'edt'       dual-distance boundary weight map  uint8
-            'boundary'  vector boundary map                float32
-            'vertices'  vertex heatmap                     float32
+            'boundary'  vector boundary map                uint8
+            'vertices'  vertex heatmap                     uint8
             'sdf'       signed distance field              float32
     """
     with rasterio.open(image_path) as src:
@@ -100,47 +108,86 @@ def compute_building_targets(
     edt_map = _compute_dual_distance_edt(
         valid_geoms, h, w, transform, max_dist_px, sigma
     )
-    logger.info(f"EDT:      {time.time() - t:.1f}s")
+    logger.info("EDT:      %.1fs", time.time() - t)
+    paths = {}
+    _write_target(
+        paths, tmp_dir, label_name, "edt", edt_map, "uint8", h, w, crs, transform
+    )
+    del edt_map
+
     t = time.time()
     boundary_map = _compute_vector_boundary(valid_geoms, h, w, transform)
-    logger.info(f"Boundary: {time.time() - t:.1f}s")
+    logger.info("Boundary: %.1fs", time.time() - t)
+    _write_target(
+        paths,
+        tmp_dir,
+        label_name,
+        "boundary",
+        np.clip(boundary_map * 255, 0, 255).astype(np.uint8),
+        "uint8",
+        h,
+        w,
+        crs,
+        transform,
+    )
+    del boundary_map
+
     t = time.time()
     vertex_map = _compute_vertex_heatmap(valid_geoms, h, w, transform, vertex_sigma)
-    logger.info(f"Vertices: {time.time() - t:.1f}s")
+    logger.info("Vertices: %.1fs", time.time() - t)
+    _write_target(
+        paths,
+        tmp_dir,
+        label_name,
+        "vertices",
+        np.clip(vertex_map * 255, 0, 255).astype(np.uint8),
+        "uint8",
+        h,
+        w,
+        crs,
+        transform,
+    )
+    del vertex_map
+
     t = time.time()
     sdf_map = _compute_sdf(valid_geoms, h, w, transform)
-    logger.info(f"SDF:      {time.time() - t:.1f}s")
-
-    # Write to tif files
-    paths = {}
-    specs = [
-        ("edt", edt_map, "uint8", np.uint8),
-        ("boundary", np.clip(boundary_map * 255, 0, 255), "uint8", np.uint8),
-        ("vertices", np.clip(vertex_map * 255, 0, 255), "uint8", np.uint8),
-        ("sdf", sdf_map, "float32", np.float32),
-    ]
-
-    for key, arr, dtype_str, dtype_np in specs:
-        out_path = Path(tmp_dir) / f"{label_name}_buildings_{key}.tif"
-        with rasterio.open(
-            out_path,
-            "w",
-            driver="GTiff",
-            height=h,
-            width=w,
-            count=1,
-            dtype=dtype_str,
-            crs=crs,
-            transform=transform,
-            tiled=True,
-            blockxsize=256,
-            blockysize=256,
-        ) as dst:
-            dst.write(arr.astype(dtype_np), 1)
-        paths[key] = str(out_path)
-        logger.info(f"[building_targets] wrote {key} → {out_path}")
-
+    logger.info("SDF:      %.1fs", time.time() - t)
+    _write_target(
+        paths, tmp_dir, label_name, "sdf", sdf_map, "float32", h, w, crs, transform
+    )
     return paths
+
+
+def _write_target(
+    paths: dict[str, str],
+    tmp_dir: str,
+    label_name: str,
+    key: str,
+    arr: np.ndarray,
+    dtype: str,
+    h: int,
+    w: int,
+    crs,
+    transform: Affine,
+) -> None:
+    out_path = Path(tmp_dir) / f"{label_name}_buildings_{key}.tif"
+    with rasterio.open(
+        out_path,
+        "w",
+        driver="GTiff",
+        height=h,
+        width=w,
+        count=1,
+        dtype=dtype,
+        crs=crs,
+        transform=transform,
+        tiled=True,
+        blockxsize=256,
+        blockysize=256,
+    ) as dst:
+        dst.write(arr, 1)
+    paths[key] = str(out_path)
+    logger.info("[building_targets] wrote %s → %s", key, out_path)
 
 
 def _compute_dual_distance_edt(
@@ -216,16 +263,15 @@ def _compute_vector_boundary(
     r = 2
 
     for geom in geoms:
-        px, py = _pixel_coords(geom, transform)
-
-        # Collect all sample points across all edges at once
         all_xs, all_ys = [], []
-        for i in range(len(px) - 1):
-            length = np.hypot(px[i+1] - px[i], py[i+1] - py[i])
-            n = max(int(length * 2), 1)
-            ts = np.linspace(0, 1, n)
-            all_xs.append(px[i] + ts * (px[i+1] - px[i]))
-            all_ys.append(py[i] + ts * (py[i+1] - py[i]))
+        for ring in _rings(geom):
+            px, py = _pixel_coords(ring, transform)
+            for i in range(len(px) - 1):
+                length = np.hypot(px[i + 1] - px[i], py[i + 1] - py[i])
+                n = max(int(length * 2), 1)
+                ts = np.linspace(0, 1, n)
+                all_xs.append(px[i] + ts * (px[i + 1] - px[i]))
+                all_ys.append(py[i] + ts * (py[i + 1] - py[i]))
 
         if not all_xs:
             continue
@@ -274,9 +320,10 @@ def _compute_vertex_heatmap(
     # Collect ALL vertices across all geometries at once
     all_vx, all_vy = [], []
     for geom in geoms:
-        px, py = _pixel_coords(geom, transform)
-        all_vx.append(px[:-1])
-        all_vy.append(py[:-1])
+        for ring in _rings(geom):
+            px, py = _pixel_coords(ring, transform)
+            all_vx.append(px[:-1])
+            all_vy.append(py[:-1])
 
     if not all_vx:
         return heatmap
@@ -313,13 +360,12 @@ def _compute_sdf(
     Positive  = inside polygon  (distance to boundary from interior)
     Negative  = outside polygon (distance to nearest polygon)
     Zero      = exactly on boundary.
-    Normalised per-image to [-1, 1].
+    Scaled by metres / _SDF_CLIP_M and clipped to [-1, 1].
     Stored as float32.
     """
     if not geoms:
         return np.zeros((h, w), dtype=np.float32)
 
-    # Rasterize all building polygons together for the binary mask
     all_mask = rasterize(
         [(g, 1) for g in geoms],
         out_shape=(h, w),
@@ -328,16 +374,13 @@ def _compute_sdf(
         dtype=np.uint8,
     ).astype(bool)
 
-    interior_dist = distance_transform_edt(all_mask).astype(np.float32)
-    exterior_dist = distance_transform_edt(~all_mask).astype(np.float32)
-
-    sdf = np.where(all_mask, interior_dist, -exterior_dist)
-
-    # Normalize to [-1, 1] for training stability
-    max_abs = max(np.abs(sdf).max(), 1.0)
-    sdf /= max_abs
-
-    return sdf.astype(np.float32)
+    sdf = distance_transform_edt(all_mask).astype(np.float32)
+    exterior = distance_transform_edt(~all_mask).astype(np.float32)
+    np.copyto(sdf, -exterior, where=~all_mask)
+    del exterior, all_mask
+    sdf *= abs(transform.a)
+    np.clip(sdf / _SDF_CLIP_M, -1.0, 1.0, out=sdf)
+    return sdf
 
 
 def compute_road_targets(
@@ -436,8 +479,7 @@ def _compute_road_centerline_weight(
     avoid full-image distance transforms. Overlapping polygons are resolved
     by taking the per-pixel maximum so no road is suppressed.
 
-    Normalised to [0, 1] by the global maximum before uint8 storage, making
-    the scale consistent across sensors and image extents.
+    Normalised by _ROAD_REF_M metres so scale is consistent across scenes.
 
     Args:
         geoms:     List of road polygon geometries.
@@ -473,14 +515,10 @@ def _compute_road_centerline_weight(
 
         # Intra-polygon EDT: distance from interior pixels to nearest boundary.
         local_edt = distance_transform_edt(mask).astype(np.float32)
+        local_edt *= abs(transform.a)
 
-        # Max merge: overlapping road polygons don't suppress each other.
         sl = weight[r0:r1, c0:c1]
         np.maximum(sl, local_edt, out=sl)
 
-    # Normalise to [0, 1] by global max for cross-sensor consistency.
-    max_val = weight.max()
-    if max_val > 0:
-        weight /= max_val
-
-    return np.clip(weight * 255, 0, 255).astype(np.uint8)
+    np.clip(weight / _ROAD_REF_M, 0, 1, out=weight)
+    return (weight * 255).astype(np.uint8)
