@@ -66,17 +66,6 @@ def window_valid(
     return np.any(np.isfinite(data), axis=0)
 
 
-def image_nodata_meta(image_path: str) -> tuple[str, float]:
-    with rasterio.open(image_path) as src:
-        _, source = nodata_spec(src)
-        n_ok = n = 0
-        for _, win in src.block_windows(1):
-            valid = window_valid(src, win)
-            n_ok += int(valid.sum())
-            n += valid.size
-    return source, (n_ok / n if n else 0.0)
-
-
 def label_src_nodata(label_path: str) -> int | float | str:
     with rasterio.open(label_path) as src:
         nd = src.nodata
@@ -91,14 +80,6 @@ def require_class_ids(class_ids: dict | None) -> None:
     bad = {k: v for k, v in class_ids.items() if int(v) < 0 or int(v) >= IGNORE_INDEX}
     if bad:
         raise ValueError(f"class ids must be in 0–254, got {bad}")
-
-
-def gdal_translate_copy(src, dst):
-    result = subprocess.run(
-        ["gdal_translate", "-of", "GTiff", src, dst], capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"GDAL failed: {result.stderr}")
 
 
 def log_stage(stage_name=None, log_memory=False, force_gc=False):
@@ -202,22 +183,6 @@ def load_vector_mask(
     return result
 
 
-def save_vector_mask(
-    gdf: gpd.GeoDataFrame,
-    output_path: str,
-    extent_geometry: gpd.GeoSeries | None = None,
-    main_layer: str = "labels",
-    extent_layer: str = "extent",
-):
-    """Saves a vector mask to a path."""
-    gdf.to_file(output_path, layer=main_layer, driver="GPKG")
-    if extent_geometry is not None:
-        extent_gdf = gpd.GeoDataFrame(geometry=[extent_geometry], crs=gdf.crs)
-        extent_gdf.to_file(output_path, layer=extent_layer, driver="GPKG")
-        del extent_gdf
-    del gdf
-
-
 def _looks_like_stac(image_path: str) -> bool:
     s = str(image_path).lower()
     return s.startswith(("http://", "https://")) or s.endswith((".json", ".jsonl"))
@@ -253,7 +218,12 @@ def validate_image(
         stac_item = pystac.Item.from_file(image_path)
         item = SingleBandItemEO(item=stac_item, bands_requested=bands_requested)
         stac_bands = [value["meta"].href for value in item.bands_requested.values()]
-        return stack_bands(stac_bands)
+        xml = stack_bands(stac_bands)
+        if tmp_dir is None:
+            return xml
+        out = Path(tmp_dir) / "stac_stack.vrt"
+        out.write_text(xml)
+        return str(out)
     except Exception:
         if local:
             return _local_image(image_path, band_indices, tmp_dir)
@@ -272,7 +242,7 @@ def validate_mask(mask_path: str):
 @log_stage(stage_name="validate_pair")
 def validate_pair(image_path, label_path, label_type):
     """Validates an image-label pair based on georeferencing and data integrity."""
-
+    label_gdf = None
     with rasterio.open(image_path) as src_image:
         logger.info("Validating image in pair")
         image_valid, image_msg = check_image_validity(src_image)
@@ -327,7 +297,10 @@ def validate_pair(image_path, label_path, label_type):
                         "reason": "Invalid georeferencing or alignment for raster label or image",
                     }
 
-    return {"valid": True, "reason": "Valid pair", "special_case": False}
+    out = {"valid": True, "reason": "Valid pair", "special_case": False}
+    if label_gdf is not None:
+        out["label_gdf"] = label_gdf
+    return out
 
 
 def _pair_geoms(image_path: str, label_path: str, label_type: str):
@@ -398,20 +371,17 @@ def _pixel_aligned_extent(
     return xmin, ymin, xmax, ymax, abs(src.transform.a), abs(src.transform.e)
 
 
-def _align_vector_crs(image_path: str, label_path: str, tmp_dir: str) -> str:
-    with rasterio.open(image_path) as src:
-        image_crs = src.crs
-    label_gdf = load_vector_mask(label_path)
-    if image_crs is None or label_gdf.crs == image_crs:
-        return label_path
-    src_crs = label_gdf.crs
-    extent = label_gdf.attrs.get("extent_geometry")
-    label_gdf.to_crs(image_crs, inplace=True)
+def _align_gdf(label: gpd.GeoDataFrame, image_crs) -> gpd.GeoDataFrame:
+    if image_crs is None or label.crs == image_crs:
+        return label
+    src_crs = label.crs
+    extent = label.attrs.get("extent_geometry")
+    out = label.to_crs(image_crs)
     if extent is not None and src_crs is not None:
-        extent = gpd.GeoSeries([extent], crs=src_crs).to_crs(image_crs).iloc[0]
-    out = Path(tmp_dir) / f"{Path(label_path).stem}_aligned.gpkg"
-    save_vector_mask(label_gdf, out, extent)
-    return str(out)
+        out.attrs["extent_geometry"] = (
+            gpd.GeoSeries([extent], crs=src_crs).to_crs(image_crs).iloc[0]
+        )
+    return out
 
 
 @with_connection_retry
@@ -427,15 +397,15 @@ def clip_raster_to_geometry(
     src_nodata: Optional[Union[int, float, str]] = None,
 ):
     """Clip raster to geometry on the given pixel-aligned extent."""
-    if Path(image_path).suffix.lower() == ".vrt":
-        vrt_image_path = Path(tmp_dir) / f"{Path(image_path).stem}_vrt.tif"
-        gdal_translate_copy(image_path, vrt_image_path)
-        source_path = vrt_image_path
+    raw = str(image_path).lstrip()
+    if raw.startswith("<"):
+        source_path = Path(tmp_dir) / f"{prefix}_src.vrt"
+        source_path.write_text(str(image_path))
         cleanup_vrt = True
     else:
         source_path = image_path
         cleanup_vrt = False
-    stem = Path(image_path).stem
+    stem = Path(image_path).stem if not raw.startswith("<") else prefix
     temp_geom_path = Path(tmp_dir) / f"{prefix}_clip_geom.shp"
     clipped_image_path = Path(tmp_dir) / f"{stem}_clipped_{prefix}.tif"
     warp_alpha_path = Path(tmp_dir) / f"{stem}_warp_a_{prefix}.tif"
@@ -457,7 +427,7 @@ def clip_raster_to_geometry(
         if src_nodata is None and not carry_mask:
             src_nodata = dst_nodata
 
-        cutline_crs = t_srs or crs
+        cutline_crs = rasterio.crs.CRS.from_wkt(t_srs) if t_srs else crs
         if hasattr(geometry, "geom_type"):
             gdf = gpd.GeoDataFrame({"id": [1]}, geometry=[geometry], crs=cutline_crs)
         else:
@@ -551,32 +521,46 @@ def clip_raster_to_geometry(
             warp_alpha_path.unlink()
 
 
-@log_stage(stage_name="clip_vector_to_extent", log_memory=True)
-def clip_vector_to_extent(label_path: str, geometry: box, tmp_dir: str) -> Path:
-    clipped_label_path = Path(tmp_dir) / f"{Path(label_path).stem}_clipped_label.gpkg"
-    label = load_vector_mask(label_path)
-    extent_gdf = gpd.GeoDataFrame(geometry=[geometry], crs=label.crs)
-    clipped_gdf = gpd.clip(label, extent_gdf)
-    save_vector_mask(clipped_gdf, clipped_label_path, extent_geometry=geometry)
-    return clipped_label_path
-
-
 @log_stage(stage_name="clip_to_intersection", log_memory=True)
 def clip_to_intersection(
-    image_path: str, label_path: str, label_type: str, tmp_dir: str
+    image_path: str,
+    label_path: str,
+    label_type: str,
+    tmp_dir: str,
+    label_gdf: gpd.GeoDataFrame | None = None,
 ):
     """Clip image and label onto the image pixel grid at their intersection."""
-    if label_type == "vector":
-        label_path = _align_vector_crs(image_path, label_path, tmp_dir)
-    image_bounds, label_bounds = _pair_geoms(image_path, label_path, label_type)
-    intersection = label_bounds.intersection(image_bounds)
-    if intersection.is_empty:
-        return None, None
     with rasterio.open(image_path) as src:
-        extent = _pixel_aligned_extent(src, intersection)
-        t_srs = src.crs.to_string() if src.crs else None
+        image_bounds = box(*src.bounds)
+        image_crs = src.crs
+        t_srs = src.crs.to_wkt() if src.crs else None
+        if label_type == "vector":
+            if label_gdf is None:
+                label_gdf = load_vector_mask(label_path)
+            label_gdf = _align_gdf(label_gdf, image_crs)
+            geom = (
+                label_gdf.attrs.get("extent_geometry")
+                if hasattr(label_gdf, "attrs")
+                else None
+            )
+            label_bounds = (
+                geom if geom is not None else box(*label_gdf.total_bounds)
+            )
+        else:
+            with rasterio.open(label_path) as label:
+                if image_crs and label.crs and image_crs != label.crs:
+                    label_bounds = box(
+                        *transform_bounds(label.crs, image_crs, *label.bounds)
+                    )
+                else:
+                    label_bounds = box(*label.bounds)
+        intersection = label_bounds.intersection(image_bounds)
+        if intersection.is_empty:
+            return None, None, None
+        pix = _pixel_aligned_extent(src, intersection)
+
     clipped_image = clip_raster_to_geometry(
-        image_path, intersection, "image", tmp_dir, extent
+        image_path, intersection, "image", tmp_dir, pix
     )
     if label_type == "raster":
         clipped_label = clip_raster_to_geometry(
@@ -584,72 +568,69 @@ def clip_to_intersection(
             intersection,
             "label",
             tmp_dir,
-            extent,
+            pix,
             t_srs=t_srs,
             dst_nodata=IGNORE_INDEX,
             src_nodata=label_src_nodata(label_path),
         )
-        clipped_label = apply_image_mask_to_label(
+        clipped_label, valid_frac = apply_image_mask_to_label(
             clipped_image, clipped_label, tmp_dir
         )
-    else:
-        snapped = box(extent[0], extent[1], extent[2], extent[3])
-        clipped_label = clip_vector_to_extent(label_path, snapped, tmp_dir)
-    return clipped_image, clipped_label
+        return clipped_image, clipped_label, valid_frac
+    snapped = box(pix[0], pix[1], pix[2], pix[3])
+    clipped = gpd.clip(
+        label_gdf, gpd.GeoDataFrame(geometry=[snapped], crs=label_gdf.crs)
+    )
+    return clipped_image, clipped, None
 
 
 @log_stage(stage_name="create_nodata_mask", log_memory=True)
-def create_nodata_mask(image_path: str) -> Optional[gpd.GeoDataFrame]:
+def create_nodata_mask(image_path: str) -> tuple[Optional[gpd.GeoDataFrame], float]:
     with rasterio.open(image_path) as src:
         mask_array = np.zeros((src.height, src.width), dtype=np.uint8)
+        n_ok = n = 0
         for _, win in src.block_windows(1):
             row_slice, col_slice = win.toslices()
-            mask_array[row_slice, col_slice] = window_valid(src, win).astype("uint8")
+            valid = window_valid(src, win)
+            mask_array[row_slice, col_slice] = valid.astype("uint8")
+            n_ok += int(valid.sum())
+            n += valid.size
         transform = src.transform
         crs = src.crs
+    frac = n_ok / n if n else 0.0
     shapes = rasterio.features.shapes(
         mask_array, mask=mask_array > 0, transform=transform
     )
     geometries = [shape(geom) for geom, val in shapes]
     if not geometries:
-        return None
-    return gpd.GeoDataFrame(geometry=geometries, crs=crs).dissolve()
+        return None, frac
+    gdf = gpd.GeoDataFrame(geometry=geometries, crs=crs).dissolve()
+    pixel = min(abs(transform.a), abs(transform.e))
+    if pixel > 0:
+        gdf["geometry"] = gdf.geometry.simplify(pixel / 2)
+    return gdf, frac
 
 
 @log_stage(stage_name="apply_image_mask_to_label", log_memory=True)
 def apply_image_mask_to_label(
     image_path: str, label_path: str, tmp_dir: str
-) -> Path:
+) -> tuple[Path, float]:
     out = Path(tmp_dir) / f"{Path(label_path).stem}_ign.tif"
     with rasterio.open(image_path) as img, rasterio.open(label_path) as lbl:
         if (img.width, img.height) != (lbl.width, lbl.height):
             raise ValueError("Image and label dimensions must match")
         profile = lbl.profile.copy()
         profile.update(nodata=IGNORE_INDEX)
+        n_ok = n = 0
         with rasterio.open(out, "w", **profile) as dst:
             for _, window in img.block_windows(1):
                 valid = window_valid(img, window)
+                n_ok += int(valid.sum())
+                n += valid.size
                 data = lbl.read(window=window)
                 data[:, ~valid] = IGNORE_INDEX
                 dst.write(data, window=window)
-    return out
-
-
-@log_stage(stage_name="apply_nodata_mask", log_memory=True)
-def apply_nodata_mask(
-    label_path: str, nodata_mask: gpd.GeoDataFrame
-) -> gpd.GeoDataFrame:
-    """
-    This function clips the vector data to the valid area defined by the raster's no-data mask.
-    """
-    vector_data = load_vector_mask(label_path)
-    if nodata_mask is None:
-        return vector_data
-    if nodata_mask.crs != vector_data.crs:
-        nodata_mask = nodata_mask.to_crs(vector_data.crs)
-    res = gpd.overlay(vector_data, nodata_mask, how="intersection")
-    del vector_data, nodata_mask
-    return res
+    return out, (n_ok / n if n else 0.0)
 
 
 _NEIGH8 = (
@@ -720,14 +701,12 @@ def _iter_windows(height: int, width: int, bs: int = _BLOCK):
             yield Window(col, row, min(bs, width - col), min(bs, height - row))
 
 
-def _inst_conflict(halo: np.ndarray, h: int, w: int, gap_px: int):
+def _inst_conflict(halo: np.ndarray, h: int, w: int):
     core = halo[1 : 1 + h, 1 : 1 + w]
     conflict = np.zeros((h, w), dtype=bool)
     for dy, dx in _NEIGH8:
         nb = halo[1 + dy : 1 + dy + h, 1 + dx : 1 + dx + w]
         hit = (nb != 0) & (core != 0) & (nb != core)
-        if gap_px == 1:
-            hit &= core < nb
         conflict |= hit
     return core, conflict
 
@@ -737,7 +716,6 @@ def _apply_contact_gap(
     inst_path,
     n_ids: int,
     burn_vals: set,
-    gap_px: int,
     contact_frac: float,
 ) -> None:
     with rasterio.open(inst_path) as inst_src:
@@ -750,7 +728,7 @@ def _apply_contact_gap(
             halo = inst_src.read(
                 1, window=halo_win, boundless=True, fill_value=0
             )
-            core, conf = _inst_conflict(halo, wh, ww, gap_px)
+            core, conf = _inst_conflict(halo, wh, ww)
             area += np.bincount(core.ravel(), minlength=n_ids)
             if conf.any():
                 contact += np.bincount(core[conf], minlength=n_ids)
@@ -767,7 +745,7 @@ def _apply_contact_gap(
                 halo = inst_src.read(
                     1, window=halo_win, boundless=True, fill_value=0
                 )
-                core, conf = _inst_conflict(halo, wh, ww, gap_px)
+                core, conf = _inst_conflict(halo, wh, ww)
                 if skip_ids.size:
                     conf &= ~np.isin(core, skip_ids)
                 lab = lab_src.read(1, window=win)
@@ -787,7 +765,6 @@ def rasterize_vector(
     default_burn_value: int = 1,
     dtype: str = "uint8",
     erosion_classes: list | None = None,
-    gap_px: int = 2,
     max_gsd_for_erosion: float = 1.0,
     contact_frac: float = 0.5,
     valid_area: gpd.GeoDataFrame | None = None,
@@ -900,7 +877,6 @@ def rasterize_vector(
         if (
             inst_gdf is not None
             and not inst_gdf.empty
-            and gap_px
             and pixel_size <= max_gsd_for_erosion
         ):
             inst_shp = Path(tmp_dir) / f"{label_name}_inst.shp"
@@ -928,7 +904,6 @@ def rasterize_vector(
                     inst_tif,
                     n_ids,
                     erosion_burn_vals,
-                    gap_px,
                     contact_frac,
                 )
             finally:
@@ -942,23 +917,28 @@ def rasterize_vector(
 
 @log_stage(stage_name="prepare_vector_labels", log_memory=True)
 def prepare_vector_labels(
-    label_path: str,
+    vector: gpd.GeoDataFrame,
     image_path: str,
     tmp_dir: str,
     attr_field: List[str] = None,
     attr_values: list = None,
     erosion_classes: list | None = None,
-    gap_px: int = 2,
     max_gsd_for_erosion: float = 1.0,
     contact_frac: float = 0.5,
     building_class_val: int | None = None,
     road_class_val: int | None = None,
     max_gsd_for_road_targets: float = 1.0,
 ):
-    """Prepares vector labels for tiling."""
-    nodata_mask_gdf = create_nodata_mask(image_path)
-    label_gdf = apply_nodata_mask(label_path, nodata_mask_gdf)
-    label_name = Path(label_path).stem
+    nodata_mask_gdf, valid_frac = create_nodata_mask(image_path)
+    if nodata_mask_gdf is not None and not vector.empty:
+        mask = nodata_mask_gdf
+        if mask.crs != vector.crs:
+            mask = mask.to_crs(vector.crs)
+        label_gdf = gpd.overlay(vector, mask, how="intersection")
+        del mask
+    else:
+        label_gdf = vector
+    label_name = Path(image_path).stem
     rasterized_label_path = rasterize_vector(
         label_gdf,
         image_path,
@@ -967,7 +947,6 @@ def prepare_vector_labels(
         attr_field,
         attr_values,
         erosion_classes=erosion_classes,
-        gap_px=gap_px,
         max_gsd_for_erosion=max_gsd_for_erosion,
         contact_frac=contact_frac,
         valid_area=nodata_mask_gdf,
@@ -1010,4 +989,4 @@ def prepare_vector_labels(
             )
 
     del nodata_mask_gdf
-    return rasterized_label_path, targets_paths, label_gdf
+    return rasterized_label_path, targets_paths, label_gdf, valid_frac
