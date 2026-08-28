@@ -26,6 +26,12 @@ from geotiff_tiler.lib.io import load_vector_mask, require_class_ids, resolve_at
 logger = logging.getLogger(__name__)
 
 PLAN_VERSION = 1
+GRID_VERSION = 1
+
+
+def grid_spec(patch_size: tuple[int, int], stride: int) -> dict:
+    h, w = patch_size
+    return {"version": GRID_VERSION, "patch": [int(h), int(w)], "stride": int(stride)}
 
 
 def window_origins(length: int, patch: int, stride: int) -> list[int]:
