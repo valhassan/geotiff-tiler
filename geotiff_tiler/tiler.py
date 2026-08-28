@@ -28,7 +28,6 @@ from geotiff_tiler.lib.io import (
     IGNORE_INDEX,
     apply_image_mask_to_label,
     clip_to_intersection,
-    image_nodata_meta,
     log_stage,
     nodata_spec,
     prepare_vector_labels,
@@ -42,6 +41,7 @@ from geotiff_tiler.lib.viz import create_dataset_summary_visualization
 from geotiff_tiler.split_planner import (
     assign_pair_ids,
     classify_patch,
+    grid_spec,
     load_plan,
     require_split,
     val_rects_for_image,
@@ -87,7 +87,6 @@ class Tiler:
         attr_field=None,
         attr_values=None,
         erosion_classes=None,
-        gap_px: int = 2,
         max_gsd_for_erosion: float = 1.0,
         building_class_val: int | None = None,
         road_class_val: int | None = None,
@@ -117,7 +116,6 @@ class Tiler:
         self.attr_field = attr_field
         self.attr_values = attr_values
         self.erosion_classes = erosion_classes
-        self.gap_px = gap_px
         self.max_gsd_for_erosion = max_gsd_for_erosion
         self.building_class_val = building_class_val
         self.road_class_val = road_class_val
@@ -137,7 +135,9 @@ class Tiler:
             if dra_cal is None:
                 raise ValueError("apply_dra=True requires dra_cal path")
             self.dra_cals = load_calibration(dra_cal)
-        self.manifest = TilingManifest(output_dir, self.prefix)
+        self.manifest = TilingManifest(
+            output_dir, self.prefix, grid=grid_spec(self.patch_size, self.stride)
+        )
         self._patch_counts = {s: 0 for s in _SPLITS}
         self._shard_indices = {s: 0 for s in _SPLITS}
         self._writers: dict = {}
@@ -312,10 +312,9 @@ class Tiler:
             with rasterio.open(image_path) as src:
                 nd_src = nodata_spec(src)[1]
             if check.get("special_case"):
-                masked = apply_image_mask_to_label(
+                masked, valid_frac = apply_image_mask_to_label(
                     image_path, label_path, tmp_dir
                 )
-                _, valid_frac = image_nodata_meta(image_path)
                 return {
                     "image_path": str(image_path),
                     "label_path": str(masked),
@@ -326,8 +325,12 @@ class Tiler:
                 }
 
             logger.info("Image: %s", image_name)
-            clipped_image, clipped_label = clip_to_intersection(
-                image_path, label_path, label_type, tmp_dir
+            clipped_image, clipped_label, valid_frac = clip_to_intersection(
+                image_path,
+                label_path,
+                label_type,
+                tmp_dir,
+                label_gdf=check.get("label_gdf"),
             )
             if clipped_image is None and clipped_label is None:
                 return {
@@ -338,17 +341,18 @@ class Tiler:
             targets_paths: dict = {}
             label_gdf = None
             if label_type == "vector":
-                clipped_label, targets_paths, label_gdf = prepare_vector_labels(
-                    clipped_label,
-                    clipped_image,
-                    tmp_dir,
-                    self.attr_field,
-                    self.attr_values,
-                    erosion_classes=self.erosion_classes,
-                    gap_px=self.gap_px,
-                    max_gsd_for_erosion=self.max_gsd_for_erosion,
-                    building_class_val=self.building_class_val,
-                    road_class_val=self.road_class_val,
+                clipped_label, targets_paths, label_gdf, valid_frac = (
+                    prepare_vector_labels(
+                        clipped_label,
+                        clipped_image,
+                        tmp_dir,
+                        self.attr_field,
+                        self.attr_values,
+                        erosion_classes=self.erosion_classes,
+                        max_gsd_for_erosion=self.max_gsd_for_erosion,
+                        building_class_val=self.building_class_val,
+                        road_class_val=self.road_class_val,
+                    )
                 )
                 if clipped_label is None:
                     return {
@@ -361,7 +365,6 @@ class Tiler:
                 clipped_image, dra = self._apply_dra(
                     clipped_image, tmp_dir, image_name, collection
                 )
-            _, valid_frac = image_nodata_meta(clipped_image)
             out = {
                 "image_path": str(clipped_image),
                 "label_path": str(clipped_label),
@@ -485,10 +488,6 @@ class Tiler:
                 with tqdm(total=total, desc="Tiling patches") as pbar:
                     for y in ys:
                         for x in xs:
-                            if self.manifest.is_patch_completed(image_name, x, y):
-                                kept += 1
-                                pbar.update(1)
-                                continue
                             window = Window(
                                 col_off=x,
                                 row_off=y,
@@ -593,7 +592,6 @@ class Tiler:
                                     window,
                                     geojson_str,
                                 )
-                            self.manifest.mark_patch_completed(image_name, x, y)
                             self._patch_counts[split] += 1
                             kept += 1
                             if kept % 100 == 0:
