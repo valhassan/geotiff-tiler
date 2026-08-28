@@ -63,7 +63,7 @@ def window_valid(
             return np.any(m > 0, axis=0)
         return m > 0
     data = src.read(window=window)
-    return np.any(np.isfinite(data) & (data != 0), axis=0)
+    return np.any(np.isfinite(data), axis=0)
 
 
 def image_nodata_meta(image_path: str) -> tuple[str, float]:
@@ -450,9 +450,10 @@ def clip_raster_to_geometry(
             dst_nodata = spec_nd
             if spec_src == "fallback_zero":
                 logger.warning(
-                    "%s has no nodata; using 0 for clipped output", image_path
+                    "%s has no nodata/mask; keeping zeros, cutline mask only",
+                    image_path,
                 )
-        carry_mask = spec_src == "mask" and src_nodata is None
+        carry_mask = spec_src != "declared" and src_nodata is None
         if src_nodata is None and not carry_mask:
             src_nodata = dst_nodata
 
