@@ -40,15 +40,38 @@ def numpy_decoder(dct):
 class TilingManifest:
     """Tracks processed images, patches, and shards so tiling can resume."""
 
-    def __init__(self, output_dir: str, prefix: str):
+    def __init__(
+        self, output_dir: str, prefix: str, grid: Optional[Dict[str, Any]] = None
+    ):
         self.output_dir = Path(output_dir)
         self.prefix = prefix
         self.manifest_path = self.output_dir / prefix / f"{self.prefix}_manifest.json"
         self._reset_state()
         if self.manifest_path.exists():
             self._load_manifest()
+            if grid is not None:
+                self._assert_grid(grid)
             logger.info(f"Resumed from manifest: {self.manifest_path}")
+        if grid is not None:
+            self.dataset_info["grid"] = dict(grid)
         self._setup_signal_handlers()
+
+    def _assert_grid(self, grid: Dict[str, Any]) -> None:
+        stored = self.dataset_info.get("grid")
+        if stored is None:
+            if not self.completed_images and not self.failed_images and not self.image_metadata:
+                return
+            stored = {"version": 0}
+        if (
+            stored.get("version") == grid["version"]
+            and stored.get("patch") == grid["patch"]
+            and stored.get("stride") == grid["stride"]
+        ):
+            return
+        raise ValueError(
+            f"Refusing to resume: manifest grid {stored!r} != {grid!r} "
+            f"({self.manifest_path}). Use a new prefix or delete that output."
+        )
     
     def _setup_signal_handlers(self):
         """Set up handlers to save manifest on interrupt"""
@@ -65,7 +88,6 @@ class TilingManifest:
         self.completed_images: Set[str] = set()
         self.failed_images: Dict[str, str] = {}
         self.in_progress_image: Optional[str] = None
-        self.completed_patches: Dict[str, Set[str]] = {}
         self.shard_indices: Dict[str, Dict[str, int]] = {}
         self.shard_sizes: Dict[str, Dict[str, int]] = {}
         self.patch_counts: Dict[str, Dict[str, int]] = {}
@@ -116,20 +138,9 @@ class TilingManifest:
         """Check if an image has failed processing"""
         return image_name in self.failed_images
     
-    def is_patch_completed(self, image_name: str, x: int, y: int) -> bool:
-        """Check if a specific patch has been processed"""
-        if image_name not in self.completed_patches:
-            return False
-        return f"{x}_{y}" in self.completed_patches[image_name]
-    
     def mark_image_in_progress(self, image_name: str) -> None:
         """Mark an image as currently being processed"""
         self.in_progress_image = image_name
-        # Initialize patch tracking for this image if not exists
-        if image_name not in self.completed_patches:
-            self.completed_patches[image_name] = set()
-        
-        # Update dataset statistics
         self.dataset_statistics["image_counts"]["in_progress"] = 1
         
         # Update last_updated timestamp
@@ -172,12 +183,6 @@ class TilingManifest:
         # Save manifest after a failure
         self.save_manifest()
     
-    def mark_patch_completed(self, image_name: str, x: int, y: int) -> None:
-        """Mark a specific patch as completed"""
-        if image_name not in self.completed_patches:
-            self.completed_patches[image_name] = set()
-        self.completed_patches[image_name].add(f"{x}_{y}")
-
     def update_shard_info(self, prefix: str, split: str, index: int, size: int, count: int) -> None:
         """Update shard index/size/count and the detailed shard record."""
         if prefix not in self.shard_indices:
@@ -507,9 +512,6 @@ class TilingManifest:
                 "completed_images": list(self.completed_images),
                 "failed_images": self.failed_images,
                 "in_progress_image": self.in_progress_image,
-                "completed_patches": {
-                    img: list(patches) for img, patches in self.completed_patches.items()
-                },
                 "shard_indices": self.shard_indices,
                 "shard_sizes": self.shard_sizes,
                 "patch_counts": self.patch_counts
@@ -552,12 +554,6 @@ class TilingManifest:
             self.completed_images = set(progress.get("completed_images", []))
             self.failed_images = progress.get("failed_images", {})
             self.in_progress_image = progress.get("in_progress_image")
-            
-            # Load patch tracking data (convert lists back to sets)
-            patch_data = progress.get("completed_patches", {})
-            self.completed_patches = {
-                img: set(patches) for img, patches in patch_data.items()
-            }
             
             # Load shard tracking data
             self.shard_indices = progress.get("shard_indices", {})
