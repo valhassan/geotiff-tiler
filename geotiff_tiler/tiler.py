@@ -87,9 +87,8 @@ class Tiler:
         attr_field=None,
         attr_values=None,
         erosion_classes=None,
-        target_gap_m: float | None = None,
+        gap_px: int = 2,
         max_gsd_for_erosion: float = 1.0,
-        min_erosion_area_m2: float = 4.0,
         building_class_val: int | None = None,
         road_class_val: int | None = None,
         class_ids: dict[str, int] | None = None,
@@ -118,9 +117,8 @@ class Tiler:
         self.attr_field = attr_field
         self.attr_values = attr_values
         self.erosion_classes = erosion_classes
-        self.target_gap_m = target_gap_m
+        self.gap_px = gap_px
         self.max_gsd_for_erosion = max_gsd_for_erosion
-        self.min_erosion_area_m2 = min_erosion_area_m2
         self.building_class_val = building_class_val
         self.road_class_val = road_class_val
         self.class_ids = class_ids or {}
@@ -347,9 +345,8 @@ class Tiler:
                     self.attr_field,
                     self.attr_values,
                     erosion_classes=self.erosion_classes,
-                    target_gap_m=self.target_gap_m,
+                    gap_px=self.gap_px,
                     max_gsd_for_erosion=self.max_gsd_for_erosion,
-                    min_erosion_area_m2=self.min_erosion_area_m2,
                     building_class_val=self.building_class_val,
                     road_class_val=self.road_class_val,
                 )
