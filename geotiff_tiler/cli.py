@@ -156,7 +156,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--erosion-classes", nargs="+", type=int)
     p.add_argument("--building-class-val", type=int)
     p.add_argument("--road-class-val", type=int)
-    p.add_argument("--target-gap-m", type=float)
+    p.add_argument("--gap-px", type=int, default=2)
     p.add_argument(
         "--bands",
         nargs="+",
@@ -248,7 +248,7 @@ def main(argv: list[str] | None = None) -> int:
                 attr_field=args.attr_field,
                 attr_values=args.attr_values,
                 erosion_classes=args.erosion_classes,
-                target_gap_m=args.target_gap_m,
+                gap_px=args.gap_px,
                 building_class_val=args.building_class_val,
                 road_class_val=args.road_class_val,
                 class_ids=args.class_ids,
