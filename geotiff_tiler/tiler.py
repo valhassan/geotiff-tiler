@@ -510,11 +510,11 @@ class Tiler:
                                 split = "tst"
 
                             label_patch = src_label.read(window=window)
-                            image_patch = src_image.read(window=window)
                             if not self._keep_patch(label_patch):
                                 discarded += 1
                                 pbar.update(1)
                                 continue
+                            image_patch = src_image.read(window=window)
                             targets_patches = {
                                 k: src.read(1, window=window)
                                 for k, src in target_srcs.items()
