@@ -610,23 +610,127 @@ def apply_nodata_mask(
     return res
 
 
-def _compute_erosion_dist(
-    pixel_size: float,
-    target_gap_m: float | None,
-    max_gsd_for_erosion: float,
-) -> float:
-    """Returns per-polygon inward erosion distance in CRS units.
+_NEIGH8 = (
+    (-1, -1), (-1, 0), (-1, 1),
+    (0, -1), (0, 1),
+    (1, -1), (1, 0), (1, 1),
+)
+_BLOCK = 256
 
-    Uses a sensor-adaptive formula when target_gap_m is not specified:
-    guarantees a ≥2-pixel gap between adjacent instances, capped at 0.6m
-    per side (1.2m total) to avoid collapsing typical building footprints.
-    Returns 0.0 for coarse sensors where erosion is counterproductive.
-    """
-    if pixel_size > max_gsd_for_erosion:
-        return 0.0
-    if target_gap_m is not None:
-        return target_gap_m / 2.0
-    return min(pixel_size, 0.6)
+
+def _unlink_shp(path: Path) -> None:
+    for ext in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
+        p = path.with_suffix(ext)
+        if p.exists():
+            p.unlink()
+
+
+def _gdal_rasterize(
+    src,
+    dst,
+    attr: str,
+    *,
+    ot: str,
+    init,
+    transform,
+    width: int,
+    height: int,
+    nodata=None,
+) -> None:
+    xmin = transform.c
+    ymin = transform.f + height * transform.e
+    xmax = transform.c + width * transform.a
+    ymax = transform.f
+    cmd = [
+        "gdal_rasterize",
+        "-a",
+        attr,
+        *(["-a_nodata", str(nodata)] if nodata is not None else []),
+        "-tr",
+        str(transform.a),
+        str(-transform.e),
+        "-te",
+        str(xmin),
+        str(ymin),
+        str(xmax),
+        str(ymax),
+        "-ot",
+        ot,
+        "-of",
+        "GTiff",
+        "-init",
+        str(init),
+        "-co",
+        "TILED=YES",
+        "-co",
+        "BLOCKXSIZE=256",
+        "-co",
+        "BLOCKYSIZE=256",
+        str(src),
+        str(dst),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def _iter_windows(height: int, width: int, bs: int = _BLOCK):
+    for row in range(0, height, bs):
+        for col in range(0, width, bs):
+            yield Window(col, row, min(bs, width - col), min(bs, height - row))
+
+
+def _inst_conflict(halo: np.ndarray, h: int, w: int, gap_px: int):
+    core = halo[1 : 1 + h, 1 : 1 + w]
+    conflict = np.zeros((h, w), dtype=bool)
+    for dy, dx in _NEIGH8:
+        nb = halo[1 + dy : 1 + dy + h, 1 + dx : 1 + dx + w]
+        hit = (nb != 0) & (core != 0) & (nb != core)
+        if gap_px == 1:
+            hit &= core < nb
+        conflict |= hit
+    return core, conflict
+
+
+def _apply_contact_gap(
+    label_path,
+    inst_path,
+    n_ids: int,
+    burn_vals: set,
+    gap_px: int,
+    contact_frac: float,
+) -> None:
+    with rasterio.open(inst_path) as inst_src:
+        h, w = inst_src.height, inst_src.width
+        area = np.zeros(n_ids, dtype=np.int64)
+        contact = np.zeros(n_ids, dtype=np.int64)
+        for win in _iter_windows(h, w):
+            wh, ww = int(win.height), int(win.width)
+            halo_win = Window(win.col_off - 1, win.row_off - 1, ww + 2, wh + 2)
+            halo = inst_src.read(
+                1, window=halo_win, boundless=True, fill_value=0
+            )
+            core, conf = _inst_conflict(halo, wh, ww, gap_px)
+            area += np.bincount(core.ravel(), minlength=n_ids)
+            if conf.any():
+                contact += np.bincount(core[conf], minlength=n_ids)
+        skip = (area > 0) & (contact > contact_frac * area)
+        skip[0] = False
+        skip_ids = np.flatnonzero(skip)
+        burns = np.fromiter(burn_vals, dtype=np.uint8)
+        with rasterio.open(label_path, "r+") as lab_src:
+            for win in _iter_windows(h, w):
+                wh, ww = int(win.height), int(win.width)
+                halo_win = Window(
+                    win.col_off - 1, win.row_off - 1, ww + 2, wh + 2
+                )
+                halo = inst_src.read(
+                    1, window=halo_win, boundless=True, fill_value=0
+                )
+                core, conf = _inst_conflict(halo, wh, ww, gap_px)
+                if skip_ids.size:
+                    conf &= ~np.isin(core, skip_ids)
+                lab = lab_src.read(1, window=win)
+                lab[conf & np.isin(lab, burns)] = 0
+                lab_src.write(lab, 1, window=win)
 
 
 @log_stage(stage_name="rasterize_vector", log_memory=True)
@@ -641,23 +745,23 @@ def rasterize_vector(
     default_burn_value: int = 1,
     dtype: str = "uint8",
     erosion_classes: list | None = None,
-    target_gap_m: float = None,
+    gap_px: int = 2,
     max_gsd_for_erosion: float = 1.0,
-    min_erosion_area_m2: float = 10.0,
+    contact_frac: float = 0.5,
     valid_area: gpd.GeoDataFrame | None = None,
 ) -> str:
-    """Rasterize vector data to a raster.
-
-    Args:
-        erosion_classes: Subset of attr_values to erode (e.g. [1]). None
-            disables erosion.
-        target_gap_m: Total gap in metres between eroded instances. None
-            uses a ≥2-pixel gap, capped at 1.2 m total.
-        max_gsd_for_erosion: Skip erosion when GSD exceeds this (metres).
-        min_erosion_area_m2: Restore original geom if eroded area falls below.
-    """
+    """Rasterize vectors. Contact-split erosion_classes in pixel space."""
     temp_vector_path = Path(tmp_dir) / f"{label_name}.shp"
     rasterized_label_path = Path(tmp_dir) / f"{label_name}_rasterized.tif"
+    gdal_ot = {
+        "uint8": "Byte",
+        "uint16": "UInt16",
+        "int16": "Int16",
+        "uint32": "UInt32",
+        "int32": "Int32",
+        "float32": "Float32",
+        "float64": "Float64",
+    }.get(dtype, "Byte")
 
     try:
         if vector.empty:
@@ -666,7 +770,6 @@ def rasterize_vector(
                 geometry=[],
                 crs=vector.crs,
             )
-            burn_attribute = "burn_val"
             erosion_burn_vals: set = set()
         else:
             vector_clean = vector[
@@ -687,17 +790,17 @@ def rasterize_vector(
                 cont_vals_dict.update(
                     {str(k): v for k, v in list(cont_vals_dict.items())}
                 )
-                vector_clean["burn_val"] = vector_clean[attr_field].map(cont_vals_dict)
+                vector_clean["burn_val"] = vector_clean[attr_field].map(
+                    cont_vals_dict
+                )
                 vector_clean = vector_clean.dropna(subset=["burn_val"])
                 erosion_burn_vals = {
-                    cont_vals_dict.get(v)
-                    for v in (erosion_classes or [])
+                    cont_vals_dict.get(v) for v in (erosion_classes or [])
                 } - {None}
             else:
                 if not vector_clean.empty:
                     vector_clean["burn_val"] = default_burn_value
                 erosion_burn_vals = set()
-            burn_attribute = "burn_val"
 
         with rasterio.open(image_path) as src:
             transform = src.transform
@@ -707,40 +810,10 @@ def rasterize_vector(
         if transform == rasterio.Affine.identity():
             transform = rasterio.transform.from_origin(0, 0, 1, 1)
 
-        pixel_size = min(transform.a, -transform.e)
-        erosion_dist = _compute_erosion_dist(
-            pixel_size, target_gap_m, max_gsd_for_erosion
-        )
-        min_width_m = 1.5
-
-        if (
-            erosion_dist > 0
-            and erosion_burn_vals
-            and not vector_clean.empty
-            and "burn_val" in vector_clean.columns
-        ):
-            erode_mask = vector_clean["burn_val"].isin(erosion_burn_vals)
-            if erode_mask.any():
-                orig = vector_clean.loc[erode_mask, "geometry"]
-                too_small_to_erode = orig.area < (min_erosion_area_m2 * 3.0)
-                eroded = orig.buffer(-erosion_dist)
-                eroded_bounds = eroded.bounds
-                eroded_width = (eroded_bounds["maxx"] - eroded_bounds["minx"]).combine(
-                    eroded_bounds["maxy"] - eroded_bounds["miny"], min
-                )
-                restore = (
-                    eroded.is_empty
-                    | (eroded.area < min_erosion_area_m2)
-                    | (eroded_width < min_width_m)
-                    | too_small_to_erode
-                )
-                vector_clean.loc[erode_mask, "geometry"] = eroded.where(~restore, orig)
-
-        vector_clean = vector_clean[~vector_clean.geometry.is_empty].copy()
-        eroded_building_gdf = (
+        inst_gdf = (
             vector_clean[vector_clean["burn_val"].isin(erosion_burn_vals)].copy()
-            if not vector_clean.empty and erosion_burn_vals
-            else gpd.GeoDataFrame()
+            if erosion_burn_vals and not vector_clean.empty
+            else None
         )
 
         crs = vector_clean.crs
@@ -751,7 +824,9 @@ def rasterize_vector(
                     crs = valid_area.crs
                 elif valid_area.crs is not None and valid_area.crs != crs:
                     geom = (
-                        gpd.GeoSeries([geom], crs=valid_area.crs).to_crs(crs).iloc[0]
+                        gpd.GeoSeries([geom], crs=valid_area.crs)
+                        .to_crs(crs)
+                        .iloc[0]
                     )
                 valid_row = gpd.GeoDataFrame(
                     {"burn_val": [0]}, geometry=[geom], crs=crs
@@ -762,65 +837,65 @@ def rasterize_vector(
                     crs=crs,
                 )
         if vector_clean.empty:
-            return None, gpd.GeoDataFrame()
+            return None
         vector_clean = vector_clean.sort_values("burn_val")
         vector_clean.to_file(temp_vector_path, driver="ESRI Shapefile")
         del vector_clean
 
-        xmin = str(transform.c)
-        ymin = str(transform.f + src_height * transform.e)
-        xmax = str(transform.c + src_width * transform.a)
-        ymax = str(transform.f)
-        xres, yres = str(transform.a), str(-transform.e)
+        _gdal_rasterize(
+            temp_vector_path,
+            rasterized_label_path,
+            "burn_val",
+            ot=gdal_ot,
+            init=IGNORE_INDEX,
+            nodata=IGNORE_INDEX,
+            transform=transform,
+            width=src_width,
+            height=src_height,
+        )
 
-        mapping = {
-            "uint8": "Byte",
-            "uint16": "UInt16",
-            "int16": "Int16",
-            "uint32": "UInt32",
-            "int32": "Int32",
-            "float32": "Float32",
-            "float64": "Float64",
-        }
+        pixel_size = min(transform.a, -transform.e)
+        if (
+            inst_gdf is not None
+            and not inst_gdf.empty
+            and gap_px
+            and pixel_size <= max_gsd_for_erosion
+        ):
+            inst_shp = Path(tmp_dir) / f"{label_name}_inst.shp"
+            inst_tif = Path(tmp_dir) / f"{label_name}_inst.tif"
+            inst_gdf = inst_gdf.reset_index(drop=True)
+            inst_gdf["inst_id"] = np.arange(1, len(inst_gdf) + 1, dtype=np.int32)
+            inst_gdf[["geometry", "inst_id"]].to_file(
+                inst_shp, driver="ESRI Shapefile"
+            )
+            n_ids = len(inst_gdf) + 1
+            del inst_gdf
+            try:
+                _gdal_rasterize(
+                    inst_shp,
+                    inst_tif,
+                    "inst_id",
+                    ot="UInt32",
+                    init=0,
+                    transform=transform,
+                    width=src_width,
+                    height=src_height,
+                )
+                _apply_contact_gap(
+                    rasterized_label_path,
+                    inst_tif,
+                    n_ids,
+                    erosion_burn_vals,
+                    gap_px,
+                    contact_frac,
+                )
+            finally:
+                Path(inst_tif).unlink(missing_ok=True)
+                _unlink_shp(inst_shp)
 
-        cmd = [
-            "gdal_rasterize",
-            "-a",
-            burn_attribute,
-            "-a_nodata",
-            str(IGNORE_INDEX),
-            "-tr",
-            xres,
-            yres,
-            "-te",
-            xmin,
-            ymin,
-            xmax,
-            ymax,
-            "-ot",
-            mapping.get(dtype, "Byte"),
-            "-of",
-            "GTiff",
-            "-init",
-            str(IGNORE_INDEX),
-            "-co",
-            "TILED=YES",
-            "-co",
-            "BLOCKXSIZE=256",
-            "-co",
-            "BLOCKYSIZE=256",
-            str(temp_vector_path),
-            str(rasterized_label_path),
-        ]
-
-        subprocess.run(cmd, check=True)
-
-        return rasterized_label_path, eroded_building_gdf
+        return rasterized_label_path
     finally:
-        for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg"]:
-            shp_file = temp_vector_path.with_suffix(ext)
-            if shp_file.exists():
-                shp_file.unlink()
+        _unlink_shp(temp_vector_path)
 
 
 @log_stage(stage_name="prepare_vector_labels", log_memory=True)
@@ -831,9 +906,9 @@ def prepare_vector_labels(
     attr_field: List[str] = None,
     attr_values: list = None,
     erosion_classes: list | None = None,
-    target_gap_m: float = None,
+    gap_px: int = 2,
     max_gsd_for_erosion: float = 1.0,
-    min_erosion_area_m2: float = 5.0,
+    contact_frac: float = 0.5,
     building_class_val: int | None = None,
     road_class_val: int | None = None,
     max_gsd_for_road_targets: float = 1.0,
@@ -842,7 +917,7 @@ def prepare_vector_labels(
     nodata_mask_gdf = create_nodata_mask(image_path)
     label_gdf = apply_nodata_mask(label_path, nodata_mask_gdf)
     label_name = Path(label_path).stem
-    rasterized_label_path, eroded_building_gdf = rasterize_vector(
+    rasterized_label_path = rasterize_vector(
         label_gdf,
         image_path,
         label_name,
@@ -850,9 +925,9 @@ def prepare_vector_labels(
         attr_field,
         attr_values,
         erosion_classes=erosion_classes,
-        target_gap_m=target_gap_m,
+        gap_px=gap_px,
         max_gsd_for_erosion=max_gsd_for_erosion,
-        min_erosion_area_m2=min_erosion_area_m2,
+        contact_frac=contact_frac,
         valid_area=nodata_mask_gdf,
     )
     targets_paths = {}
@@ -863,15 +938,11 @@ def prepare_vector_labels(
     )
 
     if building_class_val is not None:
-        if not eroded_building_gdf.empty:
-            build_gdf = eroded_building_gdf
-        elif field:
-            build_gdf = label_gdf[
-                label_gdf[field].astype(str) == str(building_class_val)
-            ]
-        else:
-            build_gdf = gpd.GeoDataFrame()
-
+        build_gdf = (
+            label_gdf[label_gdf[field].astype(str) == str(building_class_val)]
+            if field
+            else gpd.GeoDataFrame()
+        )
         if not build_gdf.empty:
             targets_paths.update(
                 compute_building_targets(
@@ -880,13 +951,11 @@ def prepare_vector_labels(
             )
 
     if road_class_val is not None:
-        if field:
-            road_gdf = label_gdf[
-                label_gdf[field].astype(str) == str(road_class_val)
-            ]
-        else:
-            road_gdf = gpd.GeoDataFrame()
-
+        road_gdf = (
+            label_gdf[label_gdf[field].astype(str) == str(road_class_val)]
+            if field
+            else gpd.GeoDataFrame()
+        )
         if not road_gdf.empty:
             targets_paths.update(
                 compute_road_targets(
