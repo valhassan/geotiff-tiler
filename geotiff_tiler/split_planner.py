@@ -141,7 +141,7 @@ def analyze_image(
     patch_size: int,
     stride: int,
     cell_strides: int = 4,
-    coarse_factor: int = 4,
+    coarse_factor: int = 2,
     label_threshold: float = 0.01,
     min_valid_frac: float = 0.5,
 ) -> dict | None:
@@ -359,7 +359,7 @@ def run_planner(
     stride: int = 256,
     val_ratio: float = 0.2,
     cell_strides: int = 4,
-    coarse_factor: int = 4,
+    coarse_factor: int = 2,
     label_threshold: float = 0.01,
     min_valid_frac: float = 0.5,
 ) -> dict:
