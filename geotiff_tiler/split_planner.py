@@ -356,7 +356,7 @@ def run_planner(
     attr_fields: str | Sequence[str] | None,
     attr_values: Sequence[int] | None,
     patch_size: int = 512,
-    stride: int = 256,
+    stride: int | None = None,
     val_ratio: float = 0.2,
     cell_strides: int = 4,
     coarse_factor: int = 2,
@@ -368,6 +368,8 @@ def run_planner(
     Each item is ``{image, label, metadata}`` with ``split`` and
     ``collection`` (or ``sensor``) in metadata.
     """
+    if stride is None:
+        stride = patch_size
     require_class_ids(class_ids)
     assign_pair_ids(input_dict)
     pairs = []
