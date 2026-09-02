@@ -34,6 +34,45 @@ def grid_spec(patch_size: tuple[int, int], stride: int) -> dict:
     return {"version": GRID_VERSION, "patch": [int(h), int(w)], "stride": int(stride)}
 
 
+def assert_plan_params(
+    plan: dict,
+    patch_size: tuple[int, int],
+    stride: int,
+    label_threshold: float,
+    min_valid_frac: float,
+) -> None:
+    p = plan.get("params") or {}
+    sp = p.get("patch_size")
+    if isinstance(sp, int):
+        stored_patch = [sp, sp]
+    elif sp is not None:
+        stored_patch = [int(sp[0]), int(sp[1])]
+    else:
+        stored_patch = None
+    got = {
+        "patch_size": stored_patch,
+        "stride": p.get("stride"),
+        "label_threshold": p.get("label_threshold"),
+        "min_valid_frac": p.get("min_valid_frac"),
+    }
+    want = {
+        "patch_size": [int(patch_size[0]), int(patch_size[1])],
+        "stride": int(stride),
+        "label_threshold": float(label_threshold),
+        "min_valid_frac": float(min_valid_frac),
+    }
+    same = got["patch_size"] == want["patch_size"] and got["stride"] == want["stride"]
+    for k in ("label_threshold", "min_valid_frac"):
+        a, b = got[k], want[k]
+        same = same and a is not None and math.isclose(float(a), b, abs_tol=1e-9)
+    if same:
+        return
+    raise ValueError(
+        f"split plan params {got!r} != tiler {want!r}. "
+        "Re-run --split_planner with the same patch/stride/thresholds."
+    )
+
+
 def window_origins(length: int, patch: int, stride: int) -> list[int]:
     last = length - patch
     origs = list(range(0, last + 1, stride))
