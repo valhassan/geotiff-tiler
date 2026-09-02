@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -21,7 +22,12 @@ from rasterio.transform import from_bounds as transform_from_bounds
 from rasterio.windows import from_bounds as window_from_bounds
 
 from geotiff_tiler.lib.geo import check_label_type
-from geotiff_tiler.lib.io import load_vector_mask, require_class_ids, resolve_attr_field
+from geotiff_tiler.lib.io import (
+    load_vector_mask,
+    require_class_ids,
+    resolve_attr_field,
+    validate_image,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,16 +150,23 @@ def analyze_image(
     coarse_factor: int = 2,
     label_threshold: float = 0.01,
     min_valid_frac: float = 0.5,
+    bands_requested: Sequence[str] | None = None,
+    band_indices: Sequence[int] | None = None,
 ) -> dict | None:
     """Coarse-grid analysis of one pair over the image ∩ label intersection.
 
     Cell rectangles are stored in the image CRS so they survive clip/reproject.
     """
-    with rasterio.open(image_path) as src:
-        img_crs = src.crs
-        img_bounds = src.bounds
-        img_transform = src.transform
-        native_res = abs(img_transform.a)
+    vkw: dict = {"band_indices": band_indices}
+    if bands_requested is not None:
+        vkw["bands_requested"] = bands_requested
+    with tempfile.TemporaryDirectory() as td:
+        resolved = validate_image(image_path, tmp_dir=td, **vkw)
+        with rasterio.open(resolved) as src:
+            img_crs = src.crs
+            img_bounds = src.bounds
+            img_transform = src.transform
+            native_res = abs(img_transform.a)
 
     label_bounds, geoms = _read_label(
         label_path, img_crs, attr_fields, attr_values or []
@@ -362,6 +375,8 @@ def run_planner(
     coarse_factor: int = 2,
     label_threshold: float = 0.01,
     min_valid_frac: float = 0.5,
+    bands_requested: Sequence[str] | None = None,
+    band_indices: Sequence[int] | None = None,
 ) -> dict:
     """Plan val cells across all sensors. tst pairs are ignored.
 
@@ -419,6 +434,8 @@ def run_planner(
                 coarse_factor,
                 label_threshold,
                 min_valid_frac,
+                bands_requested,
+                band_indices,
             )
         except Exception as e:
             logger.error("%s: analysis failed: %s", name, e)
