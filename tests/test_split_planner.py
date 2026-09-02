@@ -15,6 +15,7 @@ from shapely.ops import unary_union
 
 from geotiff_tiler.split_planner import (
     _val_yield,
+    assert_plan_params,
     classify_patch,
     merge_adjacent_rects,
     run_planner,
@@ -236,11 +237,35 @@ def test_planner_e2e():
         print("no-op rerun stable")
 
 
+def test_assert_plan_params() -> None:
+    plan = {
+        "params": {
+            "patch_size": 512,
+            "stride": 256,
+            "label_threshold": 0.01,
+            "min_valid_frac": 0.5,
+        }
+    }
+    assert_plan_params(plan, (512, 512), 256, 0.01, 0.5)
+    try:
+        assert_plan_params(plan, (256, 256), 128, 0.01, 0.5)
+        raise AssertionError("expected mismatch")
+    except ValueError as e:
+        assert "split plan params" in str(e)
+    try:
+        assert_plan_params({"params": {}}, (512, 512), 256, 0.01, 0.5)
+        raise AssertionError("expected empty params fail")
+    except ValueError:
+        pass
+
+
 def main() -> int:
     test_snapped_origins_and_yield()
     print("origins/yield ok")
     test_classify_and_merge()
     print("classify/merge ok")
+    test_assert_plan_params()
+    print("plan params ok")
     test_planner_e2e()
     print("ALL TESTS PASSED")
     return 0
