@@ -240,6 +240,8 @@ def main(argv: list[str] | None = None) -> int:
             coarse_factor=args.coarse_factor,
             label_threshold=args.label_threshold,
             min_valid_frac=args.min_valid_frac,
+            bands_requested=args.bands,
+            band_indices=args.band_indices,
         )
 
     if args.tiler:
