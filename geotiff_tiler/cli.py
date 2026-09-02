@@ -148,6 +148,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--patch-size", type=int, default=512)
     p.add_argument("--stride", type=int)
     p.add_argument("--val-ratio", type=float, default=0.2)
+    p.add_argument("--coarse-factor", type=int, default=2)
     p.add_argument("--label-threshold", type=float, default=0.01)
     p.add_argument("--min-valid-frac", type=float, default=0.5)
     p.add_argument("--class-ids", type=_class_ids)
@@ -232,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
             patch_size=args.patch_size,
             stride=stride,
             val_ratio=args.val_ratio,
+            coarse_factor=args.coarse_factor,
             label_threshold=args.label_threshold,
             min_valid_frac=args.min_valid_frac,
         )
