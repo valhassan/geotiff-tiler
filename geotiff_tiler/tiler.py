@@ -39,6 +39,7 @@ from geotiff_tiler.lib.io import (
 from geotiff_tiler.lib.manifest import TilingManifest
 from geotiff_tiler.lib.viz import create_dataset_summary_visualization
 from geotiff_tiler.split_planner import (
+    assert_plan_params,
     assign_pair_ids,
     classify_patch,
     grid_spec,
@@ -129,6 +130,14 @@ class Tiler:
         if split_plan is not None and not Path(split_plan).exists():
             raise FileNotFoundError(f"split_plan not found: {split_plan}")
         self.split_plan = load_plan(split_plan) if split_plan else None
+        if self.split_plan is not None:
+            assert_plan_params(
+                self.split_plan,
+                self.patch_size,
+                self.stride,
+                self.label_threshold,
+                self.min_valid_frac,
+            )
         self.apply_dra = apply_dra
         self.dra_cals = None
         if apply_dra:
