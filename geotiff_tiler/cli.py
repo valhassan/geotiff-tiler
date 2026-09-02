@@ -146,7 +146,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=Path)
     p.add_argument("--plan", type=Path, help="split_plan.json (default: OUTPUT_DIR)")
     p.add_argument("--patch-size", type=int, default=512)
-    p.add_argument("--stride", type=int)
+    p.add_argument(
+        "--stride",
+        type=int,
+        help="default: patch-size (no overlap)",
+    )
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument("--coarse-factor", type=int, default=2)
     p.add_argument("--label-threshold", type=float, default=0.01)
@@ -194,7 +198,7 @@ def main(argv: list[str] | None = None) -> int:
     out = args.output_dir or Path(".")
     out.mkdir(parents=True, exist_ok=True)
     plan = args.plan or (out / "split_plan.json")
-    stride = args.stride if args.stride is not None else args.patch_size // 2
+    stride = args.stride if args.stride is not None else args.patch_size
 
     pairs = load_pairs(csv_paths(args.csv))
     groups = by_collection(pairs)
