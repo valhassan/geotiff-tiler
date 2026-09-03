@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Sequence
@@ -194,6 +195,11 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
 
     out = args.output_dir or Path(".")
     out.mkdir(parents=True, exist_ok=True)
