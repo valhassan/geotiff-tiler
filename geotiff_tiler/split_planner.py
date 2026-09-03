@@ -313,6 +313,7 @@ def _val_yield(px0, px1, py0, py1, width, height, patch, stride):
 
 _ANALYZE_SAVE_EVERY = 25
 _SELECT_LOG_EVERY = 500
+_TIE_CAP, _LAST_K, _BATCH = 64, 32, 16
 
 
 def _analysis_params_match(stored: dict, want: dict) -> bool:
@@ -360,20 +361,20 @@ def _analysis_from_rec(rec: dict) -> dict:
 def _spread_pick(
     near: np.ndarray,
     coords: np.ndarray,
-    images: np.ndarray,
-    sel_by_image: dict[str, np.ndarray],
+    image_ix: np.ndarray,
+    sel_by_image: dict[int, list],
 ) -> int:
-    """Max-min Chebyshev spread; first index wins ties (incl. all-inf)."""
     if len(near) == 1:
         return int(near[0])
-    scores = np.full(len(near), np.inf, dtype=np.float64)
-    near_imgs = images[near]
+    scores = np.full(len(near), np.inf)
+    near_imgs = image_ix[near]
     for img in np.unique(near_imgs):
-        prev = sel_by_image.get(str(img))
-        if prev is None:
+        prev = sel_by_image.get(int(img))
+        if not prev:
             continue
+        pts = np.asarray(prev[-_LAST_K:])
         m = near_imgs == img
-        delta = np.abs(coords[near[m], None, :] - prev[None, :, :])
+        delta = np.abs(coords[near[m], None, :] - pts[None, :, :])
         scores[m] = np.max(delta, axis=2).min(axis=1)
     return int(near[int(np.argmax(scores))])
 
@@ -383,15 +384,18 @@ def select_cells(
     target: np.ndarray,
     quotas: dict[str, float],
     val_counts0: np.ndarray,
-    spatial_eps: float = 1e-3,
+    spatial_eps: float = 1e-3,  # unused; kept for backward compat
 ) -> list[int]:
-    """Deficit-aware greedy over candidate cells. Deterministic."""
     if not candidates:
         return []
-    C = np.stack([c["counts"] for c in candidates]).astype(np.float64)
+    C = np.stack([c["counts"] for c in candidates]).astype(np.float32)
     Y = np.array([c["yield"] for c in candidates], dtype=np.float64)
-    images = np.asarray([str(c["image"]) for c in candidates], dtype=object)
     coords = np.array([[c["cx"], c["cy"]] for c in candidates], dtype=np.float64)
+    _, image_ix = np.unique(
+        np.asarray([str(c["image"]) for c in candidates], dtype=object),
+        return_inverse=True,
+    )
+    image_ix = image_ix.astype(np.int32)
     sensor_names, sensor_ix = np.unique(
         np.asarray([str(c["sensor"]) for c in candidates], dtype=object),
         return_inverse=True,
@@ -399,11 +403,11 @@ def select_cells(
     remain = np.array(
         [float(quotas.get(str(s), 0.0)) for s in sensor_names], dtype=np.float64
     )
-
+    target32 = target.astype(np.float32)
     val = val_counts0.astype(np.float64).copy()
     selected: list[int] = []
     active = np.ones(len(candidates), dtype=bool)
-    sel_by_image: dict[str, np.ndarray] = {}
+    sel_by_image: dict[int, list] = {}
     t0 = time.monotonic()
     logger.info(
         "select_cells: %d candidates, quotas=%s",
@@ -416,27 +420,32 @@ def select_cells(
         if not mask.any():
             break
         cand = np.flatnonzero(mask)
-        after = val[None, :] + C[cand]
-        dist = after / np.maximum(after.sum(axis=1, keepdims=True), 1e-9)
-        gaps = np.abs(dist - target[None, :]).sum(axis=1)
-        best = gaps.min()
-        near = cand[gaps <= best + spatial_eps]
-        pick = _spread_pick(near, coords, images, sel_by_image)
-        selected.append(pick)
-        active[pick] = False
-        val += C[pick]
-        remain[sensor_ix[pick]] -= Y[pick]
-        img = str(images[pick])
-        pt = coords[pick]
-        prev = sel_by_image.get(img)
-        sel_by_image[img] = pt[None, :] if prev is None else np.vstack((prev, pt))
-        if len(selected) == 1 or len(selected) % _SELECT_LOG_EVERY == 0:
-            logger.info(
-                "select_cells: picked=%d remaining_active=%d elapsed=%.1fs",
-                len(selected),
-                int(active.sum()),
-                time.monotonic() - t0,
-            )
+        after = val[None, :].astype(np.float32) + C[cand]
+        dist = after / np.maximum(after.sum(1, keepdims=True), 1e-9)
+        gaps = np.abs(dist - target32[None, :]).sum(1)
+        order = cand[np.argsort(gaps, kind="stable")]
+
+        taken = 0
+        for _ in range(_BATCH):
+            pool = order[active[order] & (remain[sensor_ix[order]] > 0)][:_TIE_CAP]
+            if not pool.size:
+                break
+            pick = _spread_pick(pool, coords, image_ix, sel_by_image)
+            active[pick] = False
+            val += C[pick]
+            remain[sensor_ix[pick]] -= Y[pick]
+            sel_by_image.setdefault(int(image_ix[pick]), []).append(coords[pick])
+            selected.append(int(pick))
+            taken += 1
+            if len(selected) == 1 or len(selected) % _SELECT_LOG_EVERY == 0:
+                logger.info(
+                    "select_cells: picked=%d remaining_active=%d elapsed=%.1fs",
+                    len(selected),
+                    int(active.sum()),
+                    time.monotonic() - t0,
+                )
+        if not taken:
+            break
 
     logger.info(
         "select_cells: done picks=%d elapsed=%.1fs",
