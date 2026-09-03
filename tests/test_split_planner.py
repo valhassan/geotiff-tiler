@@ -14,11 +14,16 @@ from shapely.geometry import box
 from shapely.ops import unary_union
 
 from geotiff_tiler.split_planner import (
+    _stash_analysis,
     _val_yield,
+    analyze_image,
     assert_plan_params,
+    assign_pair_ids,
     classify_patch,
     merge_adjacent_rects,
     run_planner,
+    save_plan,
+    select_cells,
     val_rects_for_image,
     window_origins,
 )
@@ -237,6 +242,139 @@ def test_planner_e2e():
         print("no-op rerun stable")
 
 
+def _ref_select_cells(candidates, target, quotas, val_counts0, spatial_eps=1e-3):
+    """Original Python spread loop — oracle for the vectorized picker."""
+    if not candidates:
+        return []
+    C = np.stack([c["counts"] for c in candidates]).astype(np.float64)
+    Y = np.array([c["yield"] for c in candidates], dtype=np.float64)
+    sensors = np.array([str(c["sensor"]) for c in candidates])
+    images = np.array([str(c["image"]) for c in candidates])
+    coords = np.array([[c["cx"], c["cy"]] for c in candidates], dtype=np.float64)
+    remaining = dict(quotas)
+    val = val_counts0.astype(np.float64).copy()
+    selected: list[int] = []
+    active = np.ones(len(candidates), dtype=bool)
+    sel_by_image: dict[str, list] = {}
+    while True:
+        under = np.array([remaining.get(str(s), 0.0) > 0 for s in sensors])
+        mask = active & under
+        if not mask.any():
+            break
+        cand = np.where(mask)[0]
+        after = val[None, :] + C[cand]
+        dist = after / np.maximum(after.sum(axis=1, keepdims=True), 1e-9)
+        gaps = np.abs(dist - target[None, :]).sum(axis=1)
+        best = gaps.min()
+        near = cand[gaps <= best + spatial_eps]
+        pick = near[0]
+        best_d = -1.0
+        for i in near:
+            prev = sel_by_image.get(str(images[i]))
+            d = (
+                np.inf
+                if not prev
+                else min(float(np.max(np.abs(coords[i] - p))) for p in prev)
+            )
+            if d > best_d:
+                best_d, pick = d, i
+        selected.append(int(pick))
+        active[pick] = False
+        val += C[pick]
+        remaining[str(sensors[pick])] -= Y[pick]
+        sel_by_image.setdefault(str(images[pick]), []).append(coords[pick])
+    return selected
+
+
+def test_select_cells_matches_ref() -> None:
+    rng = np.random.default_rng(0)
+    cands = []
+    for i in range(80):
+        cands.append(
+            {
+                "image": f"im{i % 7}",
+                "sensor": "s1" if i < 40 else "s2",
+                "cx": i % 10,
+                "cy": i // 10,
+                "counts": rng.integers(0, 40, 5).astype(np.float64),
+                "yield": 4.0,
+                "rect": [0, 0, 1, 1],
+            }
+        )
+    target = np.array([0.5, 0.2, 0.15, 0.1, 0.05])
+    quotas = {"s1": 48.0, "s2": 48.0}
+    val0 = np.zeros(5)
+    got = select_cells(cands, target, quotas, val0)
+    ref = _ref_select_cells(cands, target, quotas, val0)
+    assert got == ref
+    assert select_cells(cands, target, quotas, val0) == got
+
+
+def test_analyzed_resume() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        pairs = assign_pair_ids(
+            [
+                _make_scene(
+                    out, "wv3_a", "worldview-3", 3072, 0.31, (500000, 5000000), 1
+                ),
+                _make_scene(
+                    out, "ps2_a", "planetscope-2", 3072, 3.0, (520000, 5100000), 3
+                ),
+            ]
+        )
+        plan_file = out / "split_plan.json"
+        plan = {
+            "version": 1,
+            "created": None,
+            "updated": None,
+            "params": {
+                "patch_size": PATCH,
+                "stride": STRIDE,
+                "val_ratio": 0.2,
+                "cell_strides": 4,
+                "coarse_factor": 2,
+                "label_threshold": 0.01,
+                "min_valid_frac": 0.5,
+                "class_ids": CLASS_IDS,
+            },
+            "target_distribution": {},
+            "global": {"total_class_counts": {}, "val_class_counts": {}},
+            "sensors": {},
+            "images": {},
+        }
+        for p in pairs:
+            a = analyze_image(
+                p["image"],
+                p["label"],
+                CLASS_IDS,
+                ["class"],
+                [1, 2, 3, 4],
+                PATCH,
+                STRIDE,
+            )
+            assert a is not None
+            a["sensor"] = p["metadata"]["collection"]
+            _stash_analysis(
+                plan, p["metadata"]["pair_id"], a, p["metadata"]["collection"]
+            )
+            Path(p["image"]).unlink()
+        save_plan(plan, plan_file)
+        plan2 = run_planner(
+            pairs,
+            plan_file,
+            CLASS_IDS,
+            ["class"],
+            [1, 2, 3, 4],
+            patch_size=PATCH,
+            stride=STRIDE,
+            val_ratio=0.2,
+        )
+        for p in pairs:
+            rec = plan2["images"][p["metadata"]["pair_id"]]
+            assert rec["status"] == "assigned", rec
+
+
 def test_assert_plan_params() -> None:
     plan = {
         "params": {
@@ -266,6 +404,10 @@ def main() -> int:
     print("classify/merge ok")
     test_assert_plan_params()
     print("plan params ok")
+    test_select_cells_matches_ref()
+    print("select_cells matches ref")
+    test_analyzed_resume()
+    print("analyzed resume ok")
     test_planner_e2e()
     print("ALL TESTS PASSED")
     return 0
