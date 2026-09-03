@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import signal
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -309,6 +311,73 @@ def _val_yield(px0, px1, py0, py1, width, height, patch, stride):
     return count(px0, px1, width) * count(py0, py1, height)
 
 
+_ANALYZE_SAVE_EVERY = 25
+_SELECT_LOG_EVERY = 500
+
+
+def _analysis_params_match(stored: dict, want: dict) -> bool:
+    if not stored:
+        return False
+    for k in (
+        "patch_size",
+        "stride",
+        "cell_strides",
+        "coarse_factor",
+        "class_ids",
+    ):
+        if stored.get(k) != want.get(k):
+            return False
+    for k in ("label_threshold", "min_valid_frac"):
+        a, b = stored.get(k), want.get(k)
+        if a is None or b is None or not math.isclose(float(a), float(b), abs_tol=1e-9):
+            return False
+    return True
+
+
+def _stash_analysis(plan: dict, name: str, a: dict, sensor: str) -> None:
+    plan["images"][name] = {
+        "sensor": sensor,
+        "status": "analyzed",
+        "crs": a["crs"],
+        "cells": a["cells"],
+        "total_patches": int(a["total_patches"]),
+        "total_class_counts": a["total_class_counts"],
+        "grid": a.get("grid"),
+    }
+
+
+def _analysis_from_rec(rec: dict) -> dict:
+    return {
+        "sensor": rec["sensor"],
+        "crs": rec["crs"],
+        "cells": rec["cells"],
+        "total_patches": rec["total_patches"],
+        "total_class_counts": rec["total_class_counts"],
+        "grid": rec.get("grid"),
+    }
+
+
+def _spread_pick(
+    near: np.ndarray,
+    coords: np.ndarray,
+    images: np.ndarray,
+    sel_by_image: dict[str, np.ndarray],
+) -> int:
+    """Max-min Chebyshev spread; first index wins ties (incl. all-inf)."""
+    if len(near) == 1:
+        return int(near[0])
+    scores = np.full(len(near), np.inf, dtype=np.float64)
+    near_imgs = images[near]
+    for img in np.unique(near_imgs):
+        prev = sel_by_image.get(str(img))
+        if prev is None:
+            continue
+        m = near_imgs == img
+        delta = np.abs(coords[near[m], None, :] - prev[None, :, :])
+        scores[m] = np.max(delta, axis=2).min(axis=1)
+    return int(near[int(np.argmax(scores))])
+
+
 def select_cells(
     candidates: list[dict],
     target: np.ndarray,
@@ -321,44 +390,59 @@ def select_cells(
         return []
     C = np.stack([c["counts"] for c in candidates]).astype(np.float64)
     Y = np.array([c["yield"] for c in candidates], dtype=np.float64)
-    sensors = np.array([c["sensor"] for c in candidates])
-    images = np.array([c["image"] for c in candidates])
+    images = np.asarray([str(c["image"]) for c in candidates], dtype=object)
     coords = np.array([[c["cx"], c["cy"]] for c in candidates], dtype=np.float64)
+    sensor_names, sensor_ix = np.unique(
+        np.asarray([str(c["sensor"]) for c in candidates], dtype=object),
+        return_inverse=True,
+    )
+    remain = np.array(
+        [float(quotas.get(str(s), 0.0)) for s in sensor_names], dtype=np.float64
+    )
 
-    remaining = dict(quotas)
     val = val_counts0.astype(np.float64).copy()
     selected: list[int] = []
     active = np.ones(len(candidates), dtype=bool)
-    sel_by_image: dict[str, list[np.ndarray]] = {}
+    sel_by_image: dict[str, np.ndarray] = {}
+    t0 = time.monotonic()
+    logger.info(
+        "select_cells: %d candidates, quotas=%s",
+        len(candidates),
+        {str(s): float(quotas.get(str(s), 0.0)) for s in sensor_names},
+    )
 
     while True:
-        under = np.array([remaining.get(s, 0.0) > 0 for s in sensors])
-        mask = active & under
+        mask = active & (remain[sensor_ix] > 0)
         if not mask.any():
             break
-        cand = np.where(mask)[0]
+        cand = np.flatnonzero(mask)
         after = val[None, :] + C[cand]
         dist = after / np.maximum(after.sum(axis=1, keepdims=True), 1e-9)
         gaps = np.abs(dist - target[None, :]).sum(axis=1)
         best = gaps.min()
         near = cand[gaps <= best + spatial_eps]
-        pick = near[0]
-        best_d = -1.0
-        for i in near:
-            prev = sel_by_image.get(images[i])
-            d = (
-                math.inf
-                if not prev
-                else min(float(np.max(np.abs(coords[i] - p))) for p in prev)
-            )
-            if d > best_d:
-                best_d, pick = d, i
-        selected.append(int(pick))
+        pick = _spread_pick(near, coords, images, sel_by_image)
+        selected.append(pick)
         active[pick] = False
         val += C[pick]
-        remaining[sensors[pick]] -= Y[pick]
-        sel_by_image.setdefault(images[pick], []).append(coords[pick])
+        remain[sensor_ix[pick]] -= Y[pick]
+        img = str(images[pick])
+        pt = coords[pick]
+        prev = sel_by_image.get(img)
+        sel_by_image[img] = pt[None, :] if prev is None else np.vstack((prev, pt))
+        if len(selected) == 1 or len(selected) % _SELECT_LOG_EVERY == 0:
+            logger.info(
+                "select_cells: picked=%d remaining_active=%d elapsed=%.1fs",
+                len(selected),
+                int(active.sum()),
+                time.monotonic() - t0,
+            )
 
+    logger.info(
+        "select_cells: done picks=%d elapsed=%.1fs",
+        len(selected),
+        time.monotonic() - t0,
+    )
     return selected
 
 
@@ -395,7 +479,7 @@ def run_planner(
             pairs.append(p)
     logger.info("Planning split for %d trn images", len(pairs))
     plan = load_plan(plan_file)
-    plan["params"] = {
+    want_params = {
         "patch_size": patch_size,
         "stride": stride,
         "val_ratio": val_ratio,
@@ -405,152 +489,212 @@ def run_planner(
         "min_valid_frac": min_valid_frac,
         "class_ids": class_ids,
     }
+    reuse_ok = _analysis_params_match(plan.get("params") or {}, want_params)
+    if plan.get("params") and not reuse_ok:
+        logger.warning("plan params changed; re-analyzing unassigned images")
+    plan["params"] = want_params
     n_classes = max(class_ids.values()) + 1
     names = {v: k for k, v in class_ids.items()}
 
     analyses: dict[str, dict] = {}
-    for p in pairs:
-        name = p["metadata"]["pair_id"]
-        meta = p.get("metadata") or {}
-        sensor = meta.get("collection") or meta.get("sensor")
-        if not sensor:
-            raise ValueError(
-                f"{p['image']}: metadata needs 'collection' or 'sensor'"
-            )
-        sensor = str(sensor)
-        rec = plan["images"].get(name)
-        if rec and rec.get("status") == "assigned":
-            continue
-        try:
-            a = analyze_image(
-                p["image"],
-                p["label"],
-                class_ids,
-                attr_fields,
-                attr_values,
-                patch_size,
-                stride,
-                cell_strides,
-                coarse_factor,
-                label_threshold,
-                min_valid_frac,
-                bands_requested,
-                band_indices,
-            )
-        except Exception as e:
-            logger.error("%s: analysis failed: %s", name, e)
-            plan["images"][name] = {
-                "sensor": sensor,
-                "status": "error",
-                "reason": str(e),
-            }
-            continue
-        if a is None:
-            plan["images"][name] = {"sensor": sensor, "status": "skipped"}
-            continue
-        a["sensor"] = sensor
-        analyses[name] = a
+    n_reused = 0
+    dirty = 0
+    stop = False
 
-    if not analyses:
-        logger.info("No new images to assign.")
-        save_plan(plan, plan_file)
-        return plan
+    def _handle(signum, _frame):
+        nonlocal stop
+        stop = True
+        logger.warning("signal %s: will checkpoint and stop", signum)
 
-    total = np.zeros(n_classes)
-    for rec in plan["images"].values():
-        if rec.get("status") == "assigned":
-            total += np.array(rec["total_class_counts"], dtype=np.float64)
-    for a in analyses.values():
-        total += np.array(a["total_class_counts"], dtype=np.float64)
-    target = total / max(total.sum(), 1e-9)
-
-    sensor_tot: dict[str, float] = {}
-    sensor_val: dict[str, float] = {}
-    for rec in plan["images"].values():
-        if rec.get("status") == "assigned":
-            s = rec["sensor"]
-            sensor_tot[s] = sensor_tot.get(s, 0) + rec["total_patches"]
-            sensor_val[s] = sensor_val.get(s, 0) + rec["est_val_patches"]
-    for a in analyses.values():
-        s = a["sensor"]
-        sensor_tot[s] = sensor_tot.get(s, 0) + a["total_patches"]
-    quotas = {
-        s: max(0.0, val_ratio * t - sensor_val.get(s, 0.0))
-        for s, t in sensor_tot.items()
-    }
-
-    val0 = np.zeros(n_classes)
-    for rec in plan["images"].values():
-        if rec.get("status") == "assigned":
-            val0 += np.array(rec["val_class_counts"], dtype=np.float64)
-
-    candidates = []
-    for name, a in analyses.items():
-        for c in a["cells"]:
-            candidates.append(
-                {
-                    "image": name,
-                    "sensor": a["sensor"],
-                    "cx": c["cx"],
-                    "cy": c["cy"],
-                    "counts": np.array(c["counts"], dtype=np.float64),
-                    "yield": c["yield"],
-                    "rect": c["rect"],
+    prev_term = signal.getsignal(signal.SIGTERM)
+    prev_int = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGTERM, _handle)
+    signal.signal(signal.SIGINT, _handle)
+    try:
+        for i, p in enumerate(pairs):
+            if stop:
+                break
+            name = p["metadata"]["pair_id"]
+            meta = p.get("metadata") or {}
+            sensor = meta.get("collection") or meta.get("sensor")
+            if not sensor:
+                raise ValueError(
+                    f"{p['image']}: metadata needs 'collection' or 'sensor'"
+                )
+            sensor = str(sensor)
+            rec = plan["images"].get(name)
+            if rec and rec.get("status") == "assigned":
+                continue
+            if (
+                reuse_ok
+                and rec
+                and rec.get("status") == "analyzed"
+                and rec.get("cells") is not None
+            ):
+                analyses[name] = _analysis_from_rec(rec)
+                n_reused += 1
+                continue
+            try:
+                a = analyze_image(
+                    p["image"],
+                    p["label"],
+                    class_ids,
+                    attr_fields,
+                    attr_values,
+                    patch_size,
+                    stride,
+                    cell_strides,
+                    coarse_factor,
+                    label_threshold,
+                    min_valid_frac,
+                    bands_requested,
+                    band_indices,
+                )
+            except Exception as e:
+                logger.error("%s: analysis failed: %s", name, e)
+                plan["images"][name] = {
+                    "sensor": sensor,
+                    "status": "error",
+                    "reason": str(e),
                 }
+                dirty += 1
+                continue
+            if a is None:
+                plan["images"][name] = {"sensor": sensor, "status": "skipped"}
+                dirty += 1
+                continue
+            a["sensor"] = sensor
+            analyses[name] = a
+            _stash_analysis(plan, name, a, sensor)
+            dirty += 1
+            logger.info(
+                "%s: analyzed cells=%d patches=%d (%d/%d)",
+                name,
+                len(a["cells"]),
+                a["total_patches"],
+                i + 1,
+                len(pairs),
             )
-    chosen = select_cells(candidates, target, quotas, val0)
-    chosen_by_image: dict[str, list[dict]] = {}
-    for i in chosen:
-        chosen_by_image.setdefault(candidates[i]["image"], []).append(candidates[i])
+            if dirty % _ANALYZE_SAVE_EVERY == 0:
+                save_plan(plan, plan_file)
+                logger.info("checkpoint %d images scanned", i + 1)
 
-    for name, a in analyses.items():
-        picked = chosen_by_image.get(name, [])
-        vc = np.zeros(n_classes)
-        for c in picked:
-            vc += c["counts"]
-        plan["images"][name] = {
-            "sensor": a["sensor"],
-            "crs": a["crs"],
-            "status": "assigned",
-            "val_cells": merge_adjacent_rects([c["rect"] for c in picked]),
-            "est_val_patches": int(sum(c["yield"] for c in picked)),
-            "total_patches": int(a["total_patches"]),
-            "total_class_counts": a["total_class_counts"],
-            "val_class_counts": vc.tolist(),
-            "assigned_at": _now(),
+        save_plan(plan, plan_file)
+        logger.info(
+            "analysis checkpoint: assign=%d reused=%d",
+            len(analyses),
+            n_reused,
+        )
+        if stop:
+            logger.warning("stopped before select_cells; rerun to assign")
+            return plan
+
+        if not analyses:
+            logger.info("No new images to assign.")
+            return plan
+
+        total = np.zeros(n_classes)
+        for rec in plan["images"].values():
+            if rec.get("status") == "assigned":
+                total += np.array(rec["total_class_counts"], dtype=np.float64)
+        for a in analyses.values():
+            total += np.array(a["total_class_counts"], dtype=np.float64)
+        target = total / max(total.sum(), 1e-9)
+
+        sensor_tot: dict[str, float] = {}
+        sensor_val: dict[str, float] = {}
+        for rec in plan["images"].values():
+            if rec.get("status") == "assigned":
+                s = rec["sensor"]
+                sensor_tot[s] = sensor_tot.get(s, 0) + rec["total_patches"]
+                sensor_val[s] = sensor_val.get(s, 0) + rec["est_val_patches"]
+        for a in analyses.values():
+            s = a["sensor"]
+            sensor_tot[s] = sensor_tot.get(s, 0) + a["total_patches"]
+        quotas = {
+            s: max(0.0, val_ratio * t - sensor_val.get(s, 0.0))
+            for s, t in sensor_tot.items()
         }
 
-    total_cc = np.zeros(n_classes)
-    val_cc = np.zeros(n_classes)
-    plan["sensors"] = {}
-    for rec in plan["images"].values():
-        if rec.get("status") != "assigned":
-            continue
-        s = rec["sensor"]
-        d = plan["sensors"].setdefault(
-            s, {"total_patches": 0, "est_val_patches": 0}
-        )
-        d["total_patches"] += rec["total_patches"]
-        d["est_val_patches"] += rec["est_val_patches"]
-        total_cc += np.array(rec["total_class_counts"])
-        val_cc += np.array(rec["val_class_counts"])
-    plan["target_distribution"] = {
-        names[i]: float(v)
-        for i, v in enumerate(total_cc / max(total_cc.sum(), 1e-9))
-    }
-    plan["global"] = {
-        "total_class_counts": {
-            names[i]: float(v) for i, v in enumerate(total_cc)
-        },
-        "val_class_counts": {names[i]: float(v) for i, v in enumerate(val_cc)},
-        "val_distribution": {
+        val0 = np.zeros(n_classes)
+        for rec in plan["images"].values():
+            if rec.get("status") == "assigned":
+                val0 += np.array(rec["val_class_counts"], dtype=np.float64)
+
+        candidates = []
+        for name, a in analyses.items():
+            for c in a["cells"]:
+                candidates.append(
+                    {
+                        "image": name,
+                        "sensor": a["sensor"],
+                        "cx": c["cx"],
+                        "cy": c["cy"],
+                        "counts": np.array(c["counts"], dtype=np.float64),
+                        "yield": c["yield"],
+                        "rect": c["rect"],
+                    }
+                )
+        chosen = select_cells(candidates, target, quotas, val0)
+        chosen_by_image: dict[str, list[dict]] = {}
+        for i in chosen:
+            chosen_by_image.setdefault(candidates[i]["image"], []).append(
+                candidates[i]
+            )
+
+        for name, a in analyses.items():
+            picked = chosen_by_image.get(name, [])
+            vc = np.zeros(n_classes)
+            for c in picked:
+                vc += c["counts"]
+            plan["images"][name] = {
+                "sensor": a["sensor"],
+                "crs": a["crs"],
+                "status": "assigned",
+                "val_cells": merge_adjacent_rects([c["rect"] for c in picked]),
+                "est_val_patches": int(sum(c["yield"] for c in picked)),
+                "total_patches": int(a["total_patches"]),
+                "total_class_counts": a["total_class_counts"],
+                "val_class_counts": vc.tolist(),
+                "assigned_at": _now(),
+            }
+
+        total_cc = np.zeros(n_classes)
+        val_cc = np.zeros(n_classes)
+        plan["sensors"] = {}
+        for rec in plan["images"].values():
+            if rec.get("status") != "assigned":
+                continue
+            s = rec["sensor"]
+            d = plan["sensors"].setdefault(
+                s, {"total_patches": 0, "est_val_patches": 0}
+            )
+            d["total_patches"] += rec["total_patches"]
+            d["est_val_patches"] += rec["est_val_patches"]
+            total_cc += np.array(rec["total_class_counts"])
+            val_cc += np.array(rec["val_class_counts"])
+        plan["target_distribution"] = {
             names[i]: float(v)
-            for i, v in enumerate(val_cc / max(val_cc.sum(), 1e-9))
-        },
-    }
-    save_plan(plan, plan_file)
-    _log_summary(plan)
-    return plan
+            for i, v in enumerate(total_cc / max(total_cc.sum(), 1e-9))
+        }
+        plan["global"] = {
+            "total_class_counts": {
+                names[i]: float(v) for i, v in enumerate(total_cc)
+            },
+            "val_class_counts": {
+                names[i]: float(v) for i, v in enumerate(val_cc)
+            },
+            "val_distribution": {
+                names[i]: float(v)
+                for i, v in enumerate(val_cc / max(val_cc.sum(), 1e-9))
+            },
+        }
+        save_plan(plan, plan_file)
+        _log_summary(plan)
+        return plan
+    finally:
+        signal.signal(signal.SIGTERM, prev_term)
+        signal.signal(signal.SIGINT, prev_int)
 
 
 def _log_summary(plan: dict) -> None:
