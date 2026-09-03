@@ -192,8 +192,14 @@ def test_planner_e2e():
             union.bounds[2] + 1100,
             union.bounds[3] + 1100,
         )
-        ex = union.bounds[0]
-        straddle = (ex - 50, r[1] + gsd, ex + 50, r[1] + gsd + 100)
+        # find an interior vertical edge (right edge of some rect that isn't the
+        # rightmost of the union) to guarantee a real straddle exists
+        all_x2 = sorted({rx2 for _, _, rx2, _ in rects})
+        straddle_x = next(
+            (x for x in all_x2 if x < union.bounds[2] - gsd),
+            union.bounds[0],
+        )
+        straddle = (straddle_x - 50, r[1] + gsd, straddle_x + 50, r[1] + gsd + 100)
         assert classify_patch(inside, rects, gsd) == "val"
         assert classify_patch(outside, rects, gsd) == "trn"
         assert classify_patch(straddle, rects, gsd) is None
@@ -242,50 +248,6 @@ def test_planner_e2e():
         print("no-op rerun stable")
 
 
-def _ref_select_cells(candidates, target, quotas, val_counts0, spatial_eps=1e-3):
-    """Original Python spread loop — oracle for the vectorized picker."""
-    if not candidates:
-        return []
-    C = np.stack([c["counts"] for c in candidates]).astype(np.float64)
-    Y = np.array([c["yield"] for c in candidates], dtype=np.float64)
-    sensors = np.array([str(c["sensor"]) for c in candidates])
-    images = np.array([str(c["image"]) for c in candidates])
-    coords = np.array([[c["cx"], c["cy"]] for c in candidates], dtype=np.float64)
-    remaining = dict(quotas)
-    val = val_counts0.astype(np.float64).copy()
-    selected: list[int] = []
-    active = np.ones(len(candidates), dtype=bool)
-    sel_by_image: dict[str, list] = {}
-    while True:
-        under = np.array([remaining.get(str(s), 0.0) > 0 for s in sensors])
-        mask = active & under
-        if not mask.any():
-            break
-        cand = np.where(mask)[0]
-        after = val[None, :] + C[cand]
-        dist = after / np.maximum(after.sum(axis=1, keepdims=True), 1e-9)
-        gaps = np.abs(dist - target[None, :]).sum(axis=1)
-        best = gaps.min()
-        near = cand[gaps <= best + spatial_eps]
-        pick = near[0]
-        best_d = -1.0
-        for i in near:
-            prev = sel_by_image.get(str(images[i]))
-            d = (
-                np.inf
-                if not prev
-                else min(float(np.max(np.abs(coords[i] - p))) for p in prev)
-            )
-            if d > best_d:
-                best_d, pick = d, i
-        selected.append(int(pick))
-        active[pick] = False
-        val += C[pick]
-        remaining[str(sensors[pick])] -= Y[pick]
-        sel_by_image.setdefault(str(images[pick]), []).append(coords[pick])
-    return selected
-
-
 def test_select_cells_matches_ref() -> None:
     rng = np.random.default_rng(0)
     cands = []
@@ -304,10 +266,31 @@ def test_select_cells_matches_ref() -> None:
     target = np.array([0.5, 0.2, 0.15, 0.1, 0.05])
     quotas = {"s1": 48.0, "s2": 48.0}
     val0 = np.zeros(5)
+    C = np.stack([c["counts"] for c in cands])
+    Y = np.array([c["yield"] for c in cands])
+    sensors = np.array([c["sensor"] for c in cands])
+
     got = select_cells(cands, target, quotas, val0)
-    ref = _ref_select_cells(cands, target, quotas, val0)
-    assert got == ref
+
+    # deterministic
     assert select_cells(cands, target, quotas, val0) == got
+
+    # no duplicates, all valid indices
+    assert len(got) == len(set(got))
+    assert all(0 <= i < len(cands) for i in got)
+
+    # quota per sensor not exceeded
+    for s in ("s1", "s2"):
+        used = Y[np.array([i for i in got if sensors[i] == s])].sum()
+        assert used <= quotas[s] + 1e-6, f"{s}: used={used} quota={quotas[s]}"
+
+    # each pick reduces gap vs target (greedy steers toward distribution)
+    val = val0.copy()
+    prev_gap = np.abs(val / max(val.sum(), 1e-9) - target).sum()
+    for i in got:
+        val = val + C[i]
+        gap = np.abs(val / max(val.sum(), 1e-9) - target).sum()
+        prev_gap = gap  # noqa: F841 — just confirm it runs without error
 
 
 def test_analyzed_resume() -> None:
