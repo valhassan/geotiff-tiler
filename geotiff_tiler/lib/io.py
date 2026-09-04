@@ -950,6 +950,9 @@ def prepare_vector_labels(
         contact_frac=contact_frac,
         valid_area=nodata_mask_gdf,
     )
+    del nodata_mask_gdf
+    gc.collect()
+
     targets_paths = {}
     field = (
         resolve_attr_field(label_gdf.columns, attr_field)
@@ -969,6 +972,7 @@ def prepare_vector_labels(
                     build_gdf, image_path, tmp_dir, label_name
                 )
             )
+        del build_gdf
 
     if road_class_val is not None:
         road_gdf = (
@@ -982,6 +986,7 @@ def prepare_vector_labels(
                     road_gdf, image_path, tmp_dir, label_name
                 )
             )
+        del road_gdf
 
-    del nodata_mask_gdf
+    gc.collect()
     return rasterized_label_path, targets_paths, label_gdf, valid_frac
