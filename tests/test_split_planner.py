@@ -21,6 +21,7 @@ from geotiff_tiler.split_planner import (
     assign_pair_ids,
     classify_patch,
     merge_adjacent_rects,
+    pair_id,
     run_planner,
     save_plan,
     select_cells,
@@ -358,6 +359,47 @@ def test_analyzed_resume() -> None:
             assert rec["status"] == "assigned", rec
 
 
+def test_pair_id_stable_plan_lookup() -> None:
+    a = {
+        "image": "/x/img.tif",
+        "label": "/l/QC188.gpkg",
+        "metadata": {"id": "Granby", "collection": "geoeye-1"},
+    }
+    b = {
+        "image": "/x/img.tif",
+        "label": "/l/QC189.gpkg",
+        "metadata": {"id": "Granby", "collection": "geoeye-1"},
+    }
+    ps = {
+        "image": "/x/ps.tif",
+        "label": "/l/AB26.gpkg",
+        "metadata": {"id": "AB26_NRGB_8bit", "collection": "planetscope-2"},
+    }
+    full = assign_pair_ids(
+        [{**x, "metadata": dict(x["metadata"])} for x in (a, b, ps)]
+    )
+    sub = assign_pair_ids(
+        [{**ps, "metadata": dict(ps["metadata"])}]
+    )
+    assert full[2]["metadata"]["pair_id"] == sub[0]["metadata"]["pair_id"]
+    assert full[0]["metadata"]["pair_id"] != full[1]["metadata"]["pair_id"]
+    assert pair_id(a) == full[0]["metadata"]["pair_id"]
+    assert pair_id(a).startswith("Granby__QC188__")
+
+    pid = full[2]["metadata"]["pair_id"]
+    plan = {
+        "images": {
+            pid: {
+                "status": "assigned",
+                "crs": "EPSG:32611",
+                "val_cells": [[1.0, 2.0, 3.0, 4.0]],
+            }
+        }
+    }
+    assert val_rects_for_image(plan, pid, None) == [[1.0, 2.0, 3.0, 4.0]]
+    assert val_rects_for_image(plan, full[0]["metadata"]["pair_id"], None) is None
+
+
 def test_assert_plan_params() -> None:
     plan = {
         "params": {
@@ -385,6 +427,8 @@ def main() -> int:
     print("origins/yield ok")
     test_classify_and_merge()
     print("classify/merge ok")
+    test_pair_id_stable_plan_lookup()
+    print("pair_id / plan lookup ok")
     test_assert_plan_params()
     print("plan params ok")
     test_select_cells_matches_ref()
