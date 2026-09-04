@@ -927,7 +927,6 @@ def prepare_vector_labels(
     contact_frac: float = 0.5,
     building_class_val: int | None = None,
     road_class_val: int | None = None,
-    max_gsd_for_road_targets: float = 1.0,
 ):
     nodata_mask_gdf, valid_frac = create_nodata_mask(image_path)
     if nodata_mask_gdf is not None and not vector.empty:
@@ -980,11 +979,7 @@ def prepare_vector_labels(
         if not road_gdf.empty:
             targets_paths.update(
                 compute_road_targets(
-                    road_gdf,
-                    image_path,
-                    tmp_dir,
-                    label_name,
-                    max_gsd_for_targets=max_gsd_for_road_targets,
+                    road_gdf, image_path, tmp_dir, label_name
                 )
             )
 
