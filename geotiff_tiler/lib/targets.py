@@ -167,11 +167,11 @@ def compute_building_targets(
     del vertex_map
 
     t = time.time()
-    sdf_map = _compute_sdf(valid_geoms, h, w, transform)
+    sdf_path = Path(tmp_dir) / f"{label_name}_buildings_sdf.tif"
+    _write_sdf(valid_geoms, h, w, crs, transform, sdf_path)
+    paths["sdf"] = str(sdf_path)
     logger.info("SDF:      %.1fs", time.time() - t)
-    _write_target(
-        paths, tmp_dir, label_name, "sdf", sdf_map, "float32", h, w, crs, transform
-    )
+    logger.info("[building_targets] wrote sdf → %s", sdf_path)
     return paths
 
 
@@ -201,6 +201,7 @@ def _write_target(
         tiled=True,
         blockxsize=256,
         blockysize=256,
+        BIGTIFF="IF_SAFER",
     ) as dst:
         dst.write(arr, 1)
     paths[key] = str(out_path)
@@ -372,38 +373,66 @@ def _compute_vertex_heatmap(
     return np.clip(heatmap, 0, 1)
 
 
-def _compute_sdf(
+def _halo_windows(h: int, w: int, halo: int, tile: int = 1024):
+    for r0 in range(0, h, tile):
+        r1 = min(h, r0 + tile)
+        for c0 in range(0, w, tile):
+            c1 = min(w, c0 + tile)
+            ra, ca = max(0, r0 - halo), max(0, c0 - halo)
+            yield r0, r1, c0, c1, ra, ca, min(h, r1 + halo), min(w, c1 + halo)
+
+
+def _write_sdf(
     geoms,
     h: int,
     w: int,
+    crs,
     transform: Affine,
-) -> np.ndarray:
-    """
-    Per-pixel signed distance to the nearest building polygon boundary.
-    Positive  = inside polygon  (distance to boundary from interior)
-    Negative  = outside polygon (distance to nearest polygon)
-    Zero      = exactly on boundary.
-    Scaled by metres / _SDF_CLIP_M and clipped to [-1, 1].
-    Stored as float32.
-    """
-    if not geoms:
-        return np.zeros((h, w), dtype=np.float32)
-
-    all_mask = rasterize(
-        [(g, 1) for g in geoms],
-        out_shape=(h, w),
+    out_path: Path,
+) -> None:
+    """Union-mask signed EDT, tiled. + inside / − outside, clip _SDF_CLIP_M."""
+    pixel_size = abs(transform.a)
+    mask = (
+        np.zeros((h, w), dtype=np.uint8)
+        if not geoms
+        else rasterize(
+            [(g, 1) for g in geoms],
+            out_shape=(h, w),
+            transform=transform,
+            fill=0,
+            dtype=np.uint8,
+        )
+    )
+    halo = int(np.ceil(_SDF_CLIP_M / pixel_size)) + 1
+    with rasterio.open(
+        out_path,
+        "w",
+        driver="GTiff",
+        height=h,
+        width=w,
+        count=1,
+        dtype="float32",
+        crs=crs,
         transform=transform,
-        fill=0,
-        dtype=np.uint8,
-    ).astype(bool)
-
-    sdf = distance_transform_edt(all_mask).astype(np.float32)
-    exterior = distance_transform_edt(~all_mask).astype(np.float32)
-    np.copyto(sdf, -exterior, where=~all_mask)
-    del exterior, all_mask
-    sdf *= abs(transform.a)
-    np.clip(sdf / _SDF_CLIP_M, -1.0, 1.0, out=sdf)
-    return sdf
+        tiled=True,
+        blockxsize=256,
+        blockysize=256,
+        BIGTIFF="IF_SAFER",
+    ) as dst:
+        for r0, r1, c0, c1, ra, ca, rb, cb in _halo_windows(h, w, halo):
+            win = Window(c0, r0, c1 - c0, r1 - r0)
+            th, tw = r1 - r0, c1 - c0
+            block = mask[ra:rb, ca:cb]
+            if not block.any():
+                dst.write(np.full((th, tw), -1.0, np.float32), 1, window=win)
+                continue
+            sdf = np.float32(
+                distance_transform_edt(block)
+                - distance_transform_edt(block == 0)
+            )
+            crop = sdf[r0 - ra : r1 - ra, c0 - ca : c1 - ca]
+            np.clip(crop * pixel_size / _SDF_CLIP_M, -1.0, 1.0, out=crop)
+            dst.write(crop, 1, window=win)
 
 
 def compute_road_targets(
@@ -477,7 +506,6 @@ def _write_road_centerline_weight(
         dtype=np.uint8,
     )
     halo = int(np.ceil(_ROAD_REF_M / pixel_size)) + 1
-    tile = 512
     with rasterio.open(
         out_path,
         "w",
@@ -491,20 +519,16 @@ def _write_road_centerline_weight(
         tiled=True,
         blockxsize=256,
         blockysize=256,
+        BIGTIFF="IF_SAFER",
     ) as dst:
-        for r0 in range(0, h, tile):
-            r1 = min(h, r0 + tile)
-            for c0 in range(0, w, tile):
-                c1 = min(w, c0 + tile)
-                if not mask[r0:r1, c0:c1].any():
-                    continue
-                ra, ca = max(0, r0 - halo), max(0, c0 - halo)
-                rb, cb = min(h, r1 + halo), min(w, c1 + halo)
-                edt = np.float32(distance_transform_edt(mask[ra:rb, ca:cb]))
-                crop = edt[r0 - ra : r1 - ra, c0 - ca : c1 - ca]
-                np.clip(crop * pixel_size / _ROAD_REF_M, 0, 1, out=crop)
-                dst.write(
-                    (crop * 255).astype(np.uint8),
-                    1,
-                    window=Window(c0, r0, c1 - c0, r1 - r0),
-                )
+        for r0, r1, c0, c1, ra, ca, rb, cb in _halo_windows(h, w, halo):
+            if not mask[r0:r1, c0:c1].any():
+                continue
+            edt = np.float32(distance_transform_edt(mask[ra:rb, ca:cb]))
+            crop = edt[r0 - ra : r1 - ra, c0 - ca : c1 - ca]
+            np.clip(crop * pixel_size / _ROAD_REF_M, 0, 1, out=crop)
+            dst.write(
+                (crop * 255).astype(np.uint8),
+                1,
+                window=Window(c0, r0, c1 - c0, r1 - r0),
+            )
