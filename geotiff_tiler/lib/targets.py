@@ -47,11 +47,12 @@ def _rasterize_geom(
         dtype=np.uint8,
     )
 
+
 def _explode_to_polygons(geoms: list) -> list:
     """
     Flatten a mixed list of Polygon / MultiPolygon geometries to individual
     Polygons. Other geometry types are silently dropped.
- 
+
     Must be called before any code that accesses geom.exterior, since
     MultiPolygon does not have that attribute.
     """
@@ -64,6 +65,7 @@ def _explode_to_polygons(geoms: list) -> list:
             out.extend(p for p in geom.geoms if not p.is_empty)
     return out
 
+
 def compute_building_targets(
     building_gdf: gpd.GeoDataFrame,
     image_path: str,
@@ -72,18 +74,21 @@ def compute_building_targets(
     sigma: float = 3.0,
     max_dist_meters: float = 10.0,
     vertex_sigma: float = 1.5,
+    max_gsd_for_targets: float = 1.0,
 ) -> dict[str, str]:
     """
     Compute all four building supervision targets from polygon geometry.
 
     Args:
-        building_gdf:       GeoDataFrame filtered to building polygons only.
-        image_path:         Path to the source image (for transform/shape).
-        tmp_dir:            Temp directory for output tifs.
-        label_name:         Stem used for output filenames.
-        sigma:              EDT decay sigma for dual-distance weight map (metres).
-        max_dist_meters:    Maximum inter-instance distance to consider (metres).
-        vertex_sigma:       Gaussian sigma for vertex heatmap (pixels).
+        building_gdf:         GeoDataFrame filtered to building polygons only.
+        image_path:           Path to the source image (for transform/shape).
+        tmp_dir:              Temp directory for output tifs.
+        label_name:           Stem used for output filenames.
+        sigma:                EDT decay sigma for dual-distance weight map (metres).
+        max_dist_meters:      Maximum inter-instance distance to consider (metres).
+        vertex_sigma:         Gaussian sigma for vertex heatmap (pixels).
+        max_gsd_for_targets:  GSD threshold in metres above which targets are
+                              skipped. Default matches the erosion threshold.
 
     Returns:
         Dict mapping target name → tif path. Keys:
@@ -91,6 +96,7 @@ def compute_building_targets(
             'boundary'  vector boundary map                uint8
             'vertices'  vertex heatmap                     uint8
             'sdf'       signed distance field              float32
+    Returns {} when GSD is too coarse.
     """
     with rasterio.open(image_path) as src:
         transform = src.transform
@@ -98,11 +104,21 @@ def compute_building_targets(
         h, w = src.height, src.width
 
     pixel_size = abs(transform.a)
+    if pixel_size > max_gsd_for_targets:
+        logger.info(
+            "[building_targets] skipping — GSD %.2fm > threshold %.2fm",
+            pixel_size,
+            max_gsd_for_targets,
+        )
+        return {}
+
     max_dist_px = max_dist_meters / pixel_size
 
-    valid_geoms = _explode_to_polygons(building_gdf[
-        ~building_gdf.geometry.is_empty & building_gdf.geometry.notnull()
-    ].geometry.tolist())
+    valid_geoms = _explode_to_polygons(
+        building_gdf[
+            ~building_gdf.geometry.is_empty & building_gdf.geometry.notnull()
+        ].geometry.tolist()
+    )
 
     t = time.time()
     edt_map = _compute_dual_distance_edt(
@@ -247,7 +263,10 @@ def _compute_dual_distance_edt(
 
 
 def _compute_vector_boundary(
-    geoms, h: int, w: int, transform: Affine,
+    geoms,
+    h: int,
+    w: int,
+    transform: Affine,
 ) -> np.ndarray:
     """Compute the vector boundary map.
     Args:
@@ -276,8 +295,8 @@ def _compute_vector_boundary(
         if not all_xs:
             continue
 
-        xs = np.concatenate(all_xs)   # (M,)
-        ys = np.concatenate(all_ys)   # (M,)
+        xs = np.concatenate(all_xs)  # (M,)
+        ys = np.concatenate(all_ys)  # (M,)
 
         # Clip sample centres to valid range
         cjs = np.clip(xs.astype(int), r, w - r - 1)
@@ -285,15 +304,15 @@ def _compute_vector_boundary(
 
         # Neighbourhood offsets
         off = np.arange(-r, r + 1)
-        di, dj = np.meshgrid(off, off, indexing='ij')  # (5,5)
-        di = di.ravel()   # (25,)
-        dj = dj.ravel()   # (25,)
+        di, dj = np.meshgrid(off, off, indexing="ij")  # (5,5)
+        di = di.ravel()  # (25,)
+        dj = dj.ravel()  # (25,)
 
         # Vectorized: (M, 25) index arrays
-        ni = cis[:, None] + di[None, :]   # (M, 25)
-        nj = cjs[:, None] + dj[None, :]   # (M, 25)
+        ni = cis[:, None] + di[None, :]  # (M, 25)
+        nj = cjs[:, None] + dj[None, :]  # (M, 25)
         dist2 = (nj - xs[:, None]) ** 2 + (ni - ys[:, None]) ** 2  # (M, 25)
-        weights = np.exp(-dist2 / (2 * sigma_px ** 2))              # (M, 25)
+        weights = np.exp(-dist2 / (2 * sigma_px**2))  # (M, 25)
 
         np.add.at(boundary, (ni.ravel(), nj.ravel()), weights.ravel())
 
@@ -301,7 +320,10 @@ def _compute_vector_boundary(
 
 
 def _compute_vertex_heatmap(
-    geoms, h: int, w: int, transform: Affine,
+    geoms,
+    h: int,
+    w: int,
+    transform: Affine,
     sigma: float = 1.5,
 ) -> np.ndarray:
     """Compute the vertex heatmap.
@@ -328,21 +350,21 @@ def _compute_vertex_heatmap(
     if not all_vx:
         return heatmap
 
-    vx = np.concatenate(all_vx)   # (V,)
-    vy = np.concatenate(all_vy)   # (V,)
+    vx = np.concatenate(all_vx)  # (V,)
+    vy = np.concatenate(all_vy)  # (V,)
 
     # Clip centres
     cjs = np.clip(vx.astype(int), r, w - r - 1)
     cis = np.clip(vy.astype(int), r, h - r - 1)
 
     off = np.arange(-r, r + 1)
-    di, dj = np.meshgrid(off, off, indexing='ij')
-    di, dj = di.ravel(), dj.ravel()          # (K,)
+    di, dj = np.meshgrid(off, off, indexing="ij")
+    di, dj = di.ravel(), dj.ravel()  # (K,)
 
-    ni = cis[:, None] + di[None, :]          # (V, K)
-    nj = cjs[:, None] + dj[None, :]          # (V, K)
+    ni = cis[:, None] + di[None, :]  # (V, K)
+    nj = cjs[:, None] + dj[None, :]  # (V, K)
     dist2 = (nj - vx[:, None]) ** 2 + (ni - vy[:, None]) ** 2
-    weights = np.exp(-dist2 / (2 * sigma ** 2))
+    weights = np.exp(-dist2 / (2 * sigma**2))
 
     np.add.at(heatmap, (ni.ravel(), nj.ravel()), weights.ravel())
 
@@ -392,13 +414,6 @@ def compute_road_targets(
 ) -> dict[str, str]:
     """
     Compute road supervision targets from polygon geometry.
-
-    Only one target is generated: the intra-polygon EDT (centerline weight).
-    Its value is maximum at the polygon centerline and zero at the boundary,
-    encoding both cross-section importance and local road width in a single map.
-
-    Target generation is skipped at coarse GSD (> max_gsd_for_targets) where
-    roads are 1–2px wide and the intra-polygon EDT has no meaningful gradient.
 
     Args:
         road_gdf:             GeoDataFrame filtered to road polygons only.
