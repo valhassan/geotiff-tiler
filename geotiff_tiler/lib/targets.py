@@ -12,6 +12,7 @@ import numpy as np
 import rasterio
 from rasterio.features import rasterize
 from rasterio.transform import Affine
+from rasterio.windows import Window
 from scipy.ndimage import distance_transform_edt
 from shapely.geometry import MultiPolygon, Polygon
 
@@ -425,7 +426,7 @@ def compute_road_targets(
 
     Returns:
         Dict mapping target name → tif path:
-            'roads_centerline_weight'  intra-polygon EDT  uint8
+            'roads_centerline_weight'  union-mask intra-road EDT  uint8
         Returns {} when GSD is too coarse or road_gdf is empty.
     """
     with rasterio.open(image_path) as src:
@@ -446,15 +447,37 @@ def compute_road_targets(
             ~road_gdf.geometry.is_empty & road_gdf.geometry.notnull()
         ].geometry.tolist()
     )
-
     if not valid_geoms:
         return {}
 
     t = time.time()
-    centerline_weight = _compute_road_centerline_weight(valid_geoms, h, w, transform)
-    logger.info(f"[road_targets] centerline_weight: {time.time() - t:.1f}s")
-
     out_path = Path(tmp_dir) / f"{label_name}_roads_centerline_weight.tif"
+    _write_road_centerline_weight(valid_geoms, h, w, crs, transform, out_path)
+    logger.info(
+        f"[road_targets] centerline_weight: {time.time() - t:.1f}s → {out_path}"
+    )
+    return {"roads_centerline_weight": str(out_path)}
+
+
+def _write_road_centerline_weight(
+    geoms,
+    h: int,
+    w: int,
+    crs,
+    transform: Affine,
+    out_path: Path,
+) -> None:
+    """Union-mask EDT; centerline value = local half-width / _ROAD_REF_M."""
+    pixel_size = abs(transform.a)
+    mask = rasterize(
+        [(g, 1) for g in geoms],
+        out_shape=(h, w),
+        transform=transform,
+        fill=0,
+        dtype=np.uint8,
+    )
+    halo = int(np.ceil(_ROAD_REF_M / pixel_size)) + 1
+    tile = 512
     with rasterio.open(
         out_path,
         "w",
@@ -469,71 +492,19 @@ def compute_road_targets(
         blockxsize=256,
         blockysize=256,
     ) as dst:
-        dst.write(centerline_weight, 1)
-
-    logger.info(f"[road_targets] wrote centerline_weight → {out_path}")
-    return {"roads_centerline_weight": str(out_path)}
-
-
-def _compute_road_centerline_weight(
-    geoms,
-    h: int,
-    w: int,
-    transform: Affine,
-) -> np.ndarray:
-    """
-    Intra-polygon EDT for road polygons.
-
-    For each road polygon, the distance transform of interior pixels gives
-    maximum value at the centerline and zero at the boundary. The value at
-    any centerline pixel equals the half-width of the road at that point in
-    pixels — so this single map encodes both centerline location and local
-    road width.
-
-    Uses the same localised bounding-box approach as the buildings EDT to
-    avoid full-image distance transforms. Overlapping polygons are resolved
-    by taking the per-pixel maximum so no road is suppressed.
-
-    Normalised by _ROAD_REF_M metres so scale is consistent across scenes.
-
-    Args:
-        geoms:     List of road polygon geometries.
-        h, w:      Image height and width in pixels.
-        transform: Rasterio Affine transform.
-
-    Returns:
-        (h, w) uint8 array in [0, 255].
-    """
-    weight = np.zeros((h, w), dtype=np.float32)
-
-    for geom in geoms:
-        minx, miny, maxx, maxy = geom.bounds
-
-        # Bounding box in pixel space with 1px padding
-        c0 = max(0, int((minx - transform.c) / transform.a) - 1)
-        r0 = max(0, int((maxy - transform.f) / transform.e) - 1)
-        c1 = min(w, int((maxx - transform.c) / transform.a) + 2)
-        r1 = min(h, int((miny - transform.f) / transform.e) + 2)
-
-        local_shape = (r1 - r0, c1 - c0)
-        if local_shape[0] <= 0 or local_shape[1] <= 0:
-            continue
-
-        local_t = Affine.translation(
-            transform.c + c0 * transform.a,
-            transform.f + r0 * transform.e,
-        ) * Affine.scale(transform.a, transform.e)
-
-        mask = _rasterize_geom(geom, local_shape, local_t)
-        if not mask.any():
-            continue
-
-        # Intra-polygon EDT: distance from interior pixels to nearest boundary.
-        local_edt = distance_transform_edt(mask).astype(np.float32)
-        local_edt *= abs(transform.a)
-
-        sl = weight[r0:r1, c0:c1]
-        np.maximum(sl, local_edt, out=sl)
-
-    np.clip(weight / _ROAD_REF_M, 0, 1, out=weight)
-    return (weight * 255).astype(np.uint8)
+        for r0 in range(0, h, tile):
+            r1 = min(h, r0 + tile)
+            for c0 in range(0, w, tile):
+                c1 = min(w, c0 + tile)
+                if not mask[r0:r1, c0:c1].any():
+                    continue
+                ra, ca = max(0, r0 - halo), max(0, c0 - halo)
+                rb, cb = min(h, r1 + halo), min(w, c1 + halo)
+                edt = np.float32(distance_transform_edt(mask[ra:rb, ca:cb]))
+                crop = edt[r0 - ra : r1 - ra, c0 - ca : c1 - ca]
+                np.clip(crop * pixel_size / _ROAD_REF_M, 0, 1, out=crop)
+                dst.write(
+                    (crop * 255).astype(np.uint8),
+                    1,
+                    window=Window(c0, r0, c1 - c0, r1 - r0),
+                )
