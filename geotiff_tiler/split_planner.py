@@ -6,6 +6,7 @@ read-only. Assigned images stay frozen on rerun; only the shortfall is filled.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -99,14 +100,23 @@ def require_split(metadata: dict, image) -> str:
     return split
 
 
+def pair_id(item: dict) -> str:
+    """Stable id for one image/label pair. Independent of list order."""
+    img = str(item.get("image") or "")
+    lbl = str(item.get("label") or "")
+    meta = item.get("metadata") or {}
+    name = str(meta.get("id") or Path(img).stem or "image")
+    stem = Path(lbl).stem if lbl else "_"
+    digest = hashlib.sha1(f"{img}\0{lbl}".encode()).hexdigest()[:8]
+    return f"{name}__{stem}__{digest}"
+
+
 def assign_pair_ids(pairs: list) -> list:
-    """``{row}_{image_name}`` on each pair. Existing ids are kept."""
-    for i, item in enumerate(pairs):
+    """Set ``metadata['pair_id']`` from ``pair_id(item)``. Existing ids kept."""
+    for item in pairs:
         meta = item.setdefault("metadata", {})
-        if meta.get("pair_id"):
-            continue
-        name = meta.get("id") or Path(str(item.get("image") or "")).stem or "image"
-        meta["pair_id"] = f"{i}_{name}"
+        if not meta.get("pair_id"):
+            meta["pair_id"] = pair_id(item)
     return pairs
 
 
