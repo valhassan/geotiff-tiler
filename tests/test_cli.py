@@ -28,6 +28,8 @@ def test_prepare_dataset_isolates_metadata() -> None:
     assert pairs[0]["metadata"]["lat"] == 47.0
     assert "lat" not in pairs[2]["metadata"]
     assert pairs[0]["metadata"] is not pairs[1]["metadata"]
+    assert pairs[0]["metadata"]["pair_id"].startswith("a__a__")
+    assert pairs[1]["metadata"]["pair_id"].startswith("b__b__")
 
 
 def test_csv_paths_and_group(root: Path) -> None:
@@ -46,6 +48,15 @@ def test_csv_paths_and_group(root: Path) -> None:
     groups = by_collection(load_pairs(paths))
     assert set(groups) == {"geoeye-1", "worldview-3"}
     assert len(groups["geoeye-1"]) == 2
+    geo = groups["geoeye-1"]
+    assert geo[0]["metadata"]["pair_id"].startswith(
+        "geoeye-1.csv-0__geoeye-1.csv-0__"
+    )
+    wv = by_collection(load_pairs([d / "worldview-3.csv"]))["worldview-3"]
+    assert (
+        wv[0]["metadata"]["pair_id"]
+        == groups["worldview-3"][0]["metadata"]["pair_id"]
+    )
 
 
 def main() -> int:
